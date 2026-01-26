@@ -1,6 +1,6 @@
 [package]
 name = "syncplay-tauri"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Tauri-based Syncplay client"
 authors = ["Syncplay Team"]
 license = "Apache-2.0"
