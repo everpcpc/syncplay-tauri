@@ -39,6 +39,9 @@ fn main() {
             commands::room::change_room,
             commands::room::set_ready,
             commands::playlist::update_playlist,
+            commands::config::get_config,
+            commands::config::update_config,
+            commands::config::get_config_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

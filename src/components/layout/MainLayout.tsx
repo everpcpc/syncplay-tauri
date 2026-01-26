@@ -4,9 +4,11 @@ import { ChatPanel } from "../chat/ChatPanel";
 import { PlayerStatus } from "../player/PlayerStatus";
 import { PlaylistPanel } from "../playlist/PlaylistPanel";
 import { ConnectionDialog } from "../connection/ConnectionDialog";
+import { SettingsDialog } from "../settings/SettingsDialog";
 
 export function MainLayout() {
   const [showConnectionDialog, setShowConnectionDialog] = useState(false);
+  const [showSettingsDialog, setShowSettingsDialog] = useState(false);
   const [showPlaylist, setShowPlaylist] = useState(true);
 
   return (
@@ -25,6 +27,12 @@ export function MainLayout() {
                 className="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded text-sm"
               >
                 {showPlaylist ? "Hide" : "Show"} Playlist
+              </button>
+              <button
+                onClick={() => setShowSettingsDialog(true)}
+                className="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded text-sm"
+              >
+                Settings
               </button>
               <button
                 onClick={() => setShowConnectionDialog(true)}
@@ -61,6 +69,12 @@ export function MainLayout() {
       <ConnectionDialog
         isOpen={showConnectionDialog}
         onClose={() => setShowConnectionDialog(false)}
+      />
+
+      {/* Settings dialog */}
+      <SettingsDialog
+        isOpen={showSettingsDialog}
+        onClose={() => setShowSettingsDialog(false)}
       />
     </div>
   );
