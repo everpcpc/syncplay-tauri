@@ -6,7 +6,9 @@ mod player;
 mod client;
 mod commands;
 mod config;
+mod app_state;
 
+use app_state::AppState;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() {
@@ -19,7 +21,16 @@ fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Create global app state
+    let app_state = AppState::new();
+
     tauri::Builder::default()
+        .manage(app_state.clone())
+        .setup(move |app| {
+            // Store app handle for event emission
+            app_state.set_app_handle(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::connection::connect_to_server,
             commands::connection::disconnect_from_server,
