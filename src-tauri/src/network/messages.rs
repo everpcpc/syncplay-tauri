@@ -4,6 +4,7 @@ use std::collections::HashMap;
 /// Main protocol message envelope
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(non_snake_case)]
 pub enum ProtocolMessage {
     Hello { Hello: HelloMessage },
     Set { Set: SetMessage },
@@ -11,6 +12,7 @@ pub enum ProtocolMessage {
     List { List: Option<ListResponse> },
     Chat { Chat: ChatMessage },
     Error { Error: ErrorMessage },
+    #[allow(clippy::upper_case_acronyms)]
     TLS { TLS: TLSMessage },
 }
 
