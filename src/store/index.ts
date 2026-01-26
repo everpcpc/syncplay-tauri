@@ -1,110 +1,140 @@
 import { create } from "zustand";
+import { listen } from "@tauri-apps/api/event";
 
+// Type definitions matching backend events
 interface ConnectionState {
   connected: boolean;
-  serverHost: string | null;
-  serverPort: number | null;
+  server: string | null;
 }
 
-interface UserListState {
-  users: Array<{
-    username: string;
-    room: string;
-    file: string | null;
-    isReady: boolean;
-  }>;
+interface User {
+  username: string;
+  room: string;
+  file: string | null;
+  isReady: boolean;
+  isController: boolean;
 }
 
-interface ChatState {
-  messages: Array<{
-    timestamp: Date;
-    username: string;
-    message: string;
-  }>;
+interface ChatMessage {
+  timestamp: string;
+  username: string | null;
+  message: string;
+  messageType: string;
 }
 
 interface PlaylistState {
   items: string[];
-  currentIndex: number;
+  currentIndex: number | null;
 }
 
 interface PlayerState {
   filename: string | null;
-  position: number;
-  duration: number;
-  paused: boolean;
+  position: number | null;
+  duration: number | null;
+  paused: boolean | null;
+  speed: number | null;
 }
 
 interface SyncplayStore {
+  // State
   connection: ConnectionState;
-  userList: UserListState;
-  chat: ChatState;
+  users: User[];
+  messages: ChatMessage[];
   playlist: PlaylistState;
   player: PlayerState;
 
   // Actions
-  setConnected: (connected: boolean, host?: string, port?: number) => void;
-  addChatMessage: (username: string, message: string) => void;
-  updateUserList: (users: UserListState["users"]) => void;
-  updatePlaylist: (items: string[], currentIndex: number) => void;
-  updatePlayerState: (state: Partial<PlayerState>) => void;
+  setConnectionStatus: (status: ConnectionState) => void;
+  setUsers: (users: User[]) => void;
+  addMessage: (message: ChatMessage) => void;
+  setPlaylist: (playlist: PlaylistState) => void;
+  setPlayerState: (state: PlayerState) => void;
+
+  // Event listener setup
+  setupEventListeners: () => void;
 }
 
 export const useSyncplayStore = create<SyncplayStore>((set) => ({
+  // Initial state
   connection: {
     connected: false,
-    serverHost: null,
-    serverPort: null,
+    server: null,
   },
-  userList: {
-    users: [],
-  },
-  chat: {
-    messages: [],
-  },
+  users: [],
+  messages: [],
   playlist: {
     items: [],
-    currentIndex: 0,
+    currentIndex: null,
   },
   player: {
     filename: null,
-    position: 0,
-    duration: 0,
+    position: null,
+    duration: null,
     paused: true,
+    speed: 1.0,
   },
 
-  setConnected: (connected, host, port) =>
-    set((state) => ({
-      connection: {
-        ...state.connection,
-        connected,
-        serverHost: host || null,
-        serverPort: port || null,
-      },
-    })),
-
-  addChatMessage: (username, message) =>
-    set((state) => ({
-      chat: {
-        messages: [
-          ...state.chat.messages,
-          { timestamp: new Date(), username, message },
-        ],
-      },
-    })),
-
-  updateUserList: (users) =>
+  // Actions
+  setConnectionStatus: (status) =>
     set(() => ({
-      userList: { users },
+      connection: status,
     })),
 
-  updatePlaylist: (items, currentIndex) =>
+  setUsers: (users) =>
     set(() => ({
-      playlist: { items, currentIndex },
+      users,
     })),
 
-  updatePlayerState: (playerState) =>
+  addMessage: (message) =>
+    set((state) => ({
+      messages: [...state.messages, message],
+    })),
+
+  setPlaylist: (playlist) =>
+    set(() => ({
+      playlist,
+    })),
+
+  setPlayerState: (playerState) =>
     set((state) => ({
       player: { ...state.player, ...playerState },
     })),
+
+  // Setup event listeners from Tauri backend
+  setupEventListeners: () => {
+    // Connection status changes
+    listen<ConnectionState>("connection-status-changed", (event) => {
+      set(() => ({
+        connection: event.payload,
+      }));
+    });
+
+    // User list updates
+    listen<{ users: User[] }>("user-list-updated", (event) => {
+      set(() => ({
+        users: event.payload.users,
+      }));
+    });
+
+    // Chat messages
+    listen<ChatMessage>("chat-message-received", (event) => {
+      set((state) => ({
+        messages: [...state.messages, event.payload],
+      }));
+    });
+
+    // Playlist updates
+    listen<PlaylistState>("playlist-updated", (event) => {
+      set(() => ({
+        playlist: event.payload,
+      }));
+    });
+
+    // Player state updates
+    listen<PlayerState>("player-state-changed", (event) => {
+      set((state) => ({
+        player: { ...state.player, ...event.payload },
+      }));
+    });
+  },
 }));
