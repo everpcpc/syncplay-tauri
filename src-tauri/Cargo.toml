@@ -31,6 +31,7 @@ directories = "5.0"
 futures = "0.3"
 async-trait = "0.1"
 parking_lot = "0.12"
+chrono = "0.4"
 
 [features]
 default = ["custom-protocol"]

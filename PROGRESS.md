@@ -1,26 +1,14 @@
 # Syncplay Tauri Implementation Progress
 
-## Completed Phases
+## Completed Phases (6/10)
 
 ### ✅ Phase 1: Project Setup
 **Status:** Complete
 
 **Implemented:**
 - Complete Tauri project structure with React + TypeScript frontend
-- Cargo.toml configured with all dependencies:
-  - tokio (async runtime)
-  - serde/serde_json (serialization)
-  - rustls/tokio-rustls (TLS support)
-  - tracing (logging)
-  - anyhow/thiserror (error handling)
-  - interprocess (IPC)
-  - parking_lot (synchronization)
-  - bytes, futures, async-trait
-- package.json configured with React dependencies:
-  - React 18.2
-  - Zustand (state management)
-  - Tailwind CSS (styling)
-  - Vite (build tool)
+- Cargo.toml configured with all dependencies
+- package.json configured with React dependencies
 - Directory structure for all modules
 - Basic UI layout with MainLayout component
 - Zustand store skeleton
@@ -31,98 +19,65 @@
 **Status:** Complete
 
 **Implemented:**
-- **Protocol Messages** (`src-tauri/src/network/messages.rs`):
-  - All Syncplay protocol message types
-  - HelloMessage (authentication, features)
-  - SetMessage (file, room, user, playlist updates)
-  - StateMessage (playback synchronization)
-  - ListResponse (user lists)
-  - ChatMessage, ErrorMessage, TLSMessage
-  - Full serde serialization/deserialization
-
-- **Protocol Codec** (`src-tauri/src/network/protocol.rs`):
-  - SyncplayCodec using tokio-util
-  - Line-based JSON protocol
-  - Encoder/Decoder implementations
-  - Debug logging
-  - Unit tests
-
-- **Connection Manager** (`src-tauri/src/network/connection.rs`):
-  - Async TCP connection with tokio
-  - Connection state machine
-  - Bidirectional message channels
-  - Separate send/receive tasks
-  - Clean disconnect handling
-
-- **TLS Support** (`src-tauri/src/network/tls.rs`):
-  - TLS connector with system certificates
-  - Stream upgrade functionality
+- **Protocol Messages** (`src-tauri/src/network/messages.rs`): All Syncplay protocol message types
+- **Protocol Codec** (`src-tauri/src/network/protocol.rs`): Line-based JSON protocol with tokio-util
+- **Connection Manager** (`src-tauri/src/network/connection.rs`): Async TCP connection with state machine
+- **TLS Support** (`src-tauri/src/network/tls.rs`): TLS connector with system certificates
 
 ### ✅ Phase 3: MPV Integration
 **Status:** Complete
 
 **Implemented:**
-- **MPV Commands** (`src-tauri/src/player/commands.rs`):
-  - MpvCommand, MpvResponse, MpvEvent structures
-  - Command builders:
-    - get_property, set_property
-    - observe_property, unobserve_property
-    - loadfile, seek
-    - show_text (OSD)
-    - cycle (pause/unpause)
-
-- **Properties** (`src-tauri/src/player/properties.rs`):
-  - PropertyId enum (TimePos, Pause, Filename, Duration, Path, Speed)
-  - PlayerState structure
-  - Property update handling
-
-- **Events** (`src-tauri/src/player/events.rs`):
-  - MpvPlayerEvent enum
-  - EndFileReason enum
-  - Event parsing from MPV
-
-- **MPV IPC Client** (`src-tauri/src/player/mpv_ipc.rs`):
-  - Unix socket connection
-  - Async command/response handling
-  - Property observation
-  - Event processing
-  - Player control methods:
-    - set_position, set_paused, set_speed
-    - load_file, show_osd
-  - State tracking
+- **MPV Commands** (`src-tauri/src/player/commands.rs`): Complete command builders
+- **Properties** (`src-tauri/src/player/properties.rs`): Property observation system
+- **Events** (`src-tauri/src/player/events.rs`): Event parsing and handling
+- **MPV IPC Client** (`src-tauri/src/player/mpv_ipc.rs`): Unix socket connection with async command/response
 
 ### ✅ Phase 4: Core Client Logic
 **Status:** Complete
 
 **Implemented:**
-- **Client State** (`src-tauri/src/client/state.rs`):
-  - ClientState with thread-safe RwLock
-  - User management (add, remove, get users)
-  - Room management
-  - File tracking
-  - Global playback state
-  - Ready state
-  - Server version tracking
+- **Client State** (`src-tauri/src/client/state.rs`): Thread-safe state management with RwLock
+- **Synchronization Engine** (`src-tauri/src/client/sync.rs`): Smart sync algorithm with thresholds and slowdown
 
-- **Synchronization Engine** (`src-tauri/src/client/sync.rs`):
-  - SyncEngine with threshold-based logic
-  - Thresholds:
-    - SEEK_THRESHOLD_REWIND: 4.0s
-    - SEEK_THRESHOLD_FASTFORWARD: 5.0s
-    - SLOWDOWN_THRESHOLD: 1.5s
-    - SLOWDOWN_RESET_THRESHOLD: 0.5s
-    - SLOWDOWN_RATE: 0.95x
-  - SyncAction enum (None, Seek, SetPaused, Slowdown, ResetSpeed)
-  - Position difference calculation
-  - Message age compensation
-  - Slowdown mechanism for minor desync
-  - Comprehensive unit tests
+### ✅ Phase 5: Playlist Management
+**Status:** Complete
 
-## Remaining Phases
+**Implemented:**
+- **Playlist** (`src-tauri/src/client/playlist.rs`):
+  - PlaylistItem structure
+  - Thread-safe Playlist manager
+  - Add, remove, reorder operations
+  - Navigation (next, previous)
+  - Index management with automatic adjustment
+  - 6 comprehensive unit tests
 
-### Phase 5: Playlist Management
-**Status:** Not started
-**Files:** `src-tauri/src/client/playlist.rs`
+### ✅ Phase 6: Chat System
+**Status:** Complete
+
+**Implemented:**
+- **Chat** (`src-tauri/src/client/chat.rs`):
+  - ChatMessage with timestamps (using chrono)
+  - ChatMessageType (User, System, Server, Error)
+  - ChatCommand parser (/room, /list, /help, /ready, /unready)
+  - ChatManager with history (max 1000 messages)
+  - Thread-safe message storage
+  - 10 comprehensive unit tests
+- **Chat Commands** (`src-tauri/src/commands/chat.rs`): Command parsing and handling
+
+## Remaining Phases (4/10)
+
+### Phase 7: Tauri Commands
+**Status:** In progress
+**Files:** `src-tauri/src/commands/*.rs`
+
+**TODO:**
+- Implement connection command logic with state management
+- Implement event emission to frontend
+- Error handling and result types
+- Integration with network, player, and client modules
+
+### Phase 8: React Frontend
 
 **TODO:**
 - Playlist data structure
