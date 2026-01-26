@@ -5,9 +5,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+#[cfg(unix)]
+use tokio::net::UnixStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::ClientOptions;
 
 use super::commands::{MpvCommand, MpvMessage, MpvResponse};
 use super::events::MpvPlayerEvent;
@@ -37,14 +41,20 @@ impl MpvIpc {
     pub async fn connect(&mut self) -> Result<mpsc::UnboundedReceiver<MpvPlayerEvent>> {
         info!("Connecting to MPV IPC socket: {}", self.socket_path);
 
-        // Connect to Unix socket
+        // Connect to Unix socket or Windows named pipe
+        #[cfg(unix)]
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .context("Failed to connect to MPV IPC socket")?;
 
+        #[cfg(windows)]
+        let stream = ClientOptions::new()
+            .open(&self.socket_path)
+            .context("Failed to connect to MPV named pipe")?;
+
         info!("Connected to MPV IPC socket");
 
-        let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = tokio::io::split(stream);
         let reader = BufReader::new(read_half);
 
         // Create channels
