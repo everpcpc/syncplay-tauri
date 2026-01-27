@@ -1,4 +1,4 @@
-.PHONY: bump-major bump-minor bump-patch format run
+.PHONY: bump-major bump-minor bump-patch format run test
 
 # Get current version from package.json
 CURRENT_VERSION := $(shell jq -r '.version' package.json)
@@ -18,6 +18,11 @@ format:
 	@echo "Formatting frontend code..."
 	@pnpm run format
 	@echo "All code formatted successfully"
+
+test:
+	@echo "Running Rust tests..."
+	@cd src-tauri && cargo test
+	@echo "All tests completed"
 
 bump-major:
 	@echo "Bumping major version from $(CURRENT_VERSION)"

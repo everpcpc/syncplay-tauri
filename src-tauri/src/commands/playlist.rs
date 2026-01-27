@@ -1,6 +1,8 @@
 // Playlist command handlers
 
 use crate::app_state::{AppState, PlaylistEvent};
+use crate::network::messages::{PlaylistChange, PlaylistIndexUpdate, ProtocolMessage, SetMessage};
+use crate::player::controller::load_media_by_name;
 use std::sync::Arc;
 use tauri::State;
 
@@ -11,6 +13,7 @@ pub async fn update_playlist(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     tracing::info!("Playlist action: {} for file: {:?}", action, filename);
+    let previous_index = state.playlist.get_current_index();
 
     match action.as_str() {
         "add" => {
@@ -45,21 +48,82 @@ pub async fn update_playlist(
         }
     }
 
-    // Emit playlist update event
     let items: Vec<String> = state
         .playlist
         .get_items()
         .iter()
         .map(|item| item.filename.clone())
         .collect();
+    let current_index = state.playlist.get_current_index();
 
+    let username = state.client_state.get_username();
+    if matches!(action.as_str(), "add" | "remove" | "clear") {
+        let message = ProtocolMessage::Set {
+            Set: SetMessage {
+                room: None,
+                file: None,
+                user: None,
+                ready: None,
+                playlist_index: None,
+                playlist_change: Some(PlaylistChange {
+                    user: Some(username.clone()),
+                    files: items.clone(),
+                }),
+                features: None,
+            },
+        };
+        send_to_server(&state, message)?;
+    }
+
+    if current_index != previous_index {
+        if let Some(index) = current_index {
+            let message = ProtocolMessage::Set {
+                Set: SetMessage {
+                    room: None,
+                    file: None,
+                    user: None,
+                    ready: None,
+                    playlist_index: Some(PlaylistIndexUpdate {
+                        user: Some(username.clone()),
+                        index: Some(index),
+                    }),
+                    playlist_change: None,
+                    features: None,
+                },
+            };
+            send_to_server(&state, message)?;
+        }
+    }
+
+    if current_index != previous_index {
+        if let Some(item) = state.playlist.get_current_item() {
+            if let Err(e) = load_media_by_name(state.inner(), &item.filename, true).await {
+                tracing::warn!("Failed to load playlist item: {}", e);
+            }
+        }
+    }
+
+    // Emit playlist update event
     state.emit_event(
         "playlist-updated",
         PlaylistEvent {
             items,
-            current_index: state.playlist.get_current_index(),
+            current_index,
         },
     );
 
     Ok(())
+}
+
+fn send_to_server(
+    state: &State<'_, Arc<AppState>>,
+    message: ProtocolMessage,
+) -> Result<(), String> {
+    let connection = state.connection.lock().clone();
+    let Some(connection) = connection else {
+        return Err("Not connected to server".to_string());
+    };
+    connection
+        .send(message)
+        .map_err(|e| format!("Failed to send message: {}", e))
 }

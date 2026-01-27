@@ -46,8 +46,11 @@ pub struct UserPreferences {
 /// Player configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerConfig {
+    #[serde(default)]
+    pub player_path: String,
+    #[serde(default)]
     pub mpv_socket_path: String,
-    pub media_directory: String,
+    pub media_directories: Vec<String>,
 }
 
 impl Default for PlayerConfig {
@@ -58,8 +61,9 @@ impl Default for PlayerConfig {
         let default_socket = "\\\\.\\pipe\\mpvsocket".to_string();
 
         Self {
+            player_path: "mpv".to_string(),
             mpv_socket_path: default_socket,
-            media_directory: String::new(),
+            media_directories: Vec::new(),
         }
     }
 }

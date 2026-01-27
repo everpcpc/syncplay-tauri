@@ -77,9 +77,9 @@ fn detect_vlc() -> Option<DetectedPlayer> {
 
 #[cfg(target_os = "macos")]
 fn detect_iina() -> Option<DetectedPlayer> {
-    let paths = vec![
-        PathBuf::from("/Applications/IINA.app/Contents/MacOS/iina-cli"),
-    ];
+    let paths = vec![PathBuf::from(
+        "/Applications/IINA.app/Contents/MacOS/iina-cli",
+    )];
 
     for path in paths {
         if path.exists() {
@@ -146,7 +146,9 @@ fn get_vlc_paths() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         paths.push(PathBuf::from("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"));
-        paths.push(PathBuf::from("C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe"));
+        paths.push(PathBuf::from(
+            "C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe",
+        ));
     }
 
     // Also check PATH
@@ -167,11 +169,7 @@ fn parse_mpv_version(output: &str) -> Option<String> {
     output
         .lines()
         .next()
-        .and_then(|line| {
-            line.split_whitespace()
-                .nth(1)
-                .map(|v| v.to_string())
-        })
+        .and_then(|line| line.split_whitespace().nth(1).map(|v| v.to_string()))
 }
 
 fn parse_vlc_version(output: &str) -> Option<String> {
@@ -179,9 +177,5 @@ fn parse_vlc_version(output: &str) -> Option<String> {
     output
         .lines()
         .next()
-        .and_then(|line| {
-            line.split_whitespace()
-                .nth(2)
-                .map(|v| v.to_string())
-        })
+        .and_then(|line| line.split_whitespace().nth(2).map(|v| v.to_string()))
 }

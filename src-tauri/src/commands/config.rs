@@ -1,20 +1,22 @@
 // Configuration command handlers
 
-use crate::config::{load_config, save_config, SyncplayConfig};
+use crate::app_state::AppState;
+use crate::config::{save_config, SyncplayConfig};
+use std::sync::Arc;
 use tauri::State;
 
 #[tauri::command]
-pub async fn get_config() -> Result<SyncplayConfig, String> {
+pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<SyncplayConfig, String> {
     tracing::info!("Getting configuration");
 
-    load_config().map_err(|e| {
-        tracing::error!("Failed to load config: {}", e);
-        format!("Failed to load configuration: {}", e)
-    })
+    Ok(state.config.lock().clone())
 }
 
 #[tauri::command]
-pub async fn update_config(config: SyncplayConfig) -> Result<(), String> {
+pub async fn update_config(
+    config: SyncplayConfig,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     tracing::info!("Updating configuration");
 
     // Validate config
@@ -28,6 +30,9 @@ pub async fn update_config(config: SyncplayConfig) -> Result<(), String> {
         tracing::error!("Failed to save config: {}", e);
         format!("Failed to save configuration: {}", e)
     })?;
+
+    *state.config.lock() = config.clone();
+    state.sync_engine.lock().update_from_config(&config.user);
 
     Ok(())
 }

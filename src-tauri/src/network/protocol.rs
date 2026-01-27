@@ -59,8 +59,9 @@ impl Encoder<ProtocolMessage> for SyncplayCodec {
 
         tracing::debug!("Sending: {}", json);
 
-        // Encode line
-        self.lines_codec.encode(json, dst)?;
+        // Encode line with CRLF delimiter (Syncplay server expects \r\n)
+        dst.extend_from_slice(json.as_bytes());
+        dst.extend_from_slice(b"\r\n");
         Ok(())
     }
 }
@@ -81,7 +82,7 @@ mod tests {
                     password: None,
                 }),
                 version: "1.2.255".to_string(),
-                realversion: "1.7.0".to_string(),
+                realversion: "1.7.3".to_string(),
                 features: Some(ClientFeatures {
                     shared_playlists: Some(true),
                     chat: Some(true),

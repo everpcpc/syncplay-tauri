@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api";
+import { open } from "@tauri-apps/api/dialog";
 
 interface ServerConfig {
   host: string;
@@ -23,7 +24,8 @@ interface UserPreferences {
 
 interface PlayerConfig {
   player_path: string;
-  media_directory: string;
+  mpv_socket_path: string;
+  media_directories: string[];
 }
 
 interface DetectedPlayer {
@@ -51,6 +53,7 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
   const [activeTab, setActiveTab] = useState<"server" | "user" | "player" | "advanced">("server");
   const [detectedPlayers, setDetectedPlayers] = useState<DetectedPlayer[]>([]);
   const [detectingPlayers, setDetectingPlayers] = useState(false);
+  const [mediaDirectoryInput, setMediaDirectoryInput] = useState("");
 
   useEffect(() => {
     if (isOpen) {
@@ -97,6 +100,63 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     } finally {
       setLoading(false);
     }
+  };
+
+  const addMediaDirectoryValue = (value: string) => {
+    if (!config) return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    if (config.player.media_directories.includes(trimmed)) {
+      setMediaDirectoryInput("");
+      return;
+    }
+    setConfig({
+      ...config,
+      player: {
+        ...config.player,
+        media_directories: [...config.player.media_directories, trimmed],
+      },
+    });
+    setMediaDirectoryInput("");
+  };
+
+  const addMediaDirectory = () => {
+    addMediaDirectoryValue(mediaDirectoryInput);
+  };
+
+  const addMediaDirectoryFromPicker = async () => {
+    if (!config) return;
+    setError(null);
+    let selected: string | string[] | null = null;
+    try {
+      const fallbackPath =
+        config.player.media_directories[config.player.media_directories.length - 1];
+      selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: fallbackPath,
+      });
+    } catch (err) {
+      setError("Failed to open directory picker");
+      return;
+    }
+
+    if (!selected || Array.isArray(selected)) {
+      return;
+    }
+
+    addMediaDirectoryValue(selected);
+  };
+
+  const removeMediaDirectory = (dir: string) => {
+    if (!config) return;
+    setConfig({
+      ...config,
+      player: {
+        ...config.player,
+        media_directories: config.player.media_directories.filter((entry) => entry !== dir),
+      },
+    });
   };
 
   if (!isOpen) return null;
@@ -304,23 +364,29 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
                       <option value="">Select a player...</option>
                       {detectedPlayers.map((player, index) => (
                         <option key={index} value={player.path}>
-                          {player.name} {player.version ? `(${player.version})` : ""} - {player.path}
+                          {player.name} {player.version ? `(${player.version})` : ""} -{" "}
+                          {player.path}
                         </option>
                       ))}
                       <option value="custom">Custom path...</option>
                     </select>
                   ) : (
-                    <p className="text-sm text-gray-400 mb-2">No players detected. Enter path manually.</p>
+                    <p className="text-sm text-gray-400 mb-2">
+                      No players detected. Enter path manually.
+                    </p>
                   )}
                 </div>
 
-                {(config.player.player_path === "custom" || detectedPlayers.length === 0 ||
-                  !detectedPlayers.some(p => p.path === config.player.player_path)) && (
+                {(config.player.player_path === "custom" ||
+                  detectedPlayers.length === 0 ||
+                  !detectedPlayers.some((p) => p.path === config.player.player_path)) && (
                   <div>
                     <label className="block text-sm font-medium mb-1">Player Path (Manual)</label>
                     <input
                       type="text"
-                      value={config.player.player_path === "custom" ? "" : config.player.player_path}
+                      value={
+                        config.player.player_path === "custom" ? "" : config.player.player_path
+                      }
                       onChange={(e) =>
                         setConfig({
                           ...config,
@@ -337,21 +403,59 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
                 )}
 
                 <div>
-                  <label className="block text-sm font-medium mb-1">Media Directory</label>
-                  <input
-                    type="text"
-                    value={config.player.media_directory}
-                    onChange={(e) =>
-                      setConfig({
-                        ...config,
-                        player: { ...config.player, media_directory: e.target.value },
-                      })
-                    }
-                    className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
-                    placeholder="/path/to/media"
-                  />
-                  <p className="text-xs text-gray-400 mt-1">
-                    Default directory for media files
+                  <label className="block text-sm font-medium mb-1">Media Directories</label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={mediaDirectoryInput}
+                      onChange={(e) => setMediaDirectoryInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          addMediaDirectory();
+                        }
+                      }}
+                      className="flex-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
+                      placeholder="/path/to/media"
+                    />
+                    <button
+                      type="button"
+                      onClick={addMediaDirectory}
+                      className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded text-sm"
+                    >
+                      Add
+                    </button>
+                    <button
+                      type="button"
+                      onClick={addMediaDirectoryFromPicker}
+                      className="bg-gray-700 hover:bg-gray-600 text-white px-3 py-2 rounded text-sm"
+                    >
+                      Browse
+                    </button>
+                  </div>
+                  {config.player.media_directories.length === 0 ? (
+                    <p className="text-xs text-gray-400 mt-2">No media directories added.</p>
+                  ) : (
+                    <div className="mt-2 space-y-2">
+                      {config.player.media_directories.map((dir) => (
+                        <div
+                          key={dir}
+                          className="flex items-center justify-between bg-gray-900 text-gray-200 px-3 py-2 rounded border border-gray-700"
+                        >
+                          <span className="text-sm truncate">{dir}</span>
+                          <button
+                            type="button"
+                            onClick={() => removeMediaDirectory(dir)}
+                            className="text-xs text-red-300 hover:text-red-200"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-400 mt-2">
+                    Files are matched locally against these directories.
                   </p>
                 </div>
               </div>

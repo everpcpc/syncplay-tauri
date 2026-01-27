@@ -4,15 +4,19 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 use crate::client::{chat::ChatManager, playlist::Playlist, state::ClientState, sync::SyncEngine};
+use crate::config::SyncplayConfig;
 use crate::network::connection::Connection;
+use crate::network::messages::HelloMessage;
 use crate::player::mpv_ipc::MpvIpc;
 
 /// Global application state
 pub struct AppState {
     /// Network connection to Syncplay server
-    pub connection: Arc<Mutex<Option<Connection>>>,
+    pub connection: Arc<Mutex<Option<Arc<Connection>>>>,
     /// MPV player IPC client
-    pub mpv: Arc<Mutex<Option<MpvIpc>>>,
+    pub mpv: Arc<Mutex<Option<Arc<MpvIpc>>>>,
+    /// MPV process handle
+    pub mpv_process: Arc<Mutex<Option<tokio::process::Child>>>,
     /// Client state (users, room, etc.)
     pub client_state: Arc<ClientState>,
     /// Playlist manager
@@ -21,19 +25,37 @@ pub struct AppState {
     pub chat: Arc<ChatManager>,
     /// Synchronization engine
     pub sync_engine: Arc<Mutex<SyncEngine>>,
+    /// Cached configuration
+    pub config: Arc<Mutex<SyncplayConfig>>,
+    /// Suppress next file update for server-driven loads
+    pub suppress_next_file_update: Arc<Mutex<bool>>,
+    /// Last hello payload (for TLS re-handshake)
+    pub last_hello: Arc<Mutex<Option<HelloMessage>>>,
+    /// Whether hello has been sent for the current connection
+    pub hello_sent: Arc<Mutex<bool>>,
     /// Tauri app handle for event emission
     pub app_handle: Arc<Mutex<Option<AppHandle>>>,
 }
 
 impl AppState {
     pub fn new() -> Arc<Self> {
+        let config = crate::config::load_config().unwrap_or_else(|e| {
+            tracing::error!("Failed to load config: {}", e);
+            SyncplayConfig::default()
+        });
+
         Arc::new(Self {
             connection: Arc::new(Mutex::new(None)),
             mpv: Arc::new(Mutex::new(None)),
+            mpv_process: Arc::new(Mutex::new(None)),
             client_state: ClientState::new(),
             playlist: Playlist::new(),
             chat: ChatManager::new(),
             sync_engine: Arc::new(Mutex::new(SyncEngine::new())),
+            config: Arc::new(Mutex::new(config)),
+            suppress_next_file_update: Arc::new(Mutex::new(false)),
+            last_hello: Arc::new(Mutex::new(None)),
+            hello_sent: Arc::new(Mutex::new(false)),
             app_handle: Arc::new(Mutex::new(None)),
         })
     }
@@ -72,10 +94,15 @@ impl Default for AppState {
         Self {
             connection: Arc::new(Mutex::new(None)),
             mpv: Arc::new(Mutex::new(None)),
+            mpv_process: Arc::new(Mutex::new(None)),
             client_state: ClientState::new(),
             playlist: Playlist::new(),
             chat: ChatManager::new(),
             sync_engine: Arc::new(Mutex::new(SyncEngine::new())),
+            config: Arc::new(Mutex::new(SyncplayConfig::default())),
+            suppress_next_file_update: Arc::new(Mutex::new(false)),
+            last_hello: Arc::new(Mutex::new(None)),
+            hello_sent: Arc::new(Mutex::new(false)),
             app_handle: Arc::new(Mutex::new(None)),
         }
     }

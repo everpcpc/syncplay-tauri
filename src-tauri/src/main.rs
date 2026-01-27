@@ -31,6 +31,10 @@ fn main() {
         .setup(move |app| {
             // Store app handle for event emission
             app_state.set_app_handle(app.handle());
+            let state = app_state.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::player::controller::spawn_player_state_loop(state);
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

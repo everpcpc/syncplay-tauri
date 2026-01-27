@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
     <defs>
-        <rect id="squircle-shape" x="0" y="0" width="1024" height="1024" rx="225" ry="225"></rect>
         <linearGradient id="grad-left-vertical" x1="60%" y1="0%" x2="40%" y2="100%">
             <stop stop-color="#FFCA28" offset="0%"></stop>
             <stop stop-color="#FF3D6E" offset="100%"></stop>
@@ -12,4 +11,14 @@
         </linearGradient>
         <polygon id="base-triangle" points="-70,-110 130,0 -70,110"></polygon>
     </defs>
+    <g stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
+        <use fill="#FFFFFF" xlink:href="#squircle-shape"></use>
+        <g transform="translate(512.000000, 512.000000)">
+            <circle fill="url(#grad-left-vertical)" opacity="0.85" cx="-150" cy="0" r="300"></circle>
+            <circle fill="url(#grad-right-vertical)" opacity="0.85"  cx="150" cy="0" r="300"></circle>
+            <g transform="translate(-5, 0) scale(0.82)">
+                <use xlink:href="#base-triangle" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="45" stroke-linejoin="round"></use>
+            </g>
+        </g>
+    </g>
 </svg>

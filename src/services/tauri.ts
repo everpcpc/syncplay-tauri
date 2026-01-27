@@ -18,7 +18,7 @@ export const tauriApi = {
     return invoke("disconnect_from_server");
   },
 
-  async getConnectionStatus(): Promise<string> {
+  async getConnectionStatus(): Promise<boolean> {
     return invoke("get_connection_status");
   },
 

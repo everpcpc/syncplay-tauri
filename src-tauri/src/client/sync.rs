@@ -1,11 +1,5 @@
-use tracing::{debug, info, warn};
-
-/// Synchronization thresholds (in seconds)
-pub const SEEK_THRESHOLD_REWIND: f64 = 4.0;
-pub const SEEK_THRESHOLD_FASTFORWARD: f64 = 5.0;
-pub const SLOWDOWN_THRESHOLD: f64 = 1.5;
-pub const SLOWDOWN_RESET_THRESHOLD: f64 = 0.5;
-pub const SLOWDOWN_RATE: f64 = 0.95;
+use crate::config::UserPreferences;
+use tracing::{debug, info};
 
 /// Synchronization action to take
 #[derive(Debug, Clone, PartialEq)]
@@ -26,13 +20,35 @@ pub enum SyncAction {
 pub struct SyncEngine {
     /// Whether slowdown is currently active
     slowdown_active: bool,
+    seek_threshold_rewind: f64,
+    seek_threshold_fastforward: f64,
+    slowdown_threshold: f64,
+    slowdown_reset_threshold: f64,
+    slowdown_rate: f64,
 }
 
 impl SyncEngine {
     pub fn new() -> Self {
         Self {
             slowdown_active: false,
+            seek_threshold_rewind: 4.0,
+            seek_threshold_fastforward: 5.0,
+            slowdown_threshold: 1.5,
+            slowdown_reset_threshold: 0.5,
+            slowdown_rate: 0.95,
         }
+    }
+
+    pub fn update_from_config(&mut self, prefs: &UserPreferences) {
+        self.seek_threshold_rewind = prefs.seek_threshold_rewind;
+        self.seek_threshold_fastforward = prefs.seek_threshold_fastforward;
+        self.slowdown_threshold = prefs.slowdown_threshold;
+        self.slowdown_reset_threshold = prefs.slowdown_reset_threshold;
+        self.slowdown_rate = prefs.slowdown_rate;
+    }
+
+    pub fn slowdown_rate(&self) -> f64 {
+        self.slowdown_rate
     }
 
     /// Calculate synchronization actions needed
@@ -77,40 +93,40 @@ impl SyncEngine {
         // Only sync position if both are playing or both are paused
         if local_paused == global_paused {
             // Check if we need to seek
-            if diff.abs() > SEEK_THRESHOLD_REWIND && diff < 0.0 {
+            if diff.abs() > self.seek_threshold_rewind && diff < 0.0 {
                 // We're behind, need to seek forward
                 info!(
                     "Behind by {:.2}s (threshold: {:.2}s) - seeking forward",
                     diff.abs(),
-                    SEEK_THRESHOLD_REWIND
+                    self.seek_threshold_rewind
                 );
                 actions.push(SyncAction::Seek(adjusted_global_position));
                 self.slowdown_active = false;
-            } else if diff > SEEK_THRESHOLD_FASTFORWARD {
+            } else if diff > self.seek_threshold_fastforward {
                 // We're ahead, need to seek backward
                 info!(
                     "Ahead by {:.2}s (threshold: {:.2}s) - seeking backward",
-                    diff, SEEK_THRESHOLD_FASTFORWARD
+                    diff, self.seek_threshold_fastforward
                 );
                 actions.push(SyncAction::Seek(adjusted_global_position));
                 self.slowdown_active = false;
-            } else if !global_paused && diff.abs() > SLOWDOWN_THRESHOLD {
+            } else if !global_paused && diff.abs() > self.slowdown_threshold {
                 // Minor desync while playing - apply slowdown
                 if !self.slowdown_active {
                     info!(
                         "Minor desync {:.2}s (threshold: {:.2}s) - applying slowdown",
                         diff.abs(),
-                        SLOWDOWN_THRESHOLD
+                        self.slowdown_threshold
                     );
                     actions.push(SyncAction::Slowdown);
                     self.slowdown_active = true;
                 }
-            } else if self.slowdown_active && diff.abs() < SLOWDOWN_RESET_THRESHOLD {
+            } else if self.slowdown_active && diff.abs() < self.slowdown_reset_threshold {
                 // Back in sync - reset speed
                 info!(
                     "Back in sync ({:.2}s < {:.2}s) - resetting speed",
                     diff.abs(),
-                    SLOWDOWN_RESET_THRESHOLD
+                    self.slowdown_reset_threshold
                 );
                 actions.push(SyncAction::ResetSpeed);
                 self.slowdown_active = false;

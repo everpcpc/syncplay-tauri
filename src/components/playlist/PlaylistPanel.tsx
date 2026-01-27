@@ -1,13 +1,87 @@
 import { useSyncplayStore } from "../../store";
+import { useNotificationStore } from "../../store/notifications";
 import { invoke } from "@tauri-apps/api";
+import { open } from "@tauri-apps/api/dialog";
+
+interface SyncplayConfig {
+  player: {
+    media_directories: string[];
+  };
+}
 
 export function PlaylistPanel() {
   const playlist = useSyncplayStore((state) => state.playlist);
   const connection = useSyncplayStore((state) => state.connection);
+  const addNotification = useNotificationStore((state) => state.addNotification);
+
+  const normalizePath = (path: string) =>
+    path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 
   const handleAddFile = async () => {
-    // TODO: Implement file picker dialog
-    console.log("Add file clicked");
+    if (!connection.connected) return;
+
+    let config: SyncplayConfig | null = null;
+    try {
+      config = await invoke<SyncplayConfig>("get_config");
+    } catch (error) {
+      addNotification({
+        type: "error",
+        message: "Failed to load config for file picker",
+      });
+      return;
+    }
+
+    const mediaDirectories = config.player.media_directories.filter((dir) => dir.trim() !== "");
+    if (mediaDirectories.length === 0) {
+      addNotification({
+        type: "warning",
+        message: "Set media directories in Settings before adding files",
+      });
+      return;
+    }
+
+    let selected: string | string[] | null = null;
+    try {
+      selected = await open({
+        multiple: false,
+        directory: false,
+        defaultPath: mediaDirectories[0],
+      });
+    } catch (error) {
+      addNotification({
+        type: "error",
+        message: "Failed to open file picker",
+      });
+      return;
+    }
+
+    if (!selected || Array.isArray(selected)) {
+      return;
+    }
+
+    const normalizedFile = normalizePath(selected);
+    const normalizedDirs = mediaDirectories.map(normalizePath);
+    const isInDirectory = normalizedDirs.some((dir) => normalizedFile.startsWith(`${dir}/`));
+    if (!isInDirectory) {
+      addNotification({
+        type: "error",
+        message: "Selected file is outside the media directories",
+      });
+      return;
+    }
+
+    const filename = selected.split(/[/\\\\]/).pop() || selected;
+    try {
+      await invoke("update_playlist", {
+        action: "add",
+        filename,
+      });
+    } catch (error) {
+      addNotification({
+        type: "error",
+        message: "Failed to add file to playlist",
+      });
+    }
   };
 
   const handleRemoveItem = async (index: number) => {
