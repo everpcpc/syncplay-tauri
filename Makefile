@@ -1,4 +1,4 @@
-.PHONY: bump-major bump-minor bump-patch format
+.PHONY: bump-major bump-minor bump-patch format run
 
 # Get current version from package.json
 CURRENT_VERSION := $(shell jq -r '.version' package.json)
@@ -7,6 +7,10 @@ CURRENT_VERSION := $(shell jq -r '.version' package.json)
 MAJOR := $(shell echo $(CURRENT_VERSION) | cut -d. -f1)
 MINOR := $(shell echo $(CURRENT_VERSION) | cut -d. -f2)
 PATCH := $(shell echo $(CURRENT_VERSION) | cut -d. -f3)
+
+run:
+	@echo "Starting Syncplay Tauri in development mode..."
+	@pnpm tauri dev
 
 format:
 	@echo "Formatting Rust code..."
