@@ -9,7 +9,7 @@ import { NotificationContainer } from "../notifications/NotificationContainer";
 import { useSyncplayStore } from "../../store";
 import { useNotificationStore } from "../../store/notifications";
 import { invoke } from "@tauri-apps/api/core";
-import { applyTheme } from "../../services/theme";
+import { applyTheme, normalizeTheme, ThemePreference } from "../../services/theme";
 
 interface SyncplayConfig {
   server: {
@@ -30,6 +30,7 @@ export function MainLayout() {
   const [showConnectionDialog, setShowConnectionDialog] = useState(false);
   const [showSettingsDialog, setShowSettingsDialog] = useState(false);
   const [showPlaylist, setShowPlaylist] = useState(true);
+  const [theme, setTheme] = useState<ThemePreference>("dark");
   const connection = useSyncplayStore((state) => state.connection);
   const addNotification = useNotificationStore((state) => state.addNotification);
   const initializedRef = useRef(false);
@@ -42,7 +43,9 @@ export function MainLayout() {
       try {
         const config = await invoke<SyncplayConfig>("get_config");
         setShowPlaylist(config.user.show_playlist);
-        applyTheme(config.user.theme);
+        const normalizedTheme = normalizeTheme(config.user.theme);
+        setTheme(normalizedTheme);
+        applyTheme(normalizedTheme);
 
         if (config.user.auto_connect && !connection.connected && config.user.username.trim()) {
           try {
@@ -71,6 +74,30 @@ export function MainLayout() {
     initFromConfig();
   }, [connection.connected, addNotification]);
 
+  const handleToggleTheme = async () => {
+    const previousTheme = theme;
+    const nextTheme = theme === "light" ? "dark" : "light";
+    setTheme(nextTheme);
+    applyTheme(nextTheme);
+
+    try {
+      const config = await invoke<SyncplayConfig>("get_config");
+      await invoke("update_config", {
+        config: {
+          ...config,
+          user: { ...config.user, theme: nextTheme },
+        },
+      });
+    } catch (error) {
+      setTheme(previousTheme);
+      applyTheme(previousTheme);
+      addNotification({
+        type: "error",
+        message: "Failed to save theme",
+      });
+    }
+  };
+
   return (
     <div className="flex flex-col h-screen app-shell">
       <NotificationContainer />
@@ -88,6 +115,12 @@ export function MainLayout() {
                 className="btn-neutral px-3 py-1.5 rounded-md text-sm"
               >
                 {showPlaylist ? "Hide" : "Show"} Playlist
+              </button>
+              <button
+                onClick={handleToggleTheme}
+                className="btn-neutral px-3 py-1.5 rounded-md text-sm"
+              >
+                Theme: {theme === "light" ? "Light" : "Dark"}
               </button>
               <button
                 onClick={() => setShowSettingsDialog(true)}

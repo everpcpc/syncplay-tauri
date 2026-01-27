@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { applyTheme } from "../../services/theme";
+import { getAppliedTheme } from "../../services/theme";
 import { open } from "@tauri-apps/plugin-dialog";
 
 interface ServerConfig {
@@ -243,8 +243,12 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
 
     saveTimeoutRef.current = setTimeout(async () => {
       try {
-        await invoke("update_config", { config });
-        applyTheme(config.user.theme);
+        await invoke("update_config", {
+          config: {
+            ...config,
+            user: { ...config.user, theme: getAppliedTheme() },
+          },
+        });
         setError(null);
       } catch (err) {
         setError(err as string);
@@ -270,29 +274,6 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
             <p className="text-xs app-text-muted">Changes are saved automatically.</p>
           </div>
           <div className="flex items-center gap-3">
-            {config && (
-              <>
-                <label className="text-sm app-text-muted" htmlFor="theme-select">
-                  Theme
-                </label>
-                <select
-                  id="theme-select"
-                  value={config.user.theme}
-                  onChange={(e) => {
-                    const theme = e.target.value;
-                    applyTheme(theme);
-                    setConfig({
-                      ...config,
-                      user: { ...config.user, theme },
-                    });
-                  }}
-                  className="app-input px-3 py-2 rounded text-sm focus:outline-none focus:border-blue-500"
-                >
-                  <option value="dark">Dark</option>
-                  <option value="light">Light</option>
-                </select>
-              </>
-            )}
             <button onClick={onClose} className="btn-neutral px-3 py-2 rounded-md text-sm">
               Close
             </button>

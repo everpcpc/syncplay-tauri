@@ -9,3 +9,8 @@ export const applyTheme = (value?: string) => {
   root.classList.toggle("theme-light", theme === "light");
   root.classList.toggle("theme-dark", theme !== "light");
 };
+
+export const getAppliedTheme = (): ThemePreference => {
+  const root = document.documentElement;
+  return root.classList.contains("theme-light") ? "light" : "dark";
+};
