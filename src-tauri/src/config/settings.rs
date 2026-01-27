@@ -43,6 +43,27 @@ pub struct UserPreferences {
     pub auto_connect: bool,
 }
 
+/// Player configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerConfig {
+    pub mpv_socket_path: String,
+    pub media_directory: String,
+}
+
+impl Default for PlayerConfig {
+    fn default() -> Self {
+        #[cfg(unix)]
+        let default_socket = "/tmp/mpvsocket".to_string();
+        #[cfg(windows)]
+        let default_socket = "\\\\.\\pipe\\mpvsocket".to_string();
+
+        Self {
+            mpv_socket_path: default_socket,
+            media_directory: String::new(),
+        }
+    }
+}
+
 impl Default for UserPreferences {
     fn default() -> Self {
         Self {
@@ -72,6 +93,7 @@ impl Default for UserPreferences {
 pub struct SyncplayConfig {
     pub server: ServerConfig,
     pub user: UserPreferences,
+    pub player: PlayerConfig,
     pub recent_servers: Vec<ServerConfig>,
 }
 
@@ -80,6 +102,7 @@ impl Default for SyncplayConfig {
         Self {
             server: ServerConfig::default(),
             user: UserPreferences::default(),
+            player: PlayerConfig::default(),
             recent_servers: vec![
                 ServerConfig::default(),
                 ServerConfig {

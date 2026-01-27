@@ -21,9 +21,21 @@ interface UserPreferences {
   auto_connect: boolean;
 }
 
+interface PlayerConfig {
+  player_path: string;
+  media_directory: string;
+}
+
+interface DetectedPlayer {
+  name: string;
+  path: string;
+  version: string | null;
+}
+
 interface SyncplayConfig {
   server: ServerConfig;
   user: UserPreferences;
+  player: PlayerConfig;
   recent_servers: ServerConfig[];
 }
 
@@ -36,11 +48,14 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
   const [config, setConfig] = useState<SyncplayConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"server" | "user" | "advanced">("server");
+  const [activeTab, setActiveTab] = useState<"server" | "user" | "player" | "advanced">("server");
+  const [detectedPlayers, setDetectedPlayers] = useState<DetectedPlayer[]>([]);
+  const [detectingPlayers, setDetectingPlayers] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
       loadConfig();
+      detectPlayers();
     }
   }, [isOpen]);
 
@@ -54,6 +69,18 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
       setError(err as string);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const detectPlayers = async () => {
+    setDetectingPlayers(true);
+    try {
+      const players = await invoke<DetectedPlayer[]>("detect_available_players");
+      setDetectedPlayers(players);
+    } catch (err) {
+      console.error("Failed to detect players:", err);
+    } finally {
+      setDetectingPlayers(false);
     }
   };
 
@@ -102,6 +129,14 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
                 }`}
               >
                 User
+              </button>
+              <button
+                onClick={() => setActiveTab("player")}
+                className={`px-4 py-2 ${
+                  activeTab === "player" ? "border-b-2 border-blue-500 text-white" : "text-gray-400"
+                }`}
+              >
+                Player
               </button>
               <button
                 onClick={() => setActiveTab("advanced")}
@@ -244,6 +279,80 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
                     className="w-4 h-4"
                   />
                   <label className="text-sm">Auto-connect on startup</label>
+                </div>
+              </div>
+            )}
+
+            {/* Player Tab */}
+            {activeTab === "player" && (
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium mb-1">Media Player</label>
+                  {detectingPlayers ? (
+                    <p className="text-sm text-gray-400">Detecting players...</p>
+                  ) : detectedPlayers.length > 0 ? (
+                    <select
+                      value={config.player.player_path}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          player: { ...config.player, player_path: e.target.value },
+                        })
+                      }
+                      className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
+                    >
+                      <option value="">Select a player...</option>
+                      {detectedPlayers.map((player, index) => (
+                        <option key={index} value={player.path}>
+                          {player.name} {player.version ? `(${player.version})` : ""} - {player.path}
+                        </option>
+                      ))}
+                      <option value="custom">Custom path...</option>
+                    </select>
+                  ) : (
+                    <p className="text-sm text-gray-400 mb-2">No players detected. Enter path manually.</p>
+                  )}
+                </div>
+
+                {(config.player.player_path === "custom" || detectedPlayers.length === 0 ||
+                  !detectedPlayers.some(p => p.path === config.player.player_path)) && (
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Player Path (Manual)</label>
+                    <input
+                      type="text"
+                      value={config.player.player_path === "custom" ? "" : config.player.player_path}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          player: { ...config.player, player_path: e.target.value },
+                        })
+                      }
+                      className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
+                      placeholder="/usr/local/bin/mpv"
+                    />
+                    <p className="text-xs text-gray-400 mt-1">
+                      Full path to media player executable
+                    </p>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">Media Directory</label>
+                  <input
+                    type="text"
+                    value={config.player.media_directory}
+                    onChange={(e) =>
+                      setConfig({
+                        ...config,
+                        player: { ...config.player, media_directory: e.target.value },
+                      })
+                    }
+                    className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
+                    placeholder="/path/to/media"
+                  />
+                  <p className="text-xs text-gray-400 mt-1">
+                    Default directory for media files
+                  </p>
                 </div>
               </div>
             )}
