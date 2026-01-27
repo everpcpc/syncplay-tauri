@@ -3,7 +3,7 @@
 use crate::app_state::AppState;
 use crate::config::{save_config, SyncplayConfig};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{AppHandle, Runtime, State};
 
 #[tauri::command]
 pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<SyncplayConfig, String> {
@@ -13,7 +13,8 @@ pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<SyncplayConfi
 }
 
 #[tauri::command]
-pub async fn update_config(
+pub async fn update_config<R: Runtime>(
+    app: AppHandle<R>,
     config: SyncplayConfig,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
@@ -26,7 +27,7 @@ pub async fn update_config(
     })?;
 
     // Save config
-    save_config(&config).map_err(|e| {
+    save_config(&app, &config).map_err(|e| {
         tracing::error!("Failed to save config: {}", e);
         format!("Failed to save configuration: {}", e)
     })?;
@@ -38,8 +39,8 @@ pub async fn update_config(
 }
 
 #[tauri::command]
-pub async fn get_config_path() -> Result<String, String> {
-    crate::config::get_config_path()
+pub async fn get_config_path<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
+    crate::config::get_config_path(&app)
         .map(|p| p.to_string_lossy().to_string())
         .map_err(|e| format!("Failed to get config path: {}", e))
 }

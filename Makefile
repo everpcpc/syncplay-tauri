@@ -1,4 +1,4 @@
-.PHONY: bump-major bump-minor bump-patch format run test
+.PHONY: bump-major bump-minor bump-patch format run test lint
 
 # Get current version from package.json
 CURRENT_VERSION := $(shell jq -r '.version' package.json)
@@ -23,6 +23,13 @@ test:
 	@echo "Running Rust tests..."
 	@cd src-tauri && cargo test
 	@echo "All tests completed"
+
+lint:
+	@echo "Linting Rust code..."
+	@cd src-tauri && cargo clippy --all-targets
+	@echo "Type-checking frontend..."
+	@pnpm exec tsc --noEmit
+	@echo "Lint checks completed"
 
 bump-major:
 	@echo "Bumping major version from $(CURRENT_VERSION)"

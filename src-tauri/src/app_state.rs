@@ -1,7 +1,7 @@
 use anyhow::Result;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter};
 
 use crate::client::{chat::ChatManager, playlist::Playlist, state::ClientState, sync::SyncEngine};
 use crate::config::SyncplayConfig;
@@ -39,11 +39,6 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Arc<Self> {
-        let config = crate::config::load_config().unwrap_or_else(|e| {
-            tracing::error!("Failed to load config: {}", e);
-            SyncplayConfig::default()
-        });
-
         Arc::new(Self {
             connection: Arc::new(Mutex::new(None)),
             mpv: Arc::new(Mutex::new(None)),
@@ -52,7 +47,7 @@ impl AppState {
             playlist: Playlist::new(),
             chat: ChatManager::new(),
             sync_engine: Arc::new(Mutex::new(SyncEngine::new())),
-            config: Arc::new(Mutex::new(config)),
+            config: Arc::new(Mutex::new(SyncplayConfig::default())),
             suppress_next_file_update: Arc::new(Mutex::new(false)),
             last_hello: Arc::new(Mutex::new(None)),
             hello_sent: Arc::new(Mutex::new(false)),
@@ -68,7 +63,7 @@ impl AppState {
     /// Emit an event to the frontend
     pub fn emit_event(&self, event: &str, payload: impl serde::Serialize + Clone) {
         if let Some(handle) = self.app_handle.lock().as_ref() {
-            if let Err(e) = handle.emit_all(event, payload) {
+            if let Err(e) = handle.emit(event, payload) {
                 tracing::error!("Failed to emit event {}: {}", event, e);
             }
         }

@@ -26,6 +26,8 @@ impl Default for ServerConfig {
 pub struct UserPreferences {
     pub username: String,
     pub default_room: String,
+    pub room_list: Vec<String>,
+    pub theme: String,
 
     // Sync thresholds
     pub seek_threshold_rewind: f64,
@@ -73,6 +75,8 @@ impl Default for UserPreferences {
         Self {
             username: String::new(),
             default_room: "default".to_string(),
+            room_list: Vec::new(),
+            theme: "dark".to_string(),
 
             // Default sync thresholds (from sync engine)
             seek_threshold_rewind: 4.0,
@@ -127,10 +131,6 @@ impl SyncplayConfig {
 
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), String> {
-        if self.user.username.is_empty() {
-            return Err("Username cannot be empty".to_string());
-        }
-
         if self.server.host.is_empty() {
             return Err("Server host cannot be empty".to_string());
         }
@@ -186,16 +186,16 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_empty_username() {
+    fn test_validate_empty_host() {
         let mut config = SyncplayConfig::default();
-        config.user.username = String::new();
+        config.server.host = String::new();
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_validate_valid_config() {
         let mut config = SyncplayConfig::default();
-        config.user.username = "testuser".to_string();
+        config.user.username = String::new();
         assert!(config.validate().is_ok());
     }
 

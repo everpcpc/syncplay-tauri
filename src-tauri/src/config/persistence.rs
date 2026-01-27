@@ -1,96 +1,100 @@
 // Persistence module
-// Configuration file I/O
+// Configuration storage via tauri-plugin-store
 
-use super::settings::{ServerConfig, SyncplayConfig, UserPreferences};
+use super::settings::SyncplayConfig;
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
-use std::fs;
 use std::path::PathBuf;
+use tauri::{AppHandle, Runtime};
+use tauri_plugin_store::{resolve_store_path, StoreBuilder};
 
-/// Get the configuration file path
-pub fn get_config_path() -> Result<PathBuf> {
-    let proj_dirs = ProjectDirs::from("com", "syncplay", "syncplay-tauri")
-        .context("Failed to determine project directories")?;
+const STORE_PATH: &str = "syncplay.store.json";
+const CONFIG_KEY: &str = "config";
 
-    let config_dir = proj_dirs.config_dir();
-    fs::create_dir_all(config_dir).context("Failed to create config directory")?;
-
-    Ok(config_dir.join("config.json"))
+/// Get the configuration store path
+pub fn get_config_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
+    resolve_store_path(app, STORE_PATH).context("Failed to resolve store path")
 }
 
-/// Load configuration from JSON file
-pub fn load_config() -> Result<SyncplayConfig> {
-    let config_path = get_config_path()?;
+/// Load configuration from the store
+pub fn load_config<R: Runtime>(app: &AppHandle<R>) -> Result<SyncplayConfig> {
+    let store = StoreBuilder::new(app, STORE_PATH)
+        .build()
+        .context("Failed to open config store")?;
 
-    if !config_path.exists() {
-        tracing::info!("Config file not found, using defaults");
-        return Ok(SyncplayConfig::default());
+    if let Some(value) = store.get(CONFIG_KEY) {
+        if let Ok(config) = serde_json::from_value::<SyncplayConfig>(value) {
+            return Ok(config);
+        }
+        tracing::warn!("Failed to deserialize config, resetting to defaults");
     }
 
-    let contents = fs::read_to_string(&config_path).context("Failed to read config file")?;
-
-    let config: SyncplayConfig =
-        serde_json::from_str(&contents).context("Failed to parse config file")?;
-
-    tracing::info!("Loaded config from {:?}", config_path);
+    let config = SyncplayConfig::default();
+    let value = serde_json::to_value(&config).context("Failed to serialize default config")?;
+    store.set(CONFIG_KEY.to_string(), value);
+    store.save().context("Failed to persist default config")?;
     Ok(config)
 }
 
-/// Save configuration to JSON file
-pub fn save_config(config: &SyncplayConfig) -> Result<()> {
-    let config_path = get_config_path()?;
+/// Save configuration to the store
+pub fn save_config<R: Runtime>(app: &AppHandle<R>, config: &SyncplayConfig) -> Result<()> {
+    let store = StoreBuilder::new(app, STORE_PATH)
+        .build()
+        .context("Failed to open config store")?;
 
-    let contents = serde_json::to_string_pretty(config).context("Failed to serialize config")?;
-
-    fs::write(&config_path, contents).context("Failed to write config file")?;
-
-    tracing::info!("Saved config to {:?}", config_path);
+    let value = serde_json::to_value(config).context("Failed to serialize config")?;
+    store.set(CONFIG_KEY.to_string(), value);
+    store.save().context("Failed to save config store")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use tauri::test::{mock_builder, mock_context, noop_assets};
+
+    fn build_test_app() -> tauri::App<tauri::test::MockRuntime> {
+        mock_builder()
+            .plugin(tauri_plugin_store::Builder::default().build())
+            .build(mock_context(noop_assets()))
+            .unwrap()
+    }
+
+    fn clear_store(app: &tauri::App<tauri::test::MockRuntime>) {
+        if let Ok(path) = get_config_path(app.handle()) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     #[test]
     fn test_save_and_load_config() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.json");
-
-        // Create a test config
+        let app = build_test_app();
+        clear_store(&app);
         let mut config = SyncplayConfig::default();
         config.user.username = "testuser".to_string();
         config.server.host = "example.com".to_string();
         config.server.port = 9000;
 
-        // Save to temp file
-        let contents = serde_json::to_string_pretty(&config).unwrap();
-        fs::write(&config_path, contents).unwrap();
+        save_config(app.handle(), &config).unwrap();
+        let loaded = load_config(app.handle()).unwrap();
 
-        // Load and verify
-        let loaded_contents = fs::read_to_string(&config_path).unwrap();
-        let loaded_config: SyncplayConfig = serde_json::from_str(&loaded_contents).unwrap();
-
-        assert_eq!(loaded_config.server.host, "example.com");
-        assert_eq!(loaded_config.server.port, 9000);
-        assert_eq!(loaded_config.user.username, "testuser");
+        assert_eq!(loaded.server.host, "example.com");
+        assert_eq!(loaded.server.port, 9000);
+        assert_eq!(loaded.user.username, "testuser");
     }
 
     #[test]
     fn test_config_path() {
-        let path = get_config_path();
-        assert!(path.is_ok());
-        let path = path.unwrap();
-        assert!(path.to_string_lossy().contains("syncplay-tauri"));
-        assert!(path.to_string_lossy().ends_with("config.json"));
+        let app = build_test_app();
+        let path = get_config_path(app.handle()).unwrap();
+        assert!(path.to_string_lossy().contains("syncplay"));
+        assert!(path.to_string_lossy().ends_with(STORE_PATH));
     }
 
     #[test]
     fn test_load_nonexistent_config() {
-        // This should return default config without error
-        // Note: This test might fail if a real config file exists
-        let config = SyncplayConfig::default();
+        let app = build_test_app();
+        clear_store(&app);
+        let config = load_config(app.handle()).unwrap();
         assert_eq!(config.server.host, "syncplay.pl");
     }
 }

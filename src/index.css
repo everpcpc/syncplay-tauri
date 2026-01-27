@@ -2,11 +2,155 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --app-bg: #0b0f14;
+  --app-bg-gradient:
+    radial-gradient(1200px 800px at 10% -10%, rgba(37, 99, 235, 0.18), transparent 60%),
+    radial-gradient(900px 700px at 100% 0%, rgba(16, 185, 129, 0.16), transparent 55%);
+  --app-panel: #0f172a;
+  --app-panel-2: #111827;
+  --app-panel-hover: #1f2937;
+  --app-border: #1e293b;
+  --app-text: #e2e8f0;
+  --app-muted: #94a3b8;
+  --app-overlay: rgba(2, 6, 23, 0.6);
+}
+
+.theme-light {
+  --app-bg: #f8fafc;
+  --app-bg-gradient:
+    radial-gradient(1000px 600px at 0% -15%, rgba(59, 130, 246, 0.14), transparent 60%),
+    radial-gradient(900px 600px at 100% 0%, rgba(16, 185, 129, 0.12), transparent 55%);
+  --app-panel: #ffffff;
+  --app-panel-2: #f1f5f9;
+  --app-panel-hover: #e2e8f0;
+  --app-border: #e2e8f0;
+  --app-text: #0f172a;
+  --app-muted: #64748b;
+  --app-overlay: rgba(15, 23, 42, 0.2);
+}
+
+.theme-dark {
+  --app-bg: #0b0f14;
+  --app-panel: #0f172a;
+  --app-panel-2: #111827;
+  --app-panel-hover: #1f2937;
+  --app-border: #1e293b;
+  --app-text: #e2e8f0;
+  --app-muted: #94a3b8;
+  --app-overlay: rgba(2, 6, 23, 0.6);
+}
+
+.app-shell {
+  background-color: var(--app-bg);
+  background-image: var(--app-bg-gradient);
+  color: var(--app-text);
+}
+
+.app-header {
+  background-color: var(--app-panel);
+  border-bottom: 1px solid var(--app-border);
+}
+
+.app-sidebar {
+  background-color: var(--app-panel);
+  border-right: 1px solid var(--app-border);
+}
+
+.app-sidebar-right {
+  background-color: var(--app-panel);
+  border-left: 1px solid var(--app-border);
+}
+
+.app-panel {
+  background-color: var(--app-panel);
+  border: 1px solid var(--app-border);
+}
+
+.app-panel-muted {
+  background-color: var(--app-panel-2);
+  border: 1px solid var(--app-border);
+}
+
+.app-surface {
+  background-color: var(--app-panel);
+}
+
+.app-surface-muted {
+  background-color: var(--app-panel-2);
+}
+
+.app-input {
+  background-color: var(--app-panel-2);
+  border: 1px solid var(--app-border);
+  color: var(--app-text);
+}
+
+.app-input-addon {
+  color: var(--app-muted);
+}
+
+.app-input-addon:hover {
+  background-color: var(--app-panel-hover);
+  color: var(--app-text);
+}
+
+.app-dropdown {
+  background-color: var(--app-panel);
+  border: 1px solid var(--app-border);
+  box-shadow: 0 18px 30px rgba(15, 23, 42, 0.18);
+}
+
+.theme-light .app-dropdown {
+  box-shadow: 0 18px 30px rgba(15, 23, 42, 0.08);
+}
+
+.app-dropdown-item {
+  border-radius: 0.5rem;
+  color: var(--app-text);
+}
+
+.app-dropdown-item:hover,
+.app-dropdown-item[aria-selected="true"] {
+  background-color: var(--app-panel-hover);
+}
+
+.btn-neutral {
+  background-color: var(--app-panel-2);
+  color: var(--app-text);
+}
+
+.btn-neutral:hover {
+  background-color: var(--app-panel-hover);
+}
+
+.btn-neutral:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.app-divider {
+  border-color: var(--app-border);
+}
+
+.app-text-muted {
+  color: var(--app-muted);
+}
+
+.app-chip-muted {
+  background-color: var(--app-panel-2);
+  color: var(--app-muted);
+}
+
+.app-overlay {
+  background-color: var(--app-overlay);
+}
+
 body {
   margin: 0;
-  font-family:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Oxygen", "Ubuntu", "Cantarell",
-    "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
+  font-family: "Space Grotesk", "Manrope", "IBM Plex Sans", "Source Sans 3", sans-serif;
+  background-color: var(--app-bg);
+  color: var(--app-text);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }

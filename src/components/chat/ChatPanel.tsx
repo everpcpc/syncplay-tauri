@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { useSyncplayStore } from "../../store";
-import { invoke } from "@tauri-apps/api";
+import { invoke } from "@tauri-apps/api/core";
 
 export function ChatPanel() {
   const messages = useSyncplayStore((state) => state.messages);
@@ -46,16 +46,16 @@ export function ChatPanel() {
       case "error":
         return "text-red-400";
       default:
-        return "text-gray-200";
+        return "";
     }
   };
 
   return (
     <div className="flex flex-col h-full">
       {/* Messages area */}
-      <div className="flex-1 p-4 overflow-auto space-y-2">
+      <div className="flex-1 p-5 overflow-auto space-y-3">
         {messages.length === 0 ? (
-          <p className="text-gray-400">
+          <p className="app-text-muted">
             {connection.connected
               ? "No messages yet. Start chatting!"
               : "Welcome to Syncplay! Connect to a server to get started."}
@@ -63,7 +63,7 @@ export function ChatPanel() {
         ) : (
           messages.map((msg, index) => (
             <div key={index} className="text-sm">
-              <span className="text-gray-500 text-xs">{formatTimestamp(msg.timestamp)}</span>
+              <span className="app-text-muted text-xs">{formatTimestamp(msg.timestamp)}</span>
               {msg.username && (
                 <span className="text-blue-400 font-medium ml-2">{msg.username}:</span>
               )}
@@ -75,7 +75,7 @@ export function ChatPanel() {
       </div>
 
       {/* Input area */}
-      <div className="border-t border-gray-700 p-4">
+      <div className="border-t app-divider p-4 app-surface">
         <input
           type="text"
           value={inputValue}
@@ -84,7 +84,7 @@ export function ChatPanel() {
           placeholder={
             connection.connected ? "Type a message... (or /help for commands)" : "Not connected"
           }
-          className="w-full bg-gray-800 text-white px-4 py-2 rounded border border-gray-700 focus:outline-none focus:border-blue-500"
+          className="w-full app-input px-4 py-2 rounded-md focus:outline-none focus:border-blue-500"
           disabled={!connection.connected}
         />
       </div>

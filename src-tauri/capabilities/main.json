@@ -1,0 +1,23 @@
+{
+  "identifier": "main",
+  "description": "Main window permissions for Syncplay.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "dialog:allow-open",
+    "allow-connect-to-server",
+    "allow-disconnect-from-server",
+    "allow-get-connection-status",
+    "allow-send-chat-message",
+    "allow-change-room",
+    "allow-set-ready",
+    "allow-update-playlist",
+    "allow-get-config",
+    "allow-update-config",
+    "allow-get-config-path",
+    "allow-detect-available-players"
+  ]
+}

@@ -296,9 +296,10 @@ pub struct UserInfo {
 
 /// Chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub username: String,
-    pub message: String,
+#[serde(untagged)]
+pub enum ChatMessage {
+    Text(String),
+    Entry { username: String, message: String },
 }
 
 /// Error message

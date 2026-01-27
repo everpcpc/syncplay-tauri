@@ -27,10 +27,21 @@ fn main() {
     let app_state = AppState::new();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
         .manage(app_state.clone())
         .setup(move |app| {
             // Store app handle for event emission
-            app_state.set_app_handle(app.handle());
+            app_state.set_app_handle(app.handle().clone());
+            let config = crate::config::load_config(app.handle()).unwrap_or_else(|e| {
+                tracing::error!("Failed to load config: {}", e);
+                crate::config::SyncplayConfig::default()
+            });
+            *app_state.config.lock() = config.clone();
+            app_state
+                .sync_engine
+                .lock()
+                .update_from_config(&config.user);
             let state = app_state.clone();
             tauri::async_runtime::spawn(async move {
                 crate::player::controller::spawn_player_state_loop(state);

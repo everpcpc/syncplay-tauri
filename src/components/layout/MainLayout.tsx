@@ -8,7 +8,8 @@ import { SettingsDialog } from "../settings/SettingsDialog";
 import { NotificationContainer } from "../notifications/NotificationContainer";
 import { useSyncplayStore } from "../../store";
 import { useNotificationStore } from "../../store/notifications";
-import { invoke } from "@tauri-apps/api";
+import { invoke } from "@tauri-apps/api/core";
+import { applyTheme } from "../../services/theme";
 
 interface SyncplayConfig {
   server: {
@@ -21,6 +22,7 @@ interface SyncplayConfig {
     default_room: string;
     show_playlist: boolean;
     auto_connect: boolean;
+    theme: string;
   };
 }
 
@@ -40,6 +42,7 @@ export function MainLayout() {
       try {
         const config = await invoke<SyncplayConfig>("get_config");
         setShowPlaylist(config.user.show_playlist);
+        applyTheme(config.user.theme);
 
         if (config.user.auto_connect && !connection.connected && config.user.username.trim()) {
           try {
@@ -69,10 +72,10 @@ export function MainLayout() {
   }, [connection.connected, addNotification]);
 
   return (
-    <div className="flex flex-col h-screen bg-gray-900 text-white">
+    <div className="flex flex-col h-screen app-shell">
       <NotificationContainer />
       {/* Header */}
-      <header className="bg-gray-800 p-4 border-b border-gray-700">
+      <header className="app-header px-6 py-4 backdrop-blur">
         <div className="flex items-center justify-between">
           <h1 className="text-xl font-bold">Syncplay</h1>
 
@@ -82,19 +85,19 @@ export function MainLayout() {
             <div className="flex gap-2">
               <button
                 onClick={() => setShowPlaylist(!showPlaylist)}
-                className="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded text-sm"
+                className="btn-neutral px-3 py-1.5 rounded-md text-sm"
               >
                 {showPlaylist ? "Hide" : "Show"} Playlist
               </button>
               <button
                 onClick={() => setShowSettingsDialog(true)}
-                className="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded text-sm"
+                className="btn-neutral px-3 py-1.5 rounded-md text-sm"
               >
                 Settings
               </button>
               <button
                 onClick={() => setShowConnectionDialog(true)}
-                className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-1 rounded text-sm"
+                className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-1.5 rounded-md text-sm"
               >
                 Connect
               </button>
@@ -106,7 +109,7 @@ export function MainLayout() {
       {/* Main content */}
       <div className="flex flex-1 overflow-hidden">
         {/* Users sidebar */}
-        <aside className="w-64 bg-gray-800 border-r border-gray-700 p-4 overflow-auto">
+        <aside className="w-64 app-sidebar p-5 overflow-auto">
           <UserList />
         </aside>
 

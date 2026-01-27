@@ -162,10 +162,16 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
         ProtocolMessage::Chat { Chat } => {
             tracing::info!("Received chat message: {:?}", Chat);
             // Transform chat message to match frontend format
+            let (username, message) = match Chat {
+                crate::network::messages::ChatMessage::Entry { username, message } => {
+                    (Some(username), message)
+                }
+                crate::network::messages::ChatMessage::Text(message) => (None, message),
+            };
             let chat_msg = serde_json::json!({
                 "timestamp": chrono::Utc::now().to_rfc3339(),
-                "username": Chat.username,
-                "message": Chat.message,
+                "username": username,
+                "message": message,
                 "messageType": "normal",
             });
             state.emit_event("chat-message-received", chat_msg);

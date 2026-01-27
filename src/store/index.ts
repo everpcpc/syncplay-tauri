@@ -54,6 +54,8 @@ interface SyncplayStore {
   setupEventListeners: () => void;
 }
 
+let listenersInitialized = false;
+
 export const useSyncplayStore = create<SyncplayStore>((set) => ({
   // Initial state
   connection: {
@@ -102,36 +104,47 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
 
   // Setup event listeners from Tauri backend
   setupEventListeners: () => {
+    if (listenersInitialized) {
+      return;
+    }
+    listenersInitialized = true;
+
+    const listenSafe = <T>(eventName: string, handler: (event: { payload: T }) => void) => {
+      listen<T>(eventName, handler).catch((error) => {
+        console.error(`Failed to listen for ${eventName}`, error);
+      });
+    };
+
     // Connection status changes
-    listen<ConnectionState>("connection-status-changed", (event) => {
+    listenSafe<ConnectionState>("connection-status-changed", (event) => {
       set(() => ({
         connection: event.payload,
       }));
     });
 
     // User list updates
-    listen<{ users: User[] }>("user-list-updated", (event) => {
+    listenSafe<{ users: User[] }>("user-list-updated", (event) => {
       set(() => ({
         users: event.payload.users,
       }));
     });
 
     // Chat messages
-    listen<ChatMessage>("chat-message-received", (event) => {
+    listenSafe<ChatMessage>("chat-message-received", (event) => {
       set((state) => ({
         messages: [...state.messages, event.payload],
       }));
     });
 
     // Playlist updates
-    listen<PlaylistState>("playlist-updated", (event) => {
+    listenSafe<PlaylistState>("playlist-updated", (event) => {
       set(() => ({
         playlist: event.payload,
       }));
     });
 
     // Player state updates
-    listen<PlayerState>("player-state-changed", (event) => {
+    listenSafe<PlayerState>("player-state-changed", (event) => {
       set((state) => ({
         player: { ...state.player, ...event.payload },
       }));

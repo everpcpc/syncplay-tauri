@@ -138,25 +138,8 @@ pub async fn send_chat_message(
         Ok(())
     } else {
         // Regular chat message
-        let username = state.client_state.get_username();
-        let message_for_event = message.clone();
-        state
-            .chat
-            .add_user_message(username.clone(), message.clone());
-        state.emit_event(
-            "chat-message-received",
-            serde_json::json!({
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "username": username,
-                "message": message_for_event,
-                "messageType": "normal",
-            }),
-        );
         let chat_msg = ProtocolMessage::Chat {
-            Chat: ProtocolChatMessage {
-                username: state.client_state.get_username(),
-                message: message.clone(),
-            },
+            Chat: ProtocolChatMessage::Text(message.clone()),
         };
         send_to_server(&state, chat_msg)?;
         Ok(())
