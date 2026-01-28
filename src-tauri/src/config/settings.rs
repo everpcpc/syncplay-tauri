@@ -46,7 +46,6 @@ pub enum TransparencyMode {
     High,
 }
 
-
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
