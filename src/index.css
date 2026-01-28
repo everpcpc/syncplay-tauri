@@ -17,7 +17,7 @@
   --app-border-strong: rgba(255, 255, 255, 0.14);
   --app-text: rgba(255, 255, 255, 0.9);
   --app-muted: rgba(255, 255, 255, 0.6);
-  --app-overlay: rgba(10, 14, 20, 0.6);
+  --app-overlay: rgba(10, 14, 20, 0.8);
   --app-shadow: none;
   --app-shadow-accent: rgba(92, 168, 255, 0.28);
   --app-accent: rgba(120, 190, 255, 0.9);
@@ -28,7 +28,7 @@
   --app-warning-soft: rgba(255, 175, 85, 0.18);
   --app-danger: rgba(255, 110, 110, 0.95);
   --app-danger-soft: rgba(255, 110, 110, 0.18);
-  --app-panel-glass: rgba(255, 255, 255, 0.12);
+  --app-panel-glass: rgba(18, 20, 28, 0.72);
   --titlebar-height: 24px;
   color-scheme: dark;
 }
@@ -49,7 +49,7 @@
   --app-border-strong: rgba(15, 23, 36, 0.14);
   --app-text: #1a1d24;
   --app-muted: rgba(17, 20, 28, 0.6);
-  --app-overlay: rgba(245, 247, 250, 0.6);
+  --app-overlay: rgba(245, 247, 250, 0.82);
   --app-shadow: none;
   --app-shadow-accent: rgba(90, 140, 210, 0.18);
   --app-accent: rgba(77, 153, 255, 0.85);
@@ -60,7 +60,7 @@
   --app-warning-soft: rgba(215, 120, 20, 0.16);
   --app-danger: rgba(200, 45, 45, 0.9);
   --app-danger-soft: rgba(200, 45, 45, 0.16);
-  --app-panel-glass: rgba(255, 255, 255, 0.92);
+  --app-panel-glass: rgba(255, 255, 255, 0.96);
 }
 
 .theme-dark {
@@ -74,7 +74,7 @@
   --app-panel: rgba(12, 16, 24, 0.92);
   --app-panel-2: rgba(30, 32, 40, 0.9);
   --app-panel-hover: rgba(54, 60, 72, 0.8);
-  --app-overlay: rgba(10, 14, 20, 0.8);
+  --app-overlay: rgba(10, 14, 20, 0.9);
 }
 
 .theme-light.reduced-transparency {
@@ -84,7 +84,7 @@
   --app-panel: rgba(255, 255, 255, 0.96);
   --app-panel-2: rgba(252, 253, 255, 0.96);
   --app-panel-hover: rgba(15, 23, 36, 0.18);
-  --app-overlay: rgba(245, 247, 250, 0.85);
+  --app-overlay: rgba(245, 247, 250, 0.92);
 }
 
 .app-shell {
@@ -311,15 +311,16 @@
 }
 
 .btn-primary {
-  background: linear-gradient(135deg, #62b7ff, #4fe3a3);
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  color: #0b0f1a;
-  box-shadow: 0 12px 22px var(--app-shadow-accent);
+  background-color: var(--app-panel-2);
+  border: 1px solid var(--app-border);
+  color: var(--app-text);
+  box-shadow: none;
 }
 
 .btn-primary:hover:not(:disabled) {
+  background-color: var(--app-panel-hover);
   transform: translateY(-1px);
-  box-shadow: 0 14px 24px var(--app-shadow-accent);
+  box-shadow: none;
 }
 
 .btn-primary:disabled,
@@ -344,14 +345,15 @@
 }
 
 .btn-danger {
-  background: linear-gradient(135deg, rgba(255, 120, 120, 0.95), rgba(255, 80, 120, 0.95));
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  color: #0b0f1a;
+  background-color: var(--app-panel-2);
+  border: 1px solid var(--app-border);
+  color: var(--app-text);
 }
 
 .btn-danger:hover:not(:disabled) {
+  background-color: var(--app-panel-hover);
   transform: translateY(-1px);
-  box-shadow: 0 12px 18px rgba(0, 0, 0, 0.25);
+  box-shadow: none;
 }
 
 .app-button-icon {
@@ -425,8 +427,6 @@
 
 .app-overlay {
   background-color: var(--app-overlay);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
 }
 
 .app-message {
@@ -470,8 +470,6 @@
   border-left-style: solid;
   box-shadow: var(--app-shadow);
   color: var(--app-text);
-  backdrop-filter: blur(20px) saturate(120%);
-  -webkit-backdrop-filter: blur(20px) saturate(120%);
 }
 
 .app-toast-success {
