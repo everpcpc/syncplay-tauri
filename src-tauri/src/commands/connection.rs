@@ -8,7 +8,7 @@ use crate::network::messages::{
     TLSMessage, UserUpdate,
 };
 use crate::network::tls::create_tls_connector;
-use crate::player::controller::{ensure_mpv_connected, load_media_by_name};
+use crate::player::controller::{ensure_player_connected, load_media_by_name};
 use crate::player::properties::PlayerState;
 use crate::utils::same_filename;
 use std::sync::Arc;
@@ -119,8 +119,8 @@ pub async fn connect_to_server<R: Runtime>(
                 },
             );
 
-            if let Err(e) = ensure_mpv_connected(state.inner()).await {
-                tracing::warn!("Failed to connect to mpv: {}", e);
+            if let Err(e) = ensure_player_connected(state.inner()).await {
+                tracing::warn!("Failed to connect to player: {}", e);
             }
 
             // Emit connection status event
@@ -279,14 +279,14 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         playstate.set_by.clone(),
     );
 
-    if let Err(e) = ensure_mpv_connected(state).await {
-        tracing::warn!("Failed to connect to mpv: {}", e);
+    if let Err(e) = ensure_player_connected(state).await {
+        tracing::warn!("Failed to connect to player: {}", e);
         return;
     }
 
-    let mpv = state.mpv.lock().clone();
-    let Some(mpv) = mpv else { return };
-    let player_state: PlayerState = mpv.get_state();
+    let player = state.player.lock().clone();
+    let Some(player) = player else { return };
+    let player_state: PlayerState = player.get_state();
     let (local_position, local_paused) = match (player_state.position, player_state.paused) {
         (Some(pos), Some(paused)) => (pos, paused),
         _ => return,
@@ -308,7 +308,7 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
     for action in actions {
         match action {
             crate::client::sync::SyncAction::Seek(position) => {
-                if let Err(e) = mpv.set_position(position).await {
+                if let Err(e) = player.set_position(position).await {
                     tracing::warn!("Failed to seek: {}", e);
                 }
             }
@@ -316,17 +316,17 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
                 if !paused {
                     *state.suppress_unpause_check.lock() = true;
                 }
-                if let Err(e) = mpv.set_paused(paused).await {
+                if let Err(e) = player.set_paused(paused).await {
                     tracing::warn!("Failed to set paused: {}", e);
                 }
             }
             crate::client::sync::SyncAction::Slowdown => {
-                if let Err(e) = mpv.set_speed(slowdown_rate).await {
+                if let Err(e) = player.set_speed(slowdown_rate).await {
                     tracing::warn!("Failed to set slowdown: {}", e);
                 }
             }
             crate::client::sync::SyncAction::ResetSpeed => {
-                if let Err(e) = mpv.set_speed(1.0).await {
+                if let Err(e) = player.set_speed(1.0).await {
                     tracing::warn!("Failed to reset speed: {}", e);
                 }
             }
@@ -614,9 +614,9 @@ fn autoplay_conditions_met(state: &Arc<AppState>) -> bool {
         return false;
     }
 
-    let mpv_state = state.mpv.lock().clone().map(|mpv| mpv.get_state());
-    if let Some(mpv_state) = mpv_state {
-        if mpv_state.paused == Some(false) {
+    let player_state = state.player.lock().clone().map(|player| player.get_state());
+    if let Some(player_state) = player_state {
+        if player_state.paused == Some(false) {
             return false;
         }
     }
@@ -657,13 +657,13 @@ fn start_autoplay_countdown(state: Arc<AppState>) {
             }
 
             if should_unpause {
-                if let Err(e) = ensure_mpv_connected(&state).await {
-                    tracing::warn!("Failed to connect to mpv for autoplay: {}", e);
+                if let Err(e) = ensure_player_connected(&state).await {
+                    tracing::warn!("Failed to connect to player for autoplay: {}", e);
                     return;
                 }
-                let mpv = state.mpv.lock().clone();
-                if let Some(mpv) = mpv {
-                    if let Err(e) = mpv.set_paused(false).await {
+                let player = state.player.lock().clone();
+                if let Some(player) = player {
+                    if let Err(e) = player.set_paused(false).await {
                         tracing::warn!("Failed to autoplay unpause: {}", e);
                     }
                 }
@@ -690,13 +690,13 @@ fn evaluate_autoplay(state: &Arc<AppState>) {
 }
 
 async fn pause_local_player(state: &Arc<AppState>) {
-    if let Err(e) = ensure_mpv_connected(state).await {
-        tracing::warn!("Failed to connect to mpv for pause: {}", e);
+    if let Err(e) = ensure_player_connected(state).await {
+        tracing::warn!("Failed to connect to player for pause: {}", e);
         return;
     }
-    let mpv = state.mpv.lock().clone();
-    if let Some(mpv) = mpv {
-        if let Err(e) = mpv.set_paused(true).await {
+    let player = state.player.lock().clone();
+    if let Some(player) = player {
+        if let Err(e) = player.set_paused(true).await {
             tracing::warn!("Failed to pause player: {}", e);
         }
     }

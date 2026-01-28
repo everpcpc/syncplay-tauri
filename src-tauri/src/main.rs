@@ -50,7 +50,7 @@ fn main() {
             let state = app_state.clone();
             if should_autostart_player(&config.player.player_path) {
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = crate::player::controller::ensure_mpv_connected(&state).await {
+                    if let Err(e) = crate::player::controller::ensure_player_connected(&state).await {
                         tracing::warn!("Failed to autostart player: {}", e);
                     }
                 });

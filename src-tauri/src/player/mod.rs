@@ -1,6 +1,11 @@
+pub mod backend;
 pub mod commands;
 pub mod controller;
 pub mod detection;
 pub mod events;
+pub mod mpc_web;
+pub mod mplayer_slave;
 pub mod mpv_ipc;
+pub mod mpv_backend;
 pub mod properties;
+pub mod vlc_rc;

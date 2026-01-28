@@ -7,16 +7,16 @@ use crate::client::{chat::ChatManager, playlist::Playlist, state::ClientState, s
 use crate::config::{SyncplayConfig, UnpauseAction};
 use crate::network::connection::Connection;
 use crate::network::messages::HelloMessage;
-use crate::player::mpv_ipc::MpvIpc;
+use crate::player::backend::PlayerBackend;
 
 /// Global application state
 pub struct AppState {
     /// Network connection to Syncplay server
     pub connection: Arc<Mutex<Option<Arc<Connection>>>>,
-    /// MPV player IPC client
-    pub mpv: Arc<Mutex<Option<Arc<MpvIpc>>>>,
-    /// MPV process handle
-    pub mpv_process: Arc<Mutex<Option<tokio::process::Child>>>,
+    /// Player backend instance
+    pub player: Arc<Mutex<Option<Arc<dyn PlayerBackend>>>>,
+    /// Player process handle
+    pub player_process: Arc<Mutex<Option<tokio::process::Child>>>,
     /// Client state (users, room, etc.)
     pub client_state: Arc<ClientState>,
     /// Playlist manager
@@ -45,8 +45,8 @@ impl AppState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             connection: Arc::new(Mutex::new(None)),
-            mpv: Arc::new(Mutex::new(None)),
-            mpv_process: Arc::new(Mutex::new(None)),
+            player: Arc::new(Mutex::new(None)),
+            player_process: Arc::new(Mutex::new(None)),
             client_state: ClientState::new(),
             playlist: Playlist::new(),
             chat: ChatManager::new(),
@@ -84,9 +84,9 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// Check if MPV is connected
-    pub fn is_mpv_connected(&self) -> bool {
-        self.mpv.lock().is_some()
+    /// Check if player is connected
+    pub fn is_player_connected(&self) -> bool {
+        self.player.lock().is_some()
     }
 }
 
@@ -94,8 +94,8 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             connection: Arc::new(Mutex::new(None)),
-            mpv: Arc::new(Mutex::new(None)),
-            mpv_process: Arc::new(Mutex::new(None)),
+            player: Arc::new(Mutex::new(None)),
+            player_process: Arc::new(Mutex::new(None)),
             client_state: ClientState::new(),
             playlist: Playlist::new(),
             chat: ChatManager::new(),

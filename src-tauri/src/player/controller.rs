@@ -3,9 +3,14 @@ use crate::config::{SyncplayConfig, UnpauseAction};
 use crate::network::messages::{
     FileInfo, PlayState, ProtocolMessage, ReadyState, SetMessage, StateMessage,
 };
+use crate::player::backend::{player_kind_from_path_or_default, PlayerBackend, PlayerKind};
 use crate::player::events::{EndFileReason, MpvPlayerEvent};
+use crate::player::mpc_web::MpcWebBackend;
+use crate::player::mplayer_slave::MplayerBackend;
+use crate::player::mpv_backend::MpvBackend;
 use crate::player::mpv_ipc::MpvIpc;
 use crate::player::properties::PlayerState;
+use crate::player::vlc_rc::VlcBackend;
 use crate::utils::{
     apply_privacy, is_trustable_and_trusted, is_url, same_filename, PRIVACY_HIDDEN_FILENAME,
 };
@@ -15,46 +20,88 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
-pub async fn ensure_mpv_connected(state: &Arc<AppState>) -> Result<(), String> {
-    if state.is_mpv_connected() {
+pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String> {
+    if state.is_player_connected() {
         return Ok(());
     }
 
     let config = state.config.lock().clone();
-    start_mpv_process_if_needed(state, &config)?;
-
-    let mut mpv = MpvIpc::new(config.player.mpv_socket_path.clone());
-    let mut attempts = 0;
-    let event_rx = loop {
-        match mpv.connect().await {
-            Ok(rx) => break rx,
-            Err(e) => {
-                attempts += 1;
-                if attempts >= 10 {
-                    return Err(format!("Failed to connect to mpv IPC: {}", e));
-                }
-                sleep(Duration::from_millis(200)).await;
+    let player_path = resolve_player_path(&config);
+    let kind = player_kind_from_path_or_default(&player_path);
+    let args = build_player_arguments(&config, &player_path);
+    {
+        let mut process_guard = state.player_process.lock();
+        if let Some(child) = process_guard.as_mut() {
+            if let Ok(Some(_)) = child.try_wait() {
+                *process_guard = None;
             }
+        }
+    }
+
+    let (backend, child) = match kind {
+        PlayerKind::Mpv | PlayerKind::MpvNet | PlayerKind::Iina => {
+            let child = start_mpv_process_if_needed(state, &config, &player_path, kind, &args)?;
+            let mut mpv = MpvIpc::new(config.player.mpv_socket_path.clone());
+            let mut attempts = 0;
+            let event_rx = loop {
+                match mpv.connect().await {
+                    Ok(rx) => break rx,
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= 10 {
+                            return Err(format!("Failed to connect to mpv IPC: {}", e));
+                        }
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            };
+            let backend = Arc::new(MpvBackend::new(kind, mpv)) as Arc<dyn PlayerBackend>;
+            spawn_event_loop(state.clone(), event_rx);
+            (backend, child)
+        }
+        PlayerKind::Vlc => {
+            let (backend, child) =
+                VlcBackend::start(&player_path, &args, None).await.map_err(|e| e.to_string())?;
+            (Arc::new(backend) as Arc<dyn PlayerBackend>, Some(child))
+        }
+        PlayerKind::Mplayer => {
+            let (backend, child) =
+                MplayerBackend::start(&player_path, &args, None).await.map_err(|e| e.to_string())?;
+            (Arc::new(backend) as Arc<dyn PlayerBackend>, Some(child))
+        }
+        PlayerKind::MpcHc | PlayerKind::MpcBe => {
+            let (backend, child) = MpcWebBackend::start(kind, &player_path, &args, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            (Arc::new(backend) as Arc<dyn PlayerBackend>, child)
+        }
+        PlayerKind::Unknown => {
+            return Err(format!("Unsupported player path: {}", player_path));
         }
     };
 
-    let mpv = Arc::new(mpv);
-    *state.mpv.lock() = Some(mpv.clone());
-
-    spawn_event_loop(state.clone(), event_rx);
+    *state.player.lock() = Some(backend);
+    if let Some(child) = child {
+        *state.player_process.lock() = Some(child);
+    } else if !matches!(kind, PlayerKind::Mpv | PlayerKind::MpvNet | PlayerKind::Iina) {
+        *state.player_process.lock() = None;
+    }
     Ok(())
 }
 
 pub fn spawn_player_state_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut last_sent: Option<PlayerStateSnapshot> = None;
+        let mut eof_sent = false;
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         loop {
             interval.tick().await;
-            let mpv = state.mpv.lock().clone();
-            let Some(mpv) = mpv else { continue };
-
-            let player_state = mpv.get_state();
+            let player = state.player.lock().clone();
+            let Some(player) = player else { continue };
+            if let Err(e) = player.poll_state().await {
+                tracing::warn!("Failed to poll player state: {}", e);
+            }
+            let player_state = player.get_state();
             emit_player_state(&state, &player_state);
 
             if !state.is_connected() {
@@ -74,7 +121,7 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
                     if !suppressed {
                         let config = state.config.lock().clone();
                         if !instaplay_conditions_met(&state, &config) {
-                            if let Err(e) = mpv.set_paused(true).await {
+                            if let Err(e) = player.set_paused(true).await {
                                 tracing::warn!("Failed to block unpause: {}", e);
                             }
                             if !state.client_state.is_ready() {
@@ -89,6 +136,7 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
             }
 
             if file_info_changed(&player_state, last_sent.as_ref()) {
+                eof_sent = false;
                 let mut suppress_guard = state.suppress_next_file_update.lock();
                 if *suppress_guard {
                     *suppress_guard = false;
@@ -114,6 +162,20 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
                 }
                 last_sent = Some(PlayerStateSnapshot::from(&player_state));
             }
+
+            if !eof_sent {
+                if let (Some(duration), Some(position)) =
+                    (player_state.duration, player_state.position)
+                {
+                    if duration > 0.0 {
+                        let threshold = if duration > 0.2 { duration - 0.2 } else { duration };
+                        if position >= threshold {
+                            eof_sent = true;
+                            handle_end_of_file(&state).await;
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -133,19 +195,19 @@ pub async fn load_media_by_name(
         if !trustable || !trusted {
             return Err("URL is not trusted".to_string());
         }
-        ensure_mpv_connected(state).await?;
-        let mpv = state
-            .mpv
+        ensure_player_connected(state).await?;
+        let player = state
+            .player
             .lock()
             .clone()
-            .ok_or_else(|| "MPV not connected".to_string())?;
-        mpv.load_file(filename)
+            .ok_or_else(|| "Player not connected".to_string())?;
+        player.load_file(filename)
             .await
             .map_err(|e| format!("Failed to load URL: {}", e))?;
         state.client_state.set_file(Some(filename.to_string()));
         if send_update {
-            let mpv_state = mpv.get_state();
-            send_file_update(state, &mpv_state);
+            let player_state = player.get_state();
+            send_file_update(state, &player_state);
         } else {
             *state.suppress_next_file_update.lock() = true;
         }
@@ -155,26 +217,27 @@ pub async fn load_media_by_name(
     let media_path = resolve_media_path(&config.player.media_directories, filename)
         .ok_or_else(|| format!("File not found in media directories: {}", filename))?;
 
-    ensure_mpv_connected(state).await?;
+    ensure_player_connected(state).await?;
 
-    let mpv = state
-        .mpv
+    let player = state
+        .player
         .lock()
         .clone()
-        .ok_or_else(|| "MPV not connected".to_string())?;
-    mpv.load_file(media_path.to_string_lossy().as_ref())
+        .ok_or_else(|| "Player not connected".to_string())?;
+    player
+        .load_file(media_path.to_string_lossy().as_ref())
         .await
         .map_err(|e| format!("Failed to load file: {}", e))?;
 
     state.client_state.set_file(Some(filename.to_string()));
     if send_update {
-        let mpv_state = state
-            .mpv
+        let player_state = state
+            .player
             .lock()
             .clone()
-            .map(|mpv| mpv.get_state())
+            .map(|player| player.get_state())
             .unwrap_or_default();
-        send_file_update(state, &mpv_state);
+        send_file_update(state, &player_state);
     } else {
         *state.suppress_next_file_update.lock() = true;
     }
@@ -222,53 +285,89 @@ pub fn resolve_media_path(media_directories: &[String], filename: &str) -> Optio
     None
 }
 
+fn resolve_player_path(config: &SyncplayConfig) -> String {
+    let trimmed = config.player.player_path.trim();
+    if trimmed.is_empty() || trimmed == "custom" {
+        "mpv".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn build_player_arguments(config: &SyncplayConfig, player_path: &str) -> Vec<String> {
+    let mut args = config.player.player_arguments.clone();
+    if let Some(extra_args) = config.player.per_player_arguments.get(player_path) {
+        args.extend(extra_args.clone());
+    }
+    args
+}
+
+fn find_iina_placeholder() -> Option<String> {
+    let candidates = ["app-icon.png", "icon.svg", "app-icon.svg"];
+    let cwd = std::env::current_dir().ok()?;
+    for name in candidates {
+        let path = cwd.join(name);
+        if path.exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 fn start_mpv_process_if_needed(
     state: &Arc<AppState>,
     config: &SyncplayConfig,
-) -> Result<(), String> {
+    player_path: &str,
+    kind: PlayerKind,
+    args: &[String],
+) -> Result<Option<tokio::process::Child>, String> {
     let should_start = {
-        let mut process_guard = state.mpv_process.lock();
+        let mut process_guard = state.player_process.lock();
         if let Some(child) = process_guard.as_mut() {
             if let Ok(Some(_)) = child.try_wait() {
                 *process_guard = None;
             } else {
-                return Ok(());
+                return Ok(None);
             }
         }
         process_guard.is_none()
     };
 
     if !should_start {
-        return Ok(());
+        return Ok(None);
     }
-
-    let player_path = if config.player.player_path.trim().is_empty() {
-        "mpv"
-    } else {
-        config.player.player_path.as_str()
-    };
 
     let mut cmd = Command::new(player_path);
-    let mut args = config.player.player_arguments.clone();
-    if let Some(extra_args) = config.player.per_player_arguments.get(player_path) {
-        args.extend(extra_args.clone());
+    let launch_args = args.to_vec();
+    match kind {
+        PlayerKind::Iina => {
+            cmd.arg("--no-stdin")
+                .arg(format!(
+                    "--mpv-input-ipc-server={}",
+                    config.player.mpv_socket_path
+                ));
+            if let Some(placeholder) = find_iina_placeholder() {
+                cmd.arg(placeholder);
+            }
+        }
+        _ => {
+            cmd.arg("--idle=yes")
+                .arg("--no-terminal")
+                .arg(format!(
+                    "--input-ipc-server={}",
+                    config.player.mpv_socket_path
+                ));
+        }
     }
-    cmd.arg("--idle=yes")
-        .arg("--no-terminal")
-        .arg(format!(
-            "--input-ipc-server={}",
-            config.player.mpv_socket_path
-        ))
-        .args(args)
+    cmd.args(&launch_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
     let child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to start mpv: {}", e))?;
-    *state.mpv_process.lock() = Some(child);
-    Ok(())
+        .map_err(|e| format!("Failed to start player: {}", e))?;
+    Ok(Some(child))
 }
 
 fn spawn_event_loop(
