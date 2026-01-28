@@ -3,6 +3,7 @@ import { UserList } from "../users/UserList";
 import { ChatPanel } from "../chat/ChatPanel";
 import { PlayerStatus } from "../player/PlayerStatus";
 import { FiLink2, FiList, FiMoon, FiSettings, FiSun } from "react-icons/fi";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWindowDrag } from "../../hooks/useWindowDrag";
 import { PlaylistPanel } from "../playlist/PlaylistPanel";
 import { ConnectionDialog } from "../connection/ConnectionDialog";
@@ -11,7 +12,6 @@ import { NotificationContainer } from "../notifications/NotificationContainer";
 import { useSyncplayStore } from "../../store";
 import { useNotificationStore } from "../../store/notifications";
 import { invoke } from "@tauri-apps/api/core";
-import { useLiquidGlassEffect } from "../../hooks/useLiquidGlassEffect";
 import {
   applyTheme,
   applyTransparency,
@@ -21,6 +21,7 @@ import {
 import { SyncplayConfig } from "../../types/config";
 
 export function MainLayout() {
+  const appWindow = getCurrentWindow();
   const [showConnectionDialog, setShowConnectionDialog] = useState(false);
   const [showSettingsDialog, setShowSettingsDialog] = useState(false);
   const [showPlaylist, setShowPlaylist] = useState(true);
@@ -91,10 +92,6 @@ export function MainLayout() {
     applyTransparency(config.user.reduce_transparency);
   }, [config]);
 
-  useLiquidGlassEffect({
-    reduceTransparency: config?.user.reduce_transparency ?? false,
-  });
-
   const handleToggleTheme = async () => {
     const previousTheme = theme;
     const nextTheme = theme === "light" ? "dark" : "light";
@@ -118,7 +115,15 @@ export function MainLayout() {
       });
     }
   };
+
+  const handleHeaderMouseDown = (event: React.MouseEvent) => {
+    if (event.button !== 0) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('[data-tauri-drag-region="false"]')) return;
+    void appWindow.startDragging();
+  };
   useWindowDrag("titlebar");
+  useWindowDrag("toolbar-drag");
 
   return (
     <div className="app-shell">
@@ -133,7 +138,12 @@ export function MainLayout() {
         </section>
 
         <section className="app-side-column">
-          <header className="app-header" data-tauri-drag-region>
+          <header
+            className="app-header"
+            id="toolbar-drag"
+            data-tauri-drag-region
+            onMouseDown={handleHeaderMouseDown}
+          >
             <div className="app-header-row">
               <PlayerStatus />
               <div className="app-header-actions" data-tauri-drag-region="false">

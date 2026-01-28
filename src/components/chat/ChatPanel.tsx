@@ -55,7 +55,7 @@ export function ChatPanel() {
   return (
     <div className="flex flex-col h-full">
       {/* Messages area */}
-      <div className="flex-1 p-5 overflow-auto space-y-3">
+      <div className="flex-1 p-5 pt-7 overflow-auto space-y-3">
         {messages.length === 0 ? (
           <p className="app-text-muted">
             {connection.connected

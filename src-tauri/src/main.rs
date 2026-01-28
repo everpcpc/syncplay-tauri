@@ -29,7 +29,6 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_liquid_glass::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .manage(app_state.clone())
         .setup(move |app| {

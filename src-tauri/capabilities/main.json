@@ -7,8 +7,8 @@
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
+    "core:window:allow-start-dragging",
     "dialog:allow-open",
-    "liquid-glass:default",
     "allow-connect-to-server",
     "allow-disconnect-from-server",
     "allow-get-connection-status",
