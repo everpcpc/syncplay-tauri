@@ -316,8 +316,14 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 app-overlay flex items-center justify-center z-50">
-      <div className="app-panel rounded-xl p-6 w-full max-w-4xl max-h-[85vh] overflow-auto shadow-xl">
+    <div
+      className="fixed inset-0 app-overlay flex items-center justify-center z-50"
+      data-tauri-drag-region="false"
+    >
+      <div
+        className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-4xl max-h-[85vh] overflow-auto shadow-xl"
+        data-tauri-drag-region="false"
+      >
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
           <div>
             <h2 className="text-xl font-bold">Settings</h2>

@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { UserList } from "../users/UserList";
 import { ChatPanel } from "../chat/ChatPanel";
 import { PlayerStatus } from "../player/PlayerStatus";
+import { FiLink2, FiList, FiMoon, FiSettings, FiSun } from "react-icons/fi";
+import { useWindowDrag } from "../../hooks/useWindowDrag";
 import { PlaylistPanel } from "../playlist/PlaylistPanel";
 import { ConnectionDialog } from "../connection/ConnectionDialog";
 import { SettingsDialog } from "../settings/SettingsDialog";
@@ -9,6 +11,7 @@ import { NotificationContainer } from "../notifications/NotificationContainer";
 import { useSyncplayStore } from "../../store";
 import { useNotificationStore } from "../../store/notifications";
 import { invoke } from "@tauri-apps/api/core";
+import { useLiquidGlassEffect } from "../../hooks/useLiquidGlassEffect";
 import {
   applyTheme,
   applyTransparency,
@@ -88,6 +91,10 @@ export function MainLayout() {
     applyTransparency(config.user.reduce_transparency);
   }, [config]);
 
+  useLiquidGlassEffect({
+    reduceTransparency: config?.user.reduce_transparency ?? false,
+  });
+
   const handleToggleTheme = async () => {
     const previousTheme = theme;
     const nextTheme = theme === "light" ? "dark" : "light";
@@ -111,66 +118,88 @@ export function MainLayout() {
       });
     }
   };
+  useWindowDrag("titlebar");
 
   return (
-    <div className="flex flex-col h-screen app-shell">
+    <div className="app-shell">
       <NotificationContainer />
-      {/* Header */}
-      <header className="app-header px-6 py-4">
-        <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold">Syncplay</h1>
+      <div className="drag-strip" id="titlebar" data-tauri-drag-region />
 
-          <div className="flex items-center gap-4">
-            <PlayerStatus />
+      <div className="app-layout">
+        <section className="app-main-column">
+          <main className="app-main-panel">
+            <ChatPanel />
+          </main>
+        </section>
 
-            <div className="flex gap-2">
-              <button
-                onClick={() => setShowPlaylist(!showPlaylist)}
-                className="btn-neutral px-3 py-1.5 rounded-md text-sm"
-              >
-                {showPlaylist ? "Hide" : "Show"} Playlist
-              </button>
-              <button
-                onClick={handleToggleTheme}
-                className="btn-neutral px-3 py-1.5 rounded-md text-sm"
-              >
-                Theme: {theme === "light" ? "Light" : "Dark"}
-              </button>
-              <button
-                onClick={() => setShowSettingsDialog(true)}
-                className="btn-neutral px-3 py-1.5 rounded-md text-sm"
-              >
-                Settings
-              </button>
-              <button
-                onClick={() => setShowConnectionDialog(true)}
-                className="btn-primary px-4 py-1.5 rounded-md text-sm"
-              >
-                Connect
-              </button>
+        <section className="app-side-column">
+          <header className="app-header" data-tauri-drag-region>
+            <div className="app-header-row">
+              <PlayerStatus />
+              <div className="app-header-actions" data-tauri-drag-region="false">
+                <button
+                  onClick={() => setShowPlaylist(!showPlaylist)}
+                  className="btn-neutral app-icon-button"
+                  data-tauri-drag-region="false"
+                  title={showPlaylist ? "Hide playlist" : "Show playlist"}
+                  aria-label={showPlaylist ? "Hide playlist" : "Show playlist"}
+                >
+                  <FiList className="app-icon" />
+                </button>
+                <button
+                  onClick={handleToggleTheme}
+                  className="btn-neutral app-icon-button"
+                  data-tauri-drag-region="false"
+                  title={theme === "light" ? "Switch to dark theme" : "Switch to light theme"}
+                  aria-label={theme === "light" ? "Switch to dark theme" : "Switch to light theme"}
+                >
+                  {theme === "light" ? (
+                    <FiMoon className="app-icon" />
+                  ) : (
+                    <FiSun className="app-icon" />
+                  )}
+                </button>
+                <button
+                  onClick={() => setShowSettingsDialog(true)}
+                  className="btn-neutral app-icon-button"
+                  data-tauri-drag-region="false"
+                  title="Settings"
+                  aria-label="Settings"
+                >
+                  <FiSettings className="app-icon" />
+                </button>
+                <button
+                  onClick={() => setShowConnectionDialog(true)}
+                  className="btn-primary app-icon-button"
+                  data-tauri-drag-region="false"
+                  title="Connect"
+                  aria-label="Connect"
+                >
+                  <FiLink2 className="app-icon" />
+                </button>
+              </div>
             </div>
+          </header>
+
+          <div
+            className="app-side-panels"
+            style={{
+              gridTemplateColumns: showPlaylist
+                ? "minmax(0, 1fr) minmax(0, 1fr)"
+                : "minmax(0, 1fr)",
+            }}
+          >
+            <aside className="app-side-panel app-sidebar p-5 overflow-auto">
+              <UserList />
+            </aside>
+
+            {showPlaylist && (
+              <aside className="app-side-panel app-sidebar-right overflow-hidden">
+                <PlaylistPanel />
+              </aside>
+            )}
           </div>
-        </div>
-      </header>
-
-      {/* Main content */}
-      <div className="flex flex-1 app-main">
-        {/* Users sidebar */}
-        <aside className="w-64 app-sidebar p-5 overflow-auto">
-          <UserList />
-        </aside>
-
-        {/* Chat area */}
-        <main className="flex-1 flex flex-col app-main-panel">
-          <ChatPanel />
-        </main>
-
-        {/* Playlist sidebar */}
-        {showPlaylist && (
-          <aside className="w-80 app-sidebar-right overflow-hidden">
-            <PlaylistPanel />
-          </aside>
-        )}
+        </section>
       </div>
 
       {/* Connection dialog */}

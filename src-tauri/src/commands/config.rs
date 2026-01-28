@@ -2,7 +2,6 @@
 
 use crate::app_state::AppState;
 use crate::config::{save_config, SyncplayConfig};
-use crate::window_effects::update_window_effects;
 use std::sync::Arc;
 use tauri::{AppHandle, Runtime, State};
 
@@ -35,7 +34,6 @@ pub async fn update_config<R: Runtime>(
 
     *state.config.lock() = config.clone();
     state.sync_engine.lock().update_from_config(&config.user);
-    update_window_effects(&app, config.user.reduce_transparency);
     {
         let mut autoplay = state.autoplay.lock();
         autoplay.enabled = config.user.autoplay_enabled;

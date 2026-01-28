@@ -1,4 +1,5 @@
 import { useSyncplayStore } from "../../store";
+import { FiChevronLeft, FiChevronRight, FiPlus, FiTrash2, FiX } from "react-icons/fi";
 import { useNotificationStore } from "../../store/notifications";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -132,16 +133,20 @@ export function PlaylistPanel() {
           <button
             onClick={handleAddFile}
             disabled={!connection.connected}
-            className="flex-1 btn-primary disabled:opacity-60 disabled:cursor-not-allowed px-3 py-1 rounded-md text-sm"
+            className="btn-primary app-icon-button disabled:opacity-60 disabled:cursor-not-allowed"
+            title="Add file"
+            aria-label="Add file"
           >
-            Add File
+            <FiPlus className="app-icon" />
           </button>
           <button
             onClick={handleClear}
             disabled={!connection.connected || playlist.items.length === 0}
-            className="btn-danger disabled:opacity-60 disabled:cursor-not-allowed px-3 py-1 rounded-md text-sm"
+            className="btn-danger app-icon-button disabled:opacity-60 disabled:cursor-not-allowed"
+            title="Clear playlist"
+            aria-label="Clear playlist"
           >
-            Clear
+            <FiTrash2 className="app-icon" />
           </button>
         </div>
       </div>
@@ -165,8 +170,10 @@ export function PlaylistPanel() {
                     onClick={() => handleRemoveItem(index)}
                     disabled={!connection.connected}
                     className="ml-2 app-text-danger hover:opacity-80 disabled:opacity-60"
+                    title="Remove item"
+                    aria-label="Remove item"
                   >
-                    ✕
+                    <FiX className="app-icon" />
                   </button>
                 </div>
               </div>
@@ -186,9 +193,11 @@ export function PlaylistPanel() {
               playlist.currentIndex === null ||
               playlist.currentIndex === 0
             }
-            className="flex-1 btn-neutral disabled:cursor-not-allowed px-3 py-2 rounded-md text-sm"
+            className="btn-neutral app-icon-button disabled:cursor-not-allowed"
+            title="Previous"
+            aria-label="Previous"
           >
-            ← Previous
+            <FiChevronLeft className="app-icon" />
           </button>
           <button
             onClick={handleNext}
@@ -198,9 +207,11 @@ export function PlaylistPanel() {
               playlist.currentIndex === null ||
               playlist.currentIndex >= playlist.items.length - 1
             }
-            className="flex-1 btn-neutral disabled:cursor-not-allowed px-3 py-2 rounded-md text-sm"
+            className="btn-neutral app-icon-button disabled:cursor-not-allowed"
+            title="Next"
+            aria-label="Next"
           >
-            Next →
+            <FiChevronRight className="app-icon" />
           </button>
         </div>
       </div>

@@ -330,8 +330,11 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
   };
 
   return (
-    <div className="fixed inset-0 app-overlay flex items-center justify-center z-50">
-      <div className="app-panel rounded-xl p-6 w-full max-w-2xl shadow-xl">
+    <div
+      className="fixed inset-0 app-overlay flex items-center justify-center z-50"
+      data-tauri-drag-region="false"
+    >
+      <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl shadow-xl">
         <h2 className="text-xl font-bold mb-4">
           {connection.connected ? "Connected" : "Connect to Server"}
         </h2>
