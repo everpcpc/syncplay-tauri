@@ -38,17 +38,14 @@ pub enum ChatOutputMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TransparencyMode {
+    #[default]
     Off,
     Low,
     High,
 }
 
-impl Default for TransparencyMode {
-    fn default() -> Self {
-        TransparencyMode::Off
-    }
-}
 
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
