@@ -246,29 +246,29 @@ export function PlaylistPanel() {
         <div className="flex items-center justify-between gap-4">
           <div className="flex gap-2">
             <button
-            onClick={handlePrevious}
-            disabled={
-              !connection.connected ||
-              playlist.items.length === 0 ||
-              playlist.currentIndex === null ||
-              playlist.currentIndex === 0
-            }
-            className="btn-neutral app-icon-button disabled:cursor-not-allowed"
-            aria-label="Previous"
-          >
+              onClick={handlePrevious}
+              disabled={
+                !connection.connected ||
+                playlist.items.length === 0 ||
+                playlist.currentIndex === null ||
+                playlist.currentIndex === 0
+              }
+              className="btn-neutral app-icon-button disabled:cursor-not-allowed"
+              aria-label="Previous"
+            >
               <LuChevronLeft className="app-icon" />
             </button>
             <button
-            onClick={handleNext}
-            disabled={
-              !connection.connected ||
-              playlist.items.length === 0 ||
-              playlist.currentIndex === null ||
-              playlist.currentIndex >= playlist.items.length - 1
-            }
-            className="btn-neutral app-icon-button disabled:cursor-not-allowed"
-            aria-label="Next"
-          >
+              onClick={handleNext}
+              disabled={
+                !connection.connected ||
+                playlist.items.length === 0 ||
+                playlist.currentIndex === null ||
+                playlist.currentIndex >= playlist.items.length - 1
+              }
+              className="btn-neutral app-icon-button disabled:cursor-not-allowed"
+              aria-label="Next"
+            >
               <LuChevronRight className="app-icon" />
             </button>
           </div>
@@ -281,7 +281,9 @@ export function PlaylistPanel() {
                 config?.user.shared_playlist_enabled ? "app-tag-accent" : ""
               }`}
               aria-label={
-                config?.user.shared_playlist_enabled ? "Shared playlists on" : "Shared playlists off"
+                config?.user.shared_playlist_enabled
+                  ? "Shared playlists on"
+                  : "Shared playlists off"
               }
             >
               <LuUsers className="app-icon" />
