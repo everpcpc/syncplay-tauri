@@ -15,6 +15,11 @@ interface DetectedPlayer {
   version: string | null;
 }
 
+interface PlayerDetectionCache {
+  players: DetectedPlayer[];
+  updated_at: number | null;
+}
+
 interface SettingsDialogProps {
   isOpen: boolean;
   onClose: () => void;
@@ -53,6 +58,8 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>("connection");
   const [detectedPlayers, setDetectedPlayers] = useState<DetectedPlayer[]>([]);
   const [detectingPlayers, setDetectingPlayers] = useState(false);
+  const [playersUpdatedAt, setPlayersUpdatedAt] = useState<number | null>(null);
+  const [playersError, setPlayersError] = useState<string | null>(null);
   const [serverAddress, setServerAddress] = useState("");
   const [serverAddressError, setServerAddressError] = useState<string | null>(null);
   const [playerArgsInput, setPlayerArgsInput] = useState("");
@@ -69,7 +76,6 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
       return;
     }
     loadConfig();
-    detectPlayers();
   }, [isOpen]);
 
   useEffect(() => {
@@ -94,17 +100,43 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     }
   };
 
-  const detectPlayers = async () => {
-    setDetectingPlayers(true);
+  const loadPlayerCache = async () => {
     try {
-      const players = await invoke<DetectedPlayer[]>("detect_available_players");
-      setDetectedPlayers(players);
+      const cache = await invoke<PlayerDetectionCache>("get_cached_players");
+      setDetectedPlayers(cache.players);
+      setPlayersUpdatedAt(cache.updated_at);
+      setPlayersError(null);
     } catch (err) {
-      console.error("Failed to detect players:", err);
+      console.error("Failed to load cached players:", err);
+      setPlayersError("Failed to load cached players.");
+    }
+  };
+
+  const refreshPlayers = async () => {
+    if (detectingPlayers) return;
+    setDetectingPlayers(true);
+    setPlayersError(null);
+    try {
+      const cache = await invoke<PlayerDetectionCache>("refresh_player_detection");
+      setDetectedPlayers(cache.players);
+      setPlayersUpdatedAt(cache.updated_at);
+    } catch (err) {
+      console.error("Failed to refresh players:", err);
+      const message =
+        typeof err === "string" ? err : (err as { message?: string })?.message || "Unknown error";
+      setPlayersError(`Failed to refresh players: ${message}`);
     } finally {
       setDetectingPlayers(false);
     }
   };
+
+  useEffect(() => {
+    if (!isOpen || activeTab !== "player") return;
+    void (async () => {
+      await loadPlayerCache();
+      await refreshPlayers();
+    })();
+  }, [isOpen, activeTab]);
 
   const parseAddress = (address: string): { host: string; port: number } | null => {
     const trimmed = address.trim();
@@ -344,11 +376,37 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
 
             {activeTab === "player" && (
               <div className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label className="block text-sm font-medium">Media Player</label>
+                  <div className="flex items-center gap-2 text-xs app-text-muted">
+                    {playersUpdatedAt && (
+                      <span>
+                        Last checked{" "}
+                        {new Date(playersUpdatedAt).toLocaleTimeString(undefined, {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={refreshPlayers}
+                      className="btn-neutral px-2 py-1 rounded-md text-xs"
+                      disabled={detectingPlayers}
+                    >
+                      {detectingPlayers ? "Refreshing..." : "Refresh Players"}
+                    </button>
+                  </div>
+                </div>
+
+                {(detectingPlayers || playersError) && (
+                  <p className="text-xs app-text-muted">
+                    {detectingPlayers ? "Refreshing player list..." : playersError}
+                  </p>
+                )}
+
                 <div>
-                  <label className="block text-sm font-medium mb-1">Media Player</label>
-                  {detectingPlayers ? (
-                    <p className="text-sm app-text-muted">Detecting players...</p>
-                  ) : detectedPlayers.length > 0 ? (
+                  {detectedPlayers.length > 0 ? (
                     <select
                       value={config.player.player_path}
                       onChange={(e) =>

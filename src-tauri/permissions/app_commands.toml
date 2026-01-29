@@ -1,0 +1,39 @@
+# Custom permission set for all Syncplay app commands.
+
+[[permission]]
+identifier = "allow-app-commands"
+description = "Enables all Syncplay app commands without any pre-configured scope."
+commands.allow = [
+  "connect_to_server",
+  "disconnect_from_server",
+  "get_connection_status",
+  "send_chat_message",
+  "change_room",
+  "set_ready",
+  "update_playlist",
+  "get_config",
+  "update_config",
+  "get_config_path",
+  "detect_available_players",
+  "get_cached_players",
+  "refresh_player_detection"
+]
+
+[[permission]]
+identifier = "deny-app-commands"
+description = "Denies all Syncplay app commands without any pre-configured scope."
+commands.deny = [
+  "connect_to_server",
+  "disconnect_from_server",
+  "get_connection_status",
+  "send_chat_message",
+  "change_room",
+  "set_ready",
+  "update_playlist",
+  "get_config",
+  "update_config",
+  "get_config_path",
+  "detect_available_players",
+  "get_cached_players",
+  "refresh_player_detection"
+]

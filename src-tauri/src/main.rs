@@ -61,6 +61,8 @@ fn main() {
             commands::config::update_config,
             commands::config::get_config_path,
             commands::player::detect_available_players,
+            commands::player::get_cached_players,
+            commands::player::refresh_player_detection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -11,6 +11,8 @@ fn main() {
         "update_config",
         "get_config_path",
         "detect_available_players",
+        "get_cached_players",
+        "refresh_player_detection",
     ];
 
     let manifest = tauri_build::AppManifest::new().commands(APP_COMMANDS);

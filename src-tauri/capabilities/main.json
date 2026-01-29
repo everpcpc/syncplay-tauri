@@ -9,16 +9,6 @@
     "core:event:allow-unlisten",
     "core:window:allow-start-dragging",
     "dialog:allow-open",
-    "allow-connect-to-server",
-    "allow-disconnect-from-server",
-    "allow-get-connection-status",
-    "allow-send-chat-message",
-    "allow-change-room",
-    "allow-set-ready",
-    "allow-update-playlist",
-    "allow-get-config",
-    "allow-update-config",
-    "allow-get-config-path",
-    "allow-detect-available-players"
+    "allow-app-commands"
   ]
 }

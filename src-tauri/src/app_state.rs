@@ -56,6 +56,10 @@ pub struct AppState {
     pub mpv_runtime_dir: Arc<Mutex<Option<TempDir>>>,
     /// Cached MPV IPC socket path
     pub mpv_socket_path: Arc<Mutex<Option<String>>>,
+    /// Cached detected players
+    pub detected_players: Arc<Mutex<Vec<crate::player::detection::DetectedPlayer>>>,
+    /// Timestamp (ms) when players were detected
+    pub detected_players_updated_at: Arc<Mutex<Option<i64>>>,
 }
 
 impl AppState {
@@ -82,6 +86,8 @@ impl AppState {
             mpv_runtime_dir: Arc::new(Mutex::new(None)),
             mpv_socket_path: Arc::new(Mutex::new(None)),
             player_connecting: Arc::new(Mutex::new(false)),
+            detected_players: Arc::new(Mutex::new(Vec::new())),
+            detected_players_updated_at: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -138,6 +144,8 @@ impl Default for AppState {
             mpv_runtime_dir: Arc::new(Mutex::new(None)),
             mpv_socket_path: Arc::new(Mutex::new(None)),
             player_connecting: Arc::new(Mutex::new(false)),
+            detected_players: Arc::new(Mutex::new(Vec::new())),
+            detected_players_updated_at: Arc::new(Mutex::new(None)),
         }
     }
 }
