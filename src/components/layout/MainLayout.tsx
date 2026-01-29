@@ -5,6 +5,9 @@ import { PlayerStatus } from "../player/PlayerStatus";
 import {
   LuColumns2,
   LuContrast,
+  LuLock,
+  LuLockOpen,
+  LuClock,
   LuDroplet,
   LuDroplets,
   LuLink2,
@@ -43,6 +46,7 @@ export function MainLayout() {
   const [theme, setTheme] = useState<ThemePreference>("dark");
   const [transparencyMode, setTransparencyMode] = useState<TransparencyPreference>("off");
   const connection = useSyncplayStore((state) => state.connection);
+  const tlsStatus = useSyncplayStore((state) => state.tlsStatus);
   const config = useSyncplayStore((state) => state.config);
   const setConfig = useSyncplayStore((state) => state.setConfig);
   const addNotification = useNotificationStore((state) => state.addNotification);
@@ -197,6 +201,29 @@ export function MainLayout() {
   useWindowDrag("titlebar");
   useWindowDrag("toolbar-drag");
 
+  const tlsLabel =
+    tlsStatus === "enabled"
+      ? "TLS enabled"
+      : tlsStatus === "pending"
+        ? "TLS pending"
+        : tlsStatus === "unsupported"
+          ? "TLS unsupported"
+          : "TLS unknown";
+  const tlsTagClass =
+    tlsStatus === "enabled"
+      ? "app-tag-success"
+      : tlsStatus === "pending"
+        ? "app-tag-accent"
+        : "app-tag-muted";
+  const tlsIcon =
+    tlsStatus === "enabled" ? (
+      <LuLock className="app-icon" />
+    ) : tlsStatus === "pending" ? (
+      <LuClock className="app-icon" />
+    ) : (
+      <LuLockOpen className="app-icon" />
+    );
+
   return (
     <div className="app-shell">
       <NotificationContainer />
@@ -300,6 +327,15 @@ export function MainLayout() {
                   </button>
                 </div>
                 <div className="flex items-center gap-2 ml-auto">
+                  {connection.connected && (
+                    <div
+                      className={`flex items-center justify-center px-2 py-1 rounded text-xs ${tlsTagClass}`}
+                      aria-label={tlsLabel}
+                      title={tlsLabel}
+                    >
+                      {tlsIcon}
+                    </div>
+                  )}
                   <button
                     onClick={() => setShowConnectionDialog(true)}
                     className="btn-primary app-icon-button"

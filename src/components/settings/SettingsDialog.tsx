@@ -9,23 +9,12 @@ import {
   UnpauseAction,
 } from "../../types/config";
 
-interface DetectedPlayer {
-  name: string;
-  path: string;
-  version: string | null;
-}
-
-interface PlayerDetectionCache {
-  players: DetectedPlayer[];
-  updated_at: number | null;
-}
-
 interface SettingsDialogProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
-type SettingsTab = "player" | "sync" | "ready" | "privacy" | "chat" | "osd" | "misc";
+type SettingsTab = "sync" | "ready" | "privacy" | "chat" | "osd" | "misc";
 
 const privacyOptions: Array<{ label: string; value: PrivacyMode }> = [
   { label: "Send raw", value: "send_raw" },
@@ -55,12 +44,7 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
   const [config, setConfig] = useState<SyncplayConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<SettingsTab>("player");
-  const [detectedPlayers, setDetectedPlayers] = useState<DetectedPlayer[]>([]);
-  const [detectingPlayers, setDetectingPlayers] = useState(false);
-  const [playersUpdatedAt, setPlayersUpdatedAt] = useState<number | null>(null);
-  const [playersError, setPlayersError] = useState<string | null>(null);
-  const [playerArgsInput, setPlayerArgsInput] = useState("");
+  const [activeTab, setActiveTab] = useState<SettingsTab>("sync");
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skipAutoSaveRef = useRef(true);
 
@@ -76,12 +60,6 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     loadConfig();
   }, [isOpen]);
 
-  useEffect(() => {
-    if (!config) return;
-    const args = config.player.player_arguments || [];
-    setPlayerArgsInput(args.join(" "));
-  }, [config?.player.player_arguments]);
-
   const loadConfig = async () => {
     setLoading(true);
     setError(null);
@@ -94,59 +72,6 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     } finally {
       setLoading(false);
     }
-  };
-
-  const loadPlayerCache = async () => {
-    try {
-      const cache = await invoke<PlayerDetectionCache>("get_cached_players");
-      setDetectedPlayers(cache.players);
-      setPlayersUpdatedAt(cache.updated_at);
-      setPlayersError(null);
-    } catch (err) {
-      console.error("Failed to load cached players:", err);
-      setPlayersError("Failed to load cached players.");
-    }
-  };
-
-  const refreshPlayers = async () => {
-    if (detectingPlayers) return;
-    setDetectingPlayers(true);
-    setPlayersError(null);
-    try {
-      const cache = await invoke<PlayerDetectionCache>("refresh_player_detection");
-      setDetectedPlayers(cache.players);
-      setPlayersUpdatedAt(cache.updated_at);
-    } catch (err) {
-      console.error("Failed to refresh players:", err);
-      const message =
-        typeof err === "string" ? err : (err as { message?: string })?.message || "Unknown error";
-      setPlayersError(`Failed to refresh players: ${message}`);
-    } finally {
-      setDetectingPlayers(false);
-    }
-  };
-
-  useEffect(() => {
-    if (!isOpen || activeTab !== "player") return;
-    void (async () => {
-      await loadPlayerCache();
-      await refreshPlayers();
-    })();
-  }, [isOpen, activeTab]);
-
-  const updatePlayerArguments = (value: string) => {
-    if (!config) return;
-    const args = value
-      .split(" ")
-      .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0);
-    setConfig({
-      ...config,
-      player: {
-        ...config.player,
-        player_arguments: args,
-      },
-    });
   };
 
   useEffect(() => {
@@ -213,7 +138,6 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
           <>
             <div className="flex flex-wrap gap-2 mb-4 border-b app-divider">
               {[
-                { id: "player", label: "Player" },
                 { id: "sync", label: "Sync" },
                 { id: "ready", label: "Readiness" },
                 { id: "privacy", label: "Privacy" },
@@ -230,109 +154,6 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
                 </button>
               ))}
             </div>
-
-            {activeTab === "player" && (
-              <div className="space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <label className="block text-sm font-medium">Media Player</label>
-                  <div className="flex items-center gap-2 text-xs app-text-muted">
-                    {playersUpdatedAt && (
-                      <span>
-                        Last checked{" "}
-                        {new Date(playersUpdatedAt).toLocaleTimeString(undefined, {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                      </span>
-                    )}
-                    <button
-                      type="button"
-                      onClick={refreshPlayers}
-                      className="btn-neutral px-2 py-1 rounded-md text-xs"
-                      disabled={detectingPlayers}
-                    >
-                      {detectingPlayers ? "Refreshing..." : "Refresh Players"}
-                    </button>
-                  </div>
-                </div>
-
-                {(detectingPlayers || playersError) && (
-                  <p className="text-xs app-text-muted">
-                    {detectingPlayers ? "Refreshing player list..." : playersError}
-                  </p>
-                )}
-
-                <div>
-                  {detectedPlayers.length > 0 ? (
-                    <select
-                      value={config.player.player_path}
-                      onChange={(e) =>
-                        setConfig({
-                          ...config,
-                          player: { ...config.player, player_path: e.target.value },
-                        })
-                      }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
-                    >
-                      <option value="">Select a player...</option>
-                      {detectedPlayers.map((player, index) => (
-                        <option key={index} value={player.path}>
-                          {player.name} {player.version ? `(${player.version})` : ""} -{" "}
-                          {player.path}
-                        </option>
-                      ))}
-                      <option value="custom">Custom path...</option>
-                    </select>
-                  ) : (
-                    <p className="text-sm app-text-muted mb-2">
-                      No players detected. Enter path manually.
-                    </p>
-                  )}
-                </div>
-
-                {(config.player.player_path === "custom" ||
-                  detectedPlayers.length === 0 ||
-                  !detectedPlayers.some((p) => p.path === config.player.player_path)) && (
-                  <div>
-                    <label className="block text-sm font-medium mb-1">Player Path (Manual)</label>
-                    <input
-                      type="text"
-                      value={
-                        config.player.player_path === "custom" ? "" : config.player.player_path
-                      }
-                      onChange={(e) =>
-                        setConfig({
-                          ...config,
-                          player: { ...config.player, player_path: e.target.value },
-                        })
-                      }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
-                      placeholder="/usr/local/bin/mpv"
-                    />
-                    <p className="text-xs app-text-muted mt-1">
-                      Full path to media player executable
-                    </p>
-                  </div>
-                )}
-
-                <div>
-                  <label className="block text-sm font-medium mb-1">Player Arguments</label>
-                  <input
-                    type="text"
-                    value={playerArgsInput}
-                    onChange={(e) => {
-                      setPlayerArgsInput(e.target.value);
-                      updatePlayerArguments(e.target.value);
-                    }}
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
-                    placeholder="--fullscreen --no-border"
-                  />
-                  <p className="text-xs app-text-muted mt-1">
-                    Arguments applied when launching the player
-                  </p>
-                </div>
-              </div>
-            )}
 
             {activeTab === "sync" && (
               <div className="space-y-4">

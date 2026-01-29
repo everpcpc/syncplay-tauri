@@ -11,12 +11,15 @@ interface RoomManagerDialogProps {
 export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
   const [config, setConfig] = useState<SyncplayConfig | null>(null);
   const [loading, setLoading] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [roomNameInput, setRoomNameInput] = useState("");
   const [roomListInput, setRoomListInput] = useState("");
   const addNotification = useNotificationStore((state) => state.addNotification);
 
   useEffect(() => {
     if (!isOpen) {
       setConfig(null);
+      setRoomNameInput("");
       setRoomListInput("");
       return;
     }
@@ -26,6 +29,7 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
       try {
         const loaded = await invoke<SyncplayConfig>("get_config");
         setConfig(loaded);
+        setRoomNameInput(loaded.user.default_room);
       } catch (error) {
         addNotification({
           type: "error",
@@ -48,6 +52,22 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
         type: "error",
         message: "Failed to update room settings",
       });
+    }
+  };
+
+  const connectToRoom = async () => {
+    const trimmed = roomNameInput.trim();
+    if (!trimmed) return;
+    setConnecting(true);
+    try {
+      await invoke("change_room", { room: trimmed });
+    } catch (error) {
+      addNotification({
+        type: "error",
+        message: "Failed to change room",
+      });
+    } finally {
+      setConnecting(false);
     }
   };
 
@@ -106,7 +126,7 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
           <div>
             <h2 className="text-xl font-bold">Rooms</h2>
-            <p className="text-xs app-text-muted">Manage default room and saved rooms.</p>
+            <p className="text-xs app-text-muted">Manage room connections and defaults.</p>
           </div>
           <button onClick={onClose} className="btn-neutral px-3 py-2 rounded-md text-sm">
             Close
@@ -120,17 +140,34 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
         ) : config ? (
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-medium mb-1">Default Room</label>
-              <input
-                type="text"
-                value={config.user.default_room}
-                onChange={(e) => updateDefaultRoom(e.target.value)}
-                className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
-              />
+              <label className="block text-sm font-medium mb-1">Connect to Room</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={roomNameInput}
+                  onChange={(e) => setRoomNameInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void connectToRoom();
+                    }
+                  }}
+                  className="flex-1 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                  placeholder="Room name"
+                />
+                <button
+                  type="button"
+                  onClick={() => void connectToRoom()}
+                  className="btn-primary px-3 py-2 rounded text-sm"
+                  disabled={connecting}
+                >
+                  {connecting ? "Connecting..." : "Connect"}
+                </button>
+              </div>
             </div>
 
             <div>
-              <label className="block text-sm font-medium mb-1">Room List</label>
+              <label className="block text-sm font-medium mb-1">Saved Rooms</label>
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -157,21 +194,42 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
                 <p className="text-xs app-text-muted mt-2">No rooms saved.</p>
               ) : (
                 <div className="mt-2 space-y-2">
-                  {config.user.room_list.map((room) => (
-                    <div
-                      key={room}
-                      className="flex items-center justify-between app-panel-muted px-3 py-2 rounded"
-                    >
-                      <span className="text-sm truncate">{room}</span>
-                      <button
-                        type="button"
-                        onClick={() => removeRoomEntry(room)}
-                        className="text-xs app-text-danger hover:opacity-80"
+                  {config.user.room_list.map((room) => {
+                    const isDefault = room === config.user.default_room;
+                    return (
+                      <div
+                        key={room}
+                        className="flex items-center justify-between app-panel-muted px-3 py-2 rounded"
                       >
-                        Remove
-                      </button>
-                    </div>
-                  ))}
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-sm truncate">{room}</span>
+                          {isDefault && (
+                            <span className="text-xs app-tag-accent px-2 py-0.5 rounded">
+                              Default
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-3 shrink-0">
+                          {!isDefault && (
+                            <button
+                              type="button"
+                              onClick={() => updateDefaultRoom(room)}
+                              className="text-xs app-text-muted hover:opacity-80"
+                            >
+                              Make default
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => removeRoomEntry(room)}
+                            className="text-xs app-text-danger hover:opacity-80"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

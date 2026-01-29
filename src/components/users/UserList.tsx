@@ -1,18 +1,64 @@
-import { useState } from "react";
-import { LuPencilLine, LuUsers } from "react-icons/lu";
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { LuCheck, LuCircle, LuPencilLine, LuUsers } from "react-icons/lu";
 import { useSyncplayStore } from "../../store";
+import { useNotificationStore } from "../../store/notifications";
 import { RoomManagerDialog } from "./RoomManagerDialog";
 
 export function UserList() {
   const users = useSyncplayStore((state) => state.users);
   const connection = useSyncplayStore((state) => state.connection);
   const config = useSyncplayStore((state) => state.config);
+  const player = useSyncplayStore((state) => state.player);
+  const addNotification = useNotificationStore((state) => state.addNotification);
   const [showRoomManager, setShowRoomManager] = useState(false);
+  const lastPausedRef = useRef<boolean | null>(null);
 
-  const currentRoom =
-    users.find((user) => user.username === config?.user.username)?.room ??
-    config?.user.default_room ??
-    "Room";
+  const currentUser = users.find((user) => user.username === config?.user.username);
+  const isReady = currentUser?.isReady ?? false;
+
+  const currentRoom = currentUser?.room ?? config?.user.default_room ?? "Room";
+
+  useEffect(() => {
+    if (!connection.connected) {
+      lastPausedRef.current = player.paused;
+      return;
+    }
+    const lastPaused = lastPausedRef.current;
+    if (player.paused && lastPaused === false && isReady) {
+      void invoke("set_ready", { isReady: false }).catch((error) => {
+        const message =
+          typeof error === "string"
+            ? error
+            : (error as { message?: string })?.message || "Unknown error";
+        addNotification({
+          type: "error",
+          message: `Failed to update ready state: ${message}`,
+        });
+      });
+    }
+    lastPausedRef.current = player.paused;
+  }, [player.paused, isReady, connection.connected, addNotification]);
+
+  const handleToggleReady = () => {
+    if (!connection.connected) {
+      addNotification({
+        type: "warning",
+        message: "Connect to a server first",
+      });
+      return;
+    }
+    void invoke("set_ready", { isReady: !isReady }).catch((error) => {
+      const message =
+        typeof error === "string"
+          ? error
+          : (error as { message?: string })?.message || "Unknown error";
+      addNotification({
+        type: "error",
+        message: `Failed to update ready state: ${message}`,
+      });
+    });
+  };
 
   if (!connection.connected) {
     return (
@@ -44,13 +90,22 @@ export function UserList() {
           <span className="text-sm font-semibold">{currentRoom}</span>
           <span className="text-xs app-text-muted">({users.length})</span>
         </div>
-        <button
-          onClick={() => setShowRoomManager(true)}
-          className="btn-neutral app-icon-button"
-          aria-label="Rooms"
-        >
-          <LuPencilLine className="app-icon" />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleToggleReady}
+            className={`app-icon-button ${isReady ? "btn-primary" : "btn-neutral"}`}
+            aria-label={isReady ? "Ready" : "Not ready"}
+          >
+            {isReady ? <LuCheck className="app-icon" /> : <LuCircle className="app-icon" />}
+          </button>
+          <button
+            onClick={() => setShowRoomManager(true)}
+            className="btn-neutral app-icon-button"
+            aria-label="Rooms"
+          >
+            <LuPencilLine className="app-icon" />
+          </button>
+        </div>
       </div>
 
       {users.length === 0 ? (

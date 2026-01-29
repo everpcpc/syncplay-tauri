@@ -8,6 +8,8 @@ interface ConnectionState {
   server: string | null;
 }
 
+type TlsStatus = "unknown" | "pending" | "enabled" | "unsupported";
+
 interface User {
   username: string;
   room: string;
@@ -39,6 +41,7 @@ interface PlayerState {
 interface SyncplayStore {
   // State
   connection: ConnectionState;
+  tlsStatus: TlsStatus;
   users: User[];
   messages: ChatMessage[];
   playlist: PlaylistState;
@@ -47,6 +50,7 @@ interface SyncplayStore {
 
   // Actions
   setConnectionStatus: (status: ConnectionState) => void;
+  setTlsStatus: (status: TlsStatus) => void;
   setUsers: (users: User[]) => void;
   addMessage: (message: ChatMessage) => void;
   setPlaylist: (playlist: PlaylistState) => void;
@@ -65,6 +69,7 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
     connected: false,
     server: null,
   },
+  tlsStatus: "unknown",
   users: [],
   messages: [],
   playlist: {
@@ -84,6 +89,11 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
   setConnectionStatus: (status) =>
     set(() => ({
       connection: status,
+    })),
+
+  setTlsStatus: (status) =>
+    set(() => ({
+      tlsStatus: status,
     })),
 
   setUsers: (users) =>
@@ -128,6 +138,12 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
     listenSafe<ConnectionState>("connection-status-changed", (event) => {
       set(() => ({
         connection: event.payload,
+      }));
+    });
+
+    listenSafe<{ status: TlsStatus }>("tls-status-changed", (event) => {
+      set(() => ({
+        tlsStatus: event.payload.status,
       }));
     });
 

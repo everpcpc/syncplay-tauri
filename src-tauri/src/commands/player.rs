@@ -19,7 +19,10 @@ pub fn detect_available_players(state: State<'_, Arc<AppState>>) -> PlayerDetect
 pub fn get_cached_players(state: State<'_, Arc<AppState>>) -> PlayerDetectionCache {
     let players = state.detected_players.lock().clone();
     let updated_at = *state.detected_players_updated_at.lock();
-    PlayerDetectionCache { players, updated_at }
+    PlayerDetectionCache {
+        players,
+        updated_at,
+    }
 }
 
 #[tauri::command]
@@ -32,5 +35,8 @@ fn refresh_player_detection_inner(state: &Arc<AppState>) -> PlayerDetectionCache
     let updated_at = Some(chrono::Utc::now().timestamp_millis());
     *state.detected_players.lock() = players.clone();
     *state.detected_players_updated_at.lock() = updated_at;
-    PlayerDetectionCache { players, updated_at }
+    PlayerDetectionCache {
+        players,
+        updated_at,
+    }
 }

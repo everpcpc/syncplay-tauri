@@ -93,9 +93,17 @@ pub async fn connect_to_server<R: Runtime>(
                     send_hello(state.inner());
                 } else {
                     tracing::info!("Sent TLS request");
+                    state.emit_event(
+                        "tls-status-changed",
+                        serde_json::json!({ "status": "pending" }),
+                    );
                 }
             } else {
                 tracing::info!("TLS not supported by client, sending Hello");
+                state.emit_event(
+                    "tls-status-changed",
+                    serde_json::json!({ "status": "unsupported" }),
+                );
                 send_hello(state.inner());
             }
 
@@ -285,11 +293,6 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         playstate.set_by.clone(),
     );
 
-    if let Err(e) = ensure_player_connected(state).await {
-        tracing::warn!("Failed to connect to player: {}", e);
-        return;
-    }
-
     let player = state.player.lock().clone();
     let Some(player) = player else { return };
     let player_state: PlayerState = player.get_state();
@@ -465,12 +468,24 @@ async fn handle_tls_message(state: &Arc<AppState>, tls: TLSMessage) {
         tracing::info!("Server accepted TLS, upgrading connection");
         if let Err(e) = connection.upgrade_tls().await {
             tracing::error!("TLS upgrade failed: {}", e);
+            state.emit_event(
+                "tls-status-changed",
+                serde_json::json!({ "status": "unsupported" }),
+            );
             send_hello(state);
             return;
         }
+        state.emit_event(
+            "tls-status-changed",
+            serde_json::json!({ "status": "enabled" }),
+        );
         send_hello(state);
     } else if answer == "false" {
         tracing::info!("Server does not support TLS, sending Hello");
+        state.emit_event(
+            "tls-status-changed",
+            serde_json::json!({ "status": "unsupported" }),
+        );
         send_hello(state);
     } else {
         tracing::debug!("Ignoring TLS message: {}", answer);
@@ -822,6 +837,10 @@ pub async fn disconnect_from_server(state: State<'_, Arc<AppState>>) -> Result<(
             connected: false,
             server: None,
         },
+    );
+    state.emit_event(
+        "tls-status-changed",
+        serde_json::json!({ "status": "unknown" }),
     );
 
     Ok(())
