@@ -261,4 +261,10 @@ impl MpvIpc {
         let cmd = MpvCommand::show_text(text, duration_ms);
         self.send_command(cmd)
     }
+
+    /// Quit MPV/IINA
+    pub fn quit(&self) -> Result<()> {
+        let cmd = MpvCommand::quit();
+        self.send_command(cmd)
+    }
 }

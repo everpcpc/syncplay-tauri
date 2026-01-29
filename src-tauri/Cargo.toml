@@ -2,9 +2,9 @@
 name = "syncplay-tauri"
 version = "0.1.0"
 description = "A Tauri-based Syncplay client"
-authors = ["Syncplay Team"]
+authors = ["everpcpc"]
 license = "Apache-2.0"
-repository = "https://github.com/syncplay/syncplay-tauri"
+repository = "https://github.com/everpcpc/syncplay-tauri"
 edition = "2021"
 
 [build-dependencies]
@@ -39,10 +39,10 @@ shell-words = "1.1"
 url = "2.5"
 reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 urlencoding = "2.1"
+tempfile = "3.8"
 
 [dev-dependencies]
 tauri = { version = "2.9.5", features = ["test"] }
-tempfile = "3.8"
 
 [features]
 default = ["custom-protocol"]

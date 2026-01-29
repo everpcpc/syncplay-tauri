@@ -61,4 +61,8 @@ impl PlayerBackend for MpvBackend {
     fn show_osd(&self, text: &str, duration_ms: Option<u64>) -> anyhow::Result<()> {
         self.ipc.show_osd(text, duration_ms)
     }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        self.ipc.quit()
+    }
 }

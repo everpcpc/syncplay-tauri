@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::backend::PlayerBackend;
 use super::properties::PlayerState;
@@ -25,6 +25,10 @@ impl VlcBackend {
         args: &[String],
         initial_file: Option<&str>,
     ) -> anyhow::Result<(Self, Child)> {
+        info!(
+            "Starting player: kind=Vlc, path={}, args={:?}, initial_file={:?}",
+            player_path, args, initial_file
+        );
         let mut cmd = Command::new(player_path);
         cmd.args(VLC_ARGS);
         cmd.args(args);
@@ -188,5 +192,9 @@ impl PlayerBackend for VlcBackend {
             let _ = guard.flush().await;
         });
         Ok(())
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        self.send_command("quit").await
     }
 }

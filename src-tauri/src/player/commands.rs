@@ -138,4 +138,12 @@ impl MpvCommand {
             request_id: Some(request_id),
         }
     }
+
+    /// Create a quit command
+    pub fn quit() -> Self {
+        Self {
+            command: vec![Value::String("quit".to_string())],
+            request_id: None,
+        }
+    }
 }

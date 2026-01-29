@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::backend::{PlayerBackend, PlayerKind};
 use super::properties::PlayerState;
@@ -44,6 +44,10 @@ impl MplayerBackend {
         args: &[String],
         initial_file: Option<&str>,
     ) -> anyhow::Result<(Self, Child)> {
+        info!(
+            "Starting player: kind=Mplayer, path={}, args={:?}, initial_file={:?}",
+            player_path, args, initial_file
+        );
         let mut cmd = Command::new(player_path);
         cmd.args(MPLAYER_ARGS);
         cmd.args(args);
@@ -214,5 +218,9 @@ impl PlayerBackend for MplayerBackend {
             let _ = guard.flush().await;
         });
         Ok(())
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        self.send_command("quit").await
     }
 }

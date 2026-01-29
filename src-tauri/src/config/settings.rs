@@ -155,8 +155,6 @@ pub struct UserPreferences {
 pub struct PlayerConfig {
     #[serde(default)]
     pub player_path: String,
-    #[serde(default)]
-    pub mpv_socket_path: String,
     pub media_directories: Vec<String>,
     #[serde(default)]
     pub player_arguments: Vec<String>,
@@ -166,14 +164,8 @@ pub struct PlayerConfig {
 
 impl Default for PlayerConfig {
     fn default() -> Self {
-        #[cfg(unix)]
-        let default_socket = "/tmp/mpvsocket".to_string();
-        #[cfg(windows)]
-        let default_socket = "\\\\.\\pipe\\mpvsocket".to_string();
-
         Self {
             player_path: "mpv".to_string(),
-            mpv_socket_path: default_socket,
             media_directories: Vec::new(),
             player_arguments: Vec::new(),
             per_player_arguments: HashMap::new(),

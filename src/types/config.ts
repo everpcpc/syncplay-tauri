@@ -96,7 +96,6 @@ export interface UserPreferences {
 
 export interface PlayerConfig {
   player_path: string;
-  mpv_socket_path: string;
   media_directories: string[];
   player_arguments: string[];
   per_player_arguments: Record<string, string[]>;

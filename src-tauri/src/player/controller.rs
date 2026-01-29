@@ -19,18 +19,46 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::Manager;
+#[cfg(unix)]
+use tempfile::Builder;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
+use tracing::info;
+
+struct PlayerConnectingGuard<'a> {
+    flag: &'a parking_lot::Mutex<bool>,
+}
+
+impl<'a> PlayerConnectingGuard<'a> {
+    fn new(flag: &'a parking_lot::Mutex<bool>) -> Self {
+        Self { flag }
+    }
+}
+
+impl<'a> Drop for PlayerConnectingGuard<'a> {
+    fn drop(&mut self) {
+        *self.flag.lock() = false;
+    }
+}
 
 pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String> {
     if state.is_player_connected() {
         return Ok(());
     }
+    {
+        let mut guard = state.player_connecting.lock();
+        if *guard {
+            return Ok(());
+        }
+        *guard = true;
+    }
+    let _connecting_guard = PlayerConnectingGuard::new(&state.player_connecting);
 
     let config = state.config.lock().clone();
     let player_path = resolve_player_path(&config);
     let kind = player_kind_from_path_or_default(&player_path);
     let args = build_player_arguments(&config, &player_path);
+    let socket_path = ensure_mpv_socket_path(state)?;
     {
         let mut process_guard = state.player_process.lock();
         if let Some(child) = process_guard.as_mut() {
@@ -41,14 +69,67 @@ pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String
     }
 
     let should_spawn = should_spawn_player(state, kind);
+    if should_spawn {
+        *state.last_player_spawn.lock() = Some(Instant::now());
+        *state.last_player_kind.lock() = Some(kind);
+    }
     let (backend, child) = match kind {
         PlayerKind::Mpv | PlayerKind::MpvNet | PlayerKind::Iina => {
-            let child = if should_spawn {
-                start_mpv_process_if_needed(state, &config, &player_path, kind, &args)?
-            } else {
-                None
-            };
-            let mut mpv = MpvIpc::new(config.player.mpv_socket_path.clone());
+            let mut child = None;
+            if should_spawn {
+                if kind == PlayerKind::Iina {
+                    let mut last_error = None;
+                    for _ in 0..3 {
+                        let spawned = start_mpv_process_if_needed(
+                            state,
+                            &player_path,
+                            kind,
+                            &args,
+                            &socket_path,
+                        )?;
+                        match spawned {
+                            Some(mut spawned_child) => {
+                                match wait_for_ipc_socket(
+                                    &mut spawned_child,
+                                    &socket_path,
+                                    Duration::from_secs(10),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        child = Some(spawned_child);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        last_error = Some(e);
+                                        let _ = spawned_child.kill().await;
+                                        let _ = spawned_child.wait().await;
+                                    }
+                                }
+                            }
+                            None => {
+                                child = None;
+                                break;
+                            }
+                        }
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                    if child.is_none() {
+                        if let Some(error) = last_error {
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    child = start_mpv_process_if_needed(
+                        state,
+                        &player_path,
+                        kind,
+                        &args,
+                        &socket_path,
+                    )?;
+                }
+            }
+            let mut mpv = MpvIpc::new(socket_path.clone());
             let mut attempts = 0;
             let max_attempts = if kind == PlayerKind::Iina { 50 } else { 10 };
             let event_rx = loop {
@@ -103,7 +184,7 @@ pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String
     };
 
     *state.player.lock() = Some(backend);
-    if should_spawn {
+    if !should_spawn && child.is_some() {
         *state.last_player_spawn.lock() = Some(Instant::now());
         *state.last_player_kind.lock() = Some(kind);
     }
@@ -124,9 +205,15 @@ pub async fn restart_player(state: &Arc<AppState>) -> Result<(), String> {
 }
 
 pub async fn stop_player(state: &Arc<AppState>) -> Result<(), String> {
+    let player = state.player.lock().clone();
     *state.player.lock() = None;
     *state.last_player_spawn.lock() = None;
     *state.last_player_kind.lock() = None;
+    if let Some(player) = player {
+        if let Err(e) = player.shutdown().await {
+            tracing::warn!("Failed to shutdown player: {}", e);
+        }
+    }
     let child = {
         let mut guard = state.player_process.lock();
         guard.take()
@@ -390,8 +477,65 @@ fn build_player_arguments(config: &SyncplayConfig, player_path: &str) -> Vec<Str
     args
 }
 
+fn ensure_mpv_socket_path(state: &Arc<AppState>) -> Result<String, String> {
+    if let Some(path) = state.mpv_socket_path.lock().clone() {
+        return Ok(path);
+    }
+
+    #[cfg(windows)]
+    {
+        let name = build_windows_pipe_name();
+        *state.mpv_socket_path.lock() = Some(name.clone());
+        return Ok(name);
+    }
+
+    #[cfg(unix)]
+    {
+        let runtime_dir =
+            create_runtime_dir().map_err(|e| format!("Failed to create runtime dir: {}", e))?;
+        let socket_path = runtime_dir
+            .path()
+            .join("mpv-socket")
+            .to_string_lossy()
+            .to_string();
+        *state.mpv_runtime_dir.lock() = Some(runtime_dir);
+        *state.mpv_socket_path.lock() = Some(socket_path.clone());
+        Ok(socket_path)
+    }
+}
+
+#[cfg(unix)]
+fn create_runtime_dir() -> Result<tempfile::TempDir, std::io::Error> {
+    let mut builder = Builder::new();
+    builder.prefix("syncplay-");
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            return builder.tempdir_in(dir);
+        }
+    }
+    builder.tempdir()
+}
+
+#[cfg(windows)]
+fn build_windows_pipe_name() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    format!("\\\\.\\pipe\\syncplay-mpv-{}-{}", pid, nanos)
+}
+
 fn resolve_placeholder_path(state: &AppState) -> Option<PathBuf> {
-    let candidates = ["app-icon.png", "icon.svg", "app-icon.svg"];
+    let candidates = [
+        "resources/placeholder.png",
+        "placeholder.png",
+        "src-tauri/resources/placeholder.png",
+        "app-icon.png",
+        "icon.svg",
+        "app-icon.svg",
+    ];
     if let Some(handle) = state.app_handle.lock().clone() {
         for name in candidates {
             if let Ok(path) = handle
@@ -429,10 +573,10 @@ fn should_spawn_player(state: &AppState, kind: PlayerKind) -> bool {
 
 fn start_mpv_process_if_needed(
     state: &Arc<AppState>,
-    config: &SyncplayConfig,
     player_path: &str,
     kind: PlayerKind,
     args: &[String],
+    socket_path: &str,
 ) -> Result<Option<tokio::process::Child>, String> {
     let should_start = {
         let mut process_guard = state.player_process.lock();
@@ -452,32 +596,57 @@ fn start_mpv_process_if_needed(
 
     let mut cmd = Command::new(player_path);
     let launch_args = args.to_vec();
+    let mut full_args = Vec::new();
     match kind {
         PlayerKind::Iina => {
-            cmd.arg("--no-stdin").arg(format!(
-                "--mpv-input-ipc-server={}",
-                config.player.mpv_socket_path
-            ));
+            full_args.push("--no-stdin".to_string());
             if let Some(placeholder) = resolve_placeholder_path(state) {
-                cmd.arg(placeholder);
+                full_args.push(placeholder.to_string_lossy().to_string());
+            } else {
+                tracing::warn!("Placeholder asset not found for player startup");
             }
+            full_args.push(format!("--mpv-input-ipc-server={}", socket_path));
         }
         _ => {
-            cmd.arg("--idle=yes").arg("--no-terminal").arg(format!(
-                "--input-ipc-server={}",
-                config.player.mpv_socket_path
-            ));
+            full_args.push("--idle=yes".to_string());
+            full_args.push("--no-terminal".to_string());
+            full_args.push(format!("--input-ipc-server={}", socket_path));
         }
     }
-    cmd.args(&launch_args)
+    full_args.extend(launch_args.clone());
+    cmd.args(&full_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
+    info!(
+        "Starting player: kind={:?}, path={}, socket={}, args={:?}",
+        kind, player_path, socket_path, full_args
+    );
     let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start player: {}", e))?;
     Ok(Some(child))
+}
+
+async fn wait_for_ipc_socket(
+    child: &mut tokio::process::Child,
+    socket_path: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if Path::new(socket_path).exists() {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() {
+                return Err(format!("Player exited with status {}", status));
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err("Timed out waiting for MPV IPC socket".to_string())
 }
 
 fn spawn_event_loop(

@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
+use tempfile::TempDir;
 
 use crate::client::{chat::ChatManager, playlist::Playlist, state::ClientState, sync::SyncEngine};
 use crate::config::{SyncplayConfig, UnpauseAction};
@@ -49,6 +50,12 @@ pub struct AppState {
     pub last_player_spawn: Arc<Mutex<Option<Instant>>>,
     /// Kind of the last spawned player
     pub last_player_kind: Arc<Mutex<Option<PlayerKind>>>,
+    /// Whether a player connection is in progress
+    pub player_connecting: Arc<Mutex<bool>>,
+    /// Runtime directory for MPV IPC socket
+    pub mpv_runtime_dir: Arc<Mutex<Option<TempDir>>>,
+    /// Cached MPV IPC socket path
+    pub mpv_socket_path: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -72,6 +79,9 @@ impl AppState {
             last_latency_calculation: Arc::new(Mutex::new(None)),
             last_player_spawn: Arc::new(Mutex::new(None)),
             last_player_kind: Arc::new(Mutex::new(None)),
+            mpv_runtime_dir: Arc::new(Mutex::new(None)),
+            mpv_socket_path: Arc::new(Mutex::new(None)),
+            player_connecting: Arc::new(Mutex::new(false)),
         })
     }
 
@@ -125,6 +135,9 @@ impl Default for AppState {
             last_latency_calculation: Arc::new(Mutex::new(None)),
             last_player_spawn: Arc::new(Mutex::new(None)),
             last_player_kind: Arc::new(Mutex::new(None)),
+            mpv_runtime_dir: Arc::new(Mutex::new(None)),
+            mpv_socket_path: Arc::new(Mutex::new(None)),
+            player_connecting: Arc::new(Mutex::new(false)),
         }
     }
 }

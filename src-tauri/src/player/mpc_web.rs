@@ -5,12 +5,13 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use reqwest::Client;
 use tokio::process::{Child, Command};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::backend::PlayerBackend;
 use super::properties::PlayerState;
 
 const DEFAULT_MPC_PORT: u16 = 13579;
+const MPC_CMD_CLOSEAPP: u32 = 0xA0004006;
 
 pub struct MpcWebBackend {
     kind: super::backend::PlayerKind,
@@ -26,6 +27,10 @@ impl MpcWebBackend {
         args: &[String],
         initial_file: Option<&str>,
     ) -> anyhow::Result<(Self, Option<Child>)> {
+        info!(
+            "Starting player: kind={:?}, path={}, args={:?}, initial_file={:?}",
+            kind, player_path, args, initial_file
+        );
         let mut cmd = Command::new(player_path);
         cmd.args(args);
         if let Some(path) = initial_file {
@@ -161,5 +166,9 @@ impl PlayerBackend for MpcWebBackend {
             let _ = client.get(url).send().await;
         });
         Ok(())
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        self.send_command(MPC_CMD_CLOSEAPP, None).await
     }
 }
