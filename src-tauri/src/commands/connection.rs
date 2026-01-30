@@ -4,8 +4,8 @@ use crate::app_state::{AppState, ConnectionStatusEvent};
 use crate::config::{save_config, ServerConfig};
 use crate::network::connection::Connection;
 use crate::network::messages::{
-    ClientFeatures, ControllerAuth, HelloMessage, NewControlledRoom, PlayState, ProtocolMessage,
-    RoomInfo, SetMessage, StateMessage, TLSMessage, UserUpdate,
+    ClientFeatures, ControllerAuth, HelloMessage, IgnoringInfo, NewControlledRoom, PingInfo,
+    PlayState, ProtocolMessage, RoomInfo, SetMessage, StateMessage, TLSMessage, UserUpdate,
 };
 use crate::network::tls::create_tls_connector;
 use crate::player::controller::{
@@ -256,6 +256,9 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
         ProtocolMessage::State { State: state_msg } => {
             tracing::info!("Received state update: {:?}", state_msg);
             let mut message_age = 0.0;
+            if let Some(ignore) = state_msg.ignoring_on_the_fly.as_ref() {
+                update_ignoring_on_the_fly(state, ignore);
+            }
             if let Some(ping) = state_msg.ping.as_ref() {
                 if let (Some(client_latency), Some(server_rtt)) =
                     (ping.client_latency_calculation, ping.server_rtt)
@@ -269,28 +272,21 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
                     state.emit_event("ping-updated", serde_json::json!({ "rttMs": rtt_ms }));
                 }
                 *state.last_latency_calculation.lock() = ping.latency_calculation;
-                if let Some(connection) = state.connection.lock().clone() {
-                    let now = crate::network::ping::PingService::new_timestamp();
-                    let client_rtt = state.ping_service.lock().get_rtt();
-                    let response = ProtocolMessage::State {
-                        State: StateMessage {
-                            playstate: None,
-                            ping: Some(crate::network::messages::PingInfo {
-                                latency_calculation: ping.latency_calculation,
-                                client_latency_calculation: Some(now),
-                                client_rtt: Some(client_rtt),
-                                server_rtt: None,
-                            }),
-                            ignoring_on_the_fly: None,
-                        },
-                    };
-                    if let Err(e) = connection.send(response) {
-                        tracing::warn!("Failed to send ping response: {}", e);
-                    }
-                }
             }
             if let Some(playstate) = state_msg.playstate {
                 handle_state_update(state, playstate, message_age).await;
+            }
+            let latency_calculation = state_msg
+                .ping
+                .as_ref()
+                .and_then(|ping| ping.latency_calculation);
+            if let Err(e) = send_state_message(
+                state,
+                build_local_playstate(state),
+                latency_calculation,
+                false,
+            ) {
+                tracing::warn!("Failed to send state response: {}", e);
             }
         }
         ProtocolMessage::Error { Error } => {
@@ -318,8 +314,14 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
 }
 
 async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, message_age: f64) {
+    *state.last_global_update.lock() = Some(std::time::Instant::now());
+    let adjusted_global_position = if !playstate.paused {
+        playstate.position + message_age
+    } else {
+        playstate.position
+    };
     state.client_state.set_global_state(
-        playstate.position,
+        adjusted_global_position,
         playstate.paused,
         playstate.set_by.clone(),
     );
@@ -342,26 +344,21 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         }
     };
 
-    let adjusted_global_position = if !playstate.paused {
-        playstate.position + message_age
-    } else {
-        playstate.position
-    };
-
+    let config = state.config.lock().clone();
     let (actions, slowdown_rate) = {
         let mut engine = state.sync_engine.lock();
-        let actions = engine.calculate_sync_actions(
+        let actions = engine.calculate_sync_actions(crate::client::sync::SyncInputs {
             local_position,
             local_paused,
-            playstate.position,
-            playstate.paused,
+            global_position: playstate.position,
+            global_paused: playstate.paused,
             message_age,
-        );
+            do_seek: playstate.do_seek.unwrap_or(false),
+            allow_fastforward: should_allow_fastforward(state, &config),
+        });
         let slowdown_rate = engine.slowdown_rate();
         (actions, slowdown_rate)
     };
-
-    let config = state.config.lock().clone();
     let actor = playstate.set_by.clone();
     let actor_name = actor.clone().unwrap_or_else(|| "Unknown".to_string());
 
@@ -424,6 +421,100 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
     update_room_warnings(state, false);
 }
 
+fn update_ignoring_on_the_fly(state: &Arc<AppState>, ignoring: &IgnoringInfo) {
+    let mut local = state.ignoring_on_the_fly.lock();
+    if let Some(server) = ignoring.server {
+        local.server = server;
+        local.client = 0;
+    } else if let Some(client) = ignoring.client {
+        if client == local.client {
+            local.client = 0;
+        }
+    }
+}
+
+fn build_local_playstate(state: &Arc<AppState>) -> Option<PlayState> {
+    if state.last_global_update.lock().is_none() {
+        return None;
+    }
+    let global = state.client_state.get_global_state();
+    let local_state = state.local_playback_state.lock();
+    let (local_position, local_paused) = local_state.current()?;
+    let config = state.config.lock().clone();
+    let position = if config.user.dont_slow_down_with_me {
+        global.position
+    } else {
+        local_position
+    };
+    let do_seek = if local_state.compute_seeked(position, global.position) {
+        Some(true)
+    } else {
+        None
+    };
+    Some(PlayState {
+        position,
+        paused: local_paused,
+        do_seek,
+        set_by: None,
+    })
+}
+
+pub(crate) fn send_state_message(
+    state: &Arc<AppState>,
+    playstate: Option<PlayState>,
+    latency_calculation: Option<f64>,
+    state_change: bool,
+) -> Result<(), String> {
+    let mut ignoring = state.ignoring_on_the_fly.lock();
+    let client_ignore_is_not_set = ignoring.client == 0 || ignoring.server != 0;
+    let playstate = if client_ignore_is_not_set {
+        playstate
+    } else {
+        None
+    };
+    if state_change {
+        ignoring.client = ignoring.client.saturating_add(1);
+    }
+    let ignoring_info = if ignoring.server != 0 || ignoring.client != 0 {
+        Some(IgnoringInfo {
+            server: if ignoring.server != 0 {
+                Some(ignoring.server)
+            } else {
+                None
+            },
+            client: if ignoring.client != 0 {
+                Some(ignoring.client)
+            } else {
+                None
+            },
+        })
+    } else {
+        None
+    };
+    if ignoring.server != 0 {
+        ignoring.server = 0;
+    }
+    drop(ignoring);
+
+    let ping = PingInfo {
+        latency_calculation,
+        client_latency_calculation: Some(crate::network::ping::PingService::new_timestamp()),
+        client_rtt: Some(state.ping_service.lock().get_rtt()),
+        server_rtt: None,
+    };
+    let message = ProtocolMessage::State {
+        State: StateMessage {
+            playstate,
+            ping: Some(ping),
+            ignoring_on_the_fly: ignoring_info,
+        },
+    };
+    let Some(connection) = state.connection.lock().clone() else {
+        return Err("Not connected".to_string());
+    };
+    connection.send(message).map_err(|e| e.to_string())
+}
+
 fn emit_system_message(state: &Arc<AppState>, message: &str) {
     state.chat.add_system_message(message.to_string());
     state.emit_event(
@@ -435,6 +526,19 @@ fn emit_system_message(state: &Arc<AppState>, message: &str) {
             "messageType": "system",
         }),
     );
+}
+
+fn should_allow_fastforward(state: &Arc<AppState>, config: &crate::config::SyncplayConfig) -> bool {
+    if config.user.dont_slow_down_with_me {
+        return true;
+    }
+    let username = state.client_state.get_username();
+    let can_control = state
+        .client_state
+        .get_user(&username)
+        .map(|user| user.is_controller)
+        .unwrap_or(false);
+    !can_control
 }
 
 fn emit_error_message(state: &Arc<AppState>, message: &str) {

@@ -1,8 +1,6 @@
 use crate::app_state::{AppState, PlayerStateEvent};
 use crate::config::{SyncplayConfig, UnpauseAction};
-use crate::network::messages::{
-    FileInfo, PlayState, ProtocolMessage, ReadyState, SetMessage, StateMessage,
-};
+use crate::network::messages::{FileInfo, PlayState, ProtocolMessage, ReadyState, SetMessage};
 use crate::player::backend::{player_kind_from_path_or_default, PlayerBackend, PlayerKind};
 use crate::player::events::{EndFileReason, MpvPlayerEvent};
 use crate::player::mpc_web::MpcWebBackend;
@@ -229,20 +227,15 @@ pub async fn stop_player(state: &Arc<AppState>) -> Result<(), String> {
 
 pub fn spawn_player_state_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
-        let mut last_sent: Option<PlayerStateSnapshot> = None;
+        let mut last_observed: Option<PlayerStateSnapshot> = None;
         let mut eof_sent = false;
-        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
             let player = state.player.lock().clone();
             let Some(player) = player else { continue };
-            if !matches!(
-                player.kind(),
-                PlayerKind::Mpv | PlayerKind::MpvNet | PlayerKind::Iina
-            ) {
-                if let Err(e) = player.poll_state().await {
-                    tracing::warn!("Failed to poll player state: {}", e);
-                }
+            if let Err(e) = player.poll_state().await {
+                tracing::warn!("Failed to poll player state: {}", e);
             }
             let player_state = player.get_state();
             emit_player_state(&state, &player_state);
@@ -251,7 +244,7 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
                 continue;
             }
 
-            if let Some(prev) = last_sent.as_ref() {
+            if let Some(prev) = last_observed.as_ref() {
                 if prev.paused == Some(true) && player_state.paused == Some(false) {
                     let suppressed = {
                         let mut guard = state.suppress_unpause_check.lock();
@@ -280,7 +273,7 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
 
             let is_placeholder = is_placeholder_file(&state, &player_state);
 
-            if !is_placeholder && file_info_changed(&player_state, last_sent.as_ref()) {
+            if !is_placeholder && file_info_changed(&player_state, last_observed.as_ref()) {
                 eof_sent = false;
                 let mut suppress_guard = state.suppress_next_file_update.lock();
                 if *suppress_guard {
@@ -290,35 +283,36 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
                 }
             }
 
-            if !is_placeholder && should_send_state(&state, &player_state, last_sent.as_ref()) {
-                if let Some(play_state) = to_play_state(&state, &player_state) {
-                    let ping = {
-                        let latency_calculation = *state.last_latency_calculation.lock();
-                        let client_latency_calculation =
-                            crate::network::ping::PingService::new_timestamp();
-                        let client_rtt = state.ping_service.lock().get_rtt();
-                        crate::network::messages::PingInfo {
-                            latency_calculation,
-                            client_latency_calculation: Some(client_latency_calculation),
-                            client_rtt: Some(client_rtt),
-                            server_rtt: None,
-                        }
+            if let (Some(position), Some(paused)) = (player_state.position, player_state.paused) {
+                let global = state.client_state.get_global_state();
+                let (local_pause_change, local_seeked) = state
+                    .local_playback_state
+                    .lock()
+                    .update_from_player(position, paused, global.position, global.paused);
+                if !is_placeholder
+                    && state.is_connected()
+                    && state.last_global_update.lock().is_some()
+                    && (local_pause_change || local_seeked)
+                {
+                    let play_state = PlayState {
+                        position,
+                        paused,
+                        do_seek: if local_seeked { Some(true) } else { None },
+                        set_by: None,
                     };
-                    let state_msg = ProtocolMessage::State {
-                        State: StateMessage {
-                            playstate: Some(play_state),
-                            ping: Some(ping),
-                            ignoring_on_the_fly: None,
-                        },
-                    };
-                    if let Some(connection) = state.connection.lock().clone() {
-                        if let Err(e) = connection.send(state_msg) {
-                            tracing::warn!("Failed to send state update: {}", e);
-                        }
+                    let latency_calculation = *state.last_latency_calculation.lock();
+                    if let Err(e) = crate::commands::connection::send_state_message(
+                        &state,
+                        Some(play_state),
+                        latency_calculation,
+                        local_pause_change || local_seeked,
+                    ) {
+                        tracing::warn!("Failed to send state update: {}", e);
                     }
                 }
-                last_sent = Some(PlayerStateSnapshot::from(&player_state));
             }
+
+            last_observed = Some(PlayerStateSnapshot::from(&player_state));
 
             if !eof_sent {
                 if let (Some(duration), Some(position)) =
@@ -744,47 +738,6 @@ fn send_file_update(state: &Arc<AppState>, player_state: &PlayerState) {
     if let Err(e) = connection.send(message) {
         tracing::warn!("Failed to send file update: {}", e);
     }
-}
-
-fn to_play_state(state: &Arc<AppState>, player_state: &PlayerState) -> Option<PlayState> {
-    let position = player_state.position?;
-    let paused = player_state.paused?;
-    let username = state.client_state.get_username();
-
-    Some(PlayState {
-        position,
-        paused,
-        do_seek: None,
-        set_by: Some(username),
-    })
-}
-
-fn should_send_state(
-    state: &Arc<AppState>,
-    player_state: &PlayerState,
-    last_sent: Option<&PlayerStateSnapshot>,
-) -> bool {
-    let global = state.client_state.get_global_state();
-    let pause_change = match last_sent {
-        Some(prev) => {
-            prev.paused != player_state.paused && Some(global.paused) != player_state.paused
-        }
-        None => false,
-    };
-
-    let seeked = match (
-        last_sent.and_then(|snapshot| snapshot.position),
-        player_state.position,
-    ) {
-        (Some(prev_pos), Some(current_pos)) => {
-            let player_diff = (current_pos - prev_pos).abs();
-            let global_diff = (current_pos - global.position).abs();
-            player_diff > 1.0 && global_diff > 1.0
-        }
-        _ => false,
-    };
-
-    pause_change || seeked
 }
 
 fn file_info_changed(player_state: &PlayerState, last_sent: Option<&PlayerStateSnapshot>) -> bool {

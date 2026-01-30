@@ -229,6 +229,7 @@ impl MpvIpc {
     pub async fn set_position(&self, position: f64) -> Result<()> {
         let cmd = MpvCommand::seek(position, "absolute", 0);
         self.send_command_async(cmd).await?;
+        self.state.lock().position = Some(position);
         Ok(())
     }
 

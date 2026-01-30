@@ -6,7 +6,10 @@ use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use tempfile::TempDir;
 
-use crate::client::{chat::ChatManager, playlist::Playlist, state::ClientState, sync::SyncEngine};
+use crate::client::{
+    chat::ChatManager, local_state::LocalPlaybackState, playlist::Playlist, state::ClientState,
+    sync::SyncEngine,
+};
 use crate::config::{SyncplayConfig, UnpauseAction};
 use crate::network::connection::Connection;
 use crate::network::messages::HelloMessage;
@@ -47,6 +50,12 @@ pub struct AppState {
     pub ping_service: Arc<Mutex<PingService>>,
     /// Last latency calculation timestamp from server
     pub last_latency_calculation: Arc<Mutex<Option<f64>>>,
+    /// Last time a global playstate was received
+    pub last_global_update: Arc<Mutex<Option<Instant>>>,
+    /// Latest local playback state
+    pub local_playback_state: Arc<Mutex<LocalPlaybackState>>,
+    /// Ignoring-on-the-fly counters
+    pub ignoring_on_the_fly: Arc<Mutex<IgnoringOnTheFlyState>>,
     /// Last time a player process was spawned
     pub last_player_spawn: Arc<Mutex<Option<Instant>>>,
     /// Kind of the last spawned player
@@ -71,6 +80,12 @@ pub struct AppState {
     pub room_warning_task_running: Arc<Mutex<bool>>,
 }
 
+#[derive(Debug, Default)]
+pub struct IgnoringOnTheFlyState {
+    pub server: u32,
+    pub client: u32,
+}
+
 impl AppState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -90,6 +105,9 @@ impl AppState {
             autoplay: Arc::new(Mutex::new(AutoPlayState::default())),
             ping_service: Arc::new(Mutex::new(PingService::default())),
             last_latency_calculation: Arc::new(Mutex::new(None)),
+            last_global_update: Arc::new(Mutex::new(None)),
+            local_playback_state: Arc::new(Mutex::new(LocalPlaybackState::new())),
+            ignoring_on_the_fly: Arc::new(Mutex::new(IgnoringOnTheFlyState::default())),
             last_player_spawn: Arc::new(Mutex::new(None)),
             last_player_kind: Arc::new(Mutex::new(None)),
             mpv_runtime_dir: Arc::new(Mutex::new(None)),
@@ -152,6 +170,9 @@ impl Default for AppState {
             autoplay: Arc::new(Mutex::new(AutoPlayState::default())),
             ping_service: Arc::new(Mutex::new(PingService::default())),
             last_latency_calculation: Arc::new(Mutex::new(None)),
+            last_global_update: Arc::new(Mutex::new(None)),
+            local_playback_state: Arc::new(Mutex::new(LocalPlaybackState::new())),
+            ignoring_on_the_fly: Arc::new(Mutex::new(IgnoringOnTheFlyState::default())),
             last_player_spawn: Arc::new(Mutex::new(None)),
             last_player_kind: Arc::new(Mutex::new(None)),
             mpv_runtime_dir: Arc::new(Mutex::new(None)),
