@@ -135,7 +135,8 @@ impl SyncEngine {
                 actions.push(SyncAction::Seek(adjusted_global_position));
                 self.slowdown_active = false;
                 self.behind_first_detected = None;
-            } else if inputs.allow_fastforward && self.fastforward_on_desync {
+            }
+            if inputs.allow_fastforward && self.fastforward_on_desync {
                 if diff < -FASTFORWARD_BEHIND_THRESHOLD {
                     let now = std::time::Instant::now();
                     match self.behind_first_detected {
@@ -171,26 +172,22 @@ impl SyncEngine {
                 } else {
                     self.behind_first_detected = None;
                 }
-            } else if self.slow_on_desync
-                && !inputs.global_paused
-                && diff.abs() > self.slowdown_threshold
-            {
+            }
+            if self.slow_on_desync && !inputs.global_paused && diff > self.slowdown_threshold {
                 // Minor desync while playing - apply slowdown
                 if !self.slowdown_active {
                     info!(
                         "Minor desync {:.2}s (threshold: {:.2}s) - applying slowdown",
-                        diff.abs(),
-                        self.slowdown_threshold
+                        diff, self.slowdown_threshold
                     );
                     actions.push(SyncAction::Slowdown);
                     self.slowdown_active = true;
                 }
-            } else if self.slowdown_active && diff.abs() < self.slowdown_reset_threshold {
+            } else if self.slowdown_active && diff < self.slowdown_reset_threshold {
                 // Back in sync - reset speed
                 info!(
                     "Back in sync ({:.2}s < {:.2}s) - resetting speed",
-                    diff.abs(),
-                    self.slowdown_reset_threshold
+                    diff, self.slowdown_reset_threshold
                 );
                 actions.push(SyncAction::ResetSpeed);
                 self.slowdown_active = false;
@@ -228,6 +225,7 @@ impl Default for SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_sync_no_action_when_in_sync() {
@@ -247,8 +245,10 @@ mod tests {
     #[test]
     fn test_sync_seek_when_behind() {
         let mut engine = SyncEngine::new();
+        engine.seek_threshold_fastforward = 2.0;
+        engine.behind_first_detected = Some(Instant::now() - Duration::from_millis(300));
         let actions = engine.calculate_sync_actions(SyncInputs {
-            local_position: 5.0,
+            local_position: 7.0,
             local_paused: false,
             global_position: 10.0,
             global_paused: false,
@@ -293,7 +293,7 @@ mod tests {
     fn test_sync_slowdown() {
         let mut engine = SyncEngine::new();
         let actions = engine.calculate_sync_actions(SyncInputs {
-            local_position: 8.0,
+            local_position: 12.0,
             local_paused: false,
             global_position: 10.0,
             global_paused: false,
@@ -310,7 +310,7 @@ mod tests {
         let mut engine = SyncEngine::new();
         // First apply slowdown
         engine.calculate_sync_actions(SyncInputs {
-            local_position: 8.0,
+            local_position: 12.0,
             local_paused: false,
             global_position: 10.0,
             global_paused: false,
@@ -322,7 +322,7 @@ mod tests {
 
         // Then get back in sync
         let actions = engine.calculate_sync_actions(SyncInputs {
-            local_position: 10.0,
+            local_position: 10.05,
             local_paused: false,
             global_position: 10.0,
             global_paused: false,
