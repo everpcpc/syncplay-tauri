@@ -281,11 +281,9 @@ async fn handle_line(
 
     let (command, argument) = parse_line(line);
     match command.as_str() {
-        "playstate" => {
-            if !argument.is_empty() {
-                let paused = argument != "playing";
-                state.lock().paused = Some(paused);
-            }
+        "playstate" if !argument.is_empty() => {
+            let paused = argument != "playing";
+            state.lock().paused = Some(paused);
         }
         "position" => {
             if argument != "no-input" {
@@ -329,27 +327,21 @@ async fn handle_line(
                     .map(|name| name.to_string_lossy().to_string());
             }
         }
-        "filename" => {
-            if argument != "no-input" {
-                state.lock().filename = Some(argument.clone());
-            }
+        "filename" if argument != "no-input" => {
+            state.lock().filename = Some(argument.clone());
         }
-        "inputstate-change" => {
-            if argument == "no-input" {
-                let mut guard = state.lock();
-                guard.path = None;
-                guard.filename = None;
-                guard.duration = None;
-                guard.position = None;
-            }
+        "inputstate-change" if argument == "no-input" => {
+            let mut guard = state.lock();
+            guard.path = None;
+            guard.filename = None;
+            guard.duration = None;
+            guard.position = None;
         }
-        "vlc-version" => {
-            if !meets_min_version(&argument, VLC_MIN_VERSION) {
-                warn!(
-                    "VLC version {} is below minimum {}",
-                    argument, VLC_MIN_VERSION
-                );
-            }
+        "vlc-version" if !meets_min_version(&argument, VLC_MIN_VERSION) => {
+            warn!(
+                "VLC version {} is below minimum {}",
+                argument, VLC_MIN_VERSION
+            );
         }
         _ => {}
     }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { LuChevronDown, LuChevronUp } from "react-icons/lu";
 import { SyncplayConfig } from "../../types/config";
 import { useNotificationStore } from "../../store/notifications";
 
@@ -119,6 +120,28 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
     await saveConfig(nextConfig);
   };
 
+  const moveMediaDirectory = async (index: number, offset: -1 | 1) => {
+    if (!config) return;
+    const targetIndex = index + offset;
+    const directories = config.player.media_directories;
+    if (targetIndex < 0 || targetIndex >= directories.length) return;
+
+    const nextDirectories = [...directories];
+    [nextDirectories[index], nextDirectories[targetIndex]] = [
+      nextDirectories[targetIndex],
+      nextDirectories[index],
+    ];
+
+    const nextConfig: SyncplayConfig = {
+      ...config,
+      player: {
+        ...config.player,
+        media_directories: nextDirectories,
+      },
+    };
+    await saveConfig(nextConfig);
+  };
+
   if (!isOpen) return null;
 
   return (
@@ -179,19 +202,39 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
                 <p className="text-xs app-text-muted">No media directories added.</p>
               ) : (
                 <div className="space-y-2">
-                  {config.player.media_directories.map((dir) => (
+                  {config.player.media_directories.map((dir, index) => (
                     <div
                       key={dir}
-                      className="flex items-center justify-between app-panel-muted px-3 py-2 rounded"
+                      className="flex items-center justify-between gap-2 app-panel-muted px-3 py-2 rounded"
                     >
-                      <span className="text-sm truncate">{dir}</span>
-                      <button
-                        type="button"
-                        onClick={() => removeMediaDirectory(dir)}
-                        className="text-xs app-text-danger hover:opacity-80"
-                      >
-                        Remove
-                      </button>
+                      <span className="text-sm truncate min-w-0 flex-1">{dir}</span>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => moveMediaDirectory(index, -1)}
+                          disabled={index === 0}
+                          className="btn-neutral app-icon-button disabled:opacity-40 disabled:cursor-not-allowed"
+                          aria-label="Move up"
+                        >
+                          <LuChevronUp className="app-icon" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => moveMediaDirectory(index, 1)}
+                          disabled={index === config.player.media_directories.length - 1}
+                          className="btn-neutral app-icon-button disabled:opacity-40 disabled:cursor-not-allowed"
+                          aria-label="Move down"
+                        >
+                          <LuChevronDown className="app-icon" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeMediaDirectory(dir)}
+                          className="text-xs app-text-danger hover:opacity-80"
+                        >
+                          Remove
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
