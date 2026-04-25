@@ -334,11 +334,10 @@ export function PlaylistPanel() {
       return;
     }
 
-    const filename = selected.split(/[/\\\\]/).pop() || selected;
     try {
       await invoke("update_playlist", {
         action: "add",
-        filename,
+        filename: selected,
       });
     } catch (error) {
       addNotification({
@@ -355,35 +354,13 @@ export function PlaylistPanel() {
       const resolvedPaths = paths.map((path) => path.trim()).filter((path) => path !== "");
       if (resolvedPaths.length === 0) return;
 
-      let baseConfig: SyncplayConfig | null = config;
-      if (!baseConfig) {
-        try {
-          baseConfig = await invoke<SyncplayConfig>("get_config");
-        } catch (error) {
-          addNotification({
-            type: "error",
-            message: "Failed to load config for dropped files",
-          });
-          return;
-        }
-      }
-
-      const mediaDirectories = baseConfig.player.media_directories.filter(
-        (dir) => dir.trim() !== ""
-      );
-      const normalizedDirs = mediaDirectories.map(normalizePath);
       const rejected: string[] = [];
 
       for (const path of resolvedPaths) {
-        const normalizedFile = normalizePath(path);
-        const isInDirectory =
-          normalizedDirs.length > 0 &&
-          normalizedDirs.some((dir) => normalizedFile.startsWith(`${dir}/`));
-        const filename = isInDirectory ? path.split(/[/\\\\]/).pop() || path : path;
         try {
           await invoke("update_playlist", {
             action: "add",
-            filename,
+            filename: path,
           });
         } catch (error) {
           rejected.push(path);
@@ -397,7 +374,7 @@ export function PlaylistPanel() {
         });
       }
     },
-    [addNotification, config, connection.connected, normalizePath]
+    [addNotification, connection.connected]
   );
 
   const handleDropFiles = async (event: DragEvent<HTMLDivElement>) => {

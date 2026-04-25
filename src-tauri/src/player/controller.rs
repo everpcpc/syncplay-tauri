@@ -1,4 +1,5 @@
 use crate::app_state::{AppState, PlayerStateEvent};
+use crate::client::media_index::{resolve_exact_in_directory, resolve_similar_in_directory};
 use crate::commands::playlist::{
     apply_playlist_index_from_server, change_playlist_from_filename, send_playlist_index,
     shared_playlists_enabled,
@@ -452,6 +453,7 @@ pub async fn load_media_by_name(
         .resolve_path(filename)
         .or_else(|| resolve_media_path(&config.player.media_directories, filename))
         .ok_or_else(|| format!("File not found in media directories: {}", filename))?;
+    state.media_index.remember_resolved_path(&media_path);
 
     ensure_player_connected(state).await?;
 
@@ -528,18 +530,13 @@ pub fn resolve_media_path(media_directories: &[String], filename: &str) -> Optio
     if filename == PRIVACY_HIDDEN_FILENAME {
         return None;
     }
-    let target = Path::new(filename)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(filename);
     for directory in media_directories {
         let directory = directory.trim();
         if directory.is_empty() {
             continue;
         }
-        let candidate = Path::new(directory).join(target);
-        if candidate.exists() {
-            return Some(candidate);
+        if let Some(path) = resolve_exact_in_directory(Path::new(directory), filename) {
+            return Some(path);
         }
     }
 
@@ -548,20 +545,8 @@ pub fn resolve_media_path(media_directories: &[String], filename: &str) -> Optio
         if directory.is_empty() {
             continue;
         }
-        let dir_path = Path::new(directory);
-        let entries = match std::fs::read_dir(dir_path) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let candidate_name = path.file_name()?.to_string_lossy();
-            if same_filename(Some(target), Some(candidate_name.as_ref())) {
-                return Some(path);
-            }
+        if let Some(path) = resolve_similar_in_directory(Path::new(directory), filename) {
+            return Some(path);
         }
     }
 

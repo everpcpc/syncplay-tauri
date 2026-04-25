@@ -94,6 +94,7 @@ impl MediaIndexCache {
 pub struct MediaIndex {
     cache: RwLock<MediaIndexCache>,
     directories: RwLock<Vec<String>>,
+    last_resolved_directory: RwLock<Option<PathBuf>>,
     updating: AtomicBool,
     disabled: AtomicBool,
 }
@@ -103,6 +104,7 @@ impl MediaIndex {
         Arc::new(Self {
             cache: RwLock::new(MediaIndexCache::default()),
             directories: RwLock::new(Vec::new()),
+            last_resolved_directory: RwLock::new(None),
             updating: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
         })
@@ -131,10 +133,14 @@ impl MediaIndex {
         if path.is_absolute() && path.is_file() {
             return Some(path.to_path_buf());
         }
+        if let Some(path) = self.resolve_from_last_directory(filename) {
+            return Some(path);
+        }
         self.cache.read().resolve(filename)
     }
 
     pub fn add_override_path(&self, filename: &str, path: PathBuf) {
+        self.remember_resolved_path(&path);
         self.cache.write().insert_override(filename, path);
     }
 
@@ -144,6 +150,18 @@ impl MediaIndex {
 
     pub fn is_refreshing(&self) -> bool {
         self.updating.load(Ordering::SeqCst)
+    }
+
+    fn resolve_from_last_directory(&self, filename: &str) -> Option<PathBuf> {
+        let directory = self.last_resolved_directory.read().clone()?;
+        resolve_in_directory(&directory, filename)
+    }
+
+    pub fn remember_resolved_path(&self, path: &Path) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        *self.last_resolved_directory.write() = Some(parent.to_path_buf());
     }
 
     pub fn spawn_indexer(self: Arc<Self>, state: Arc<AppState>) {
@@ -230,6 +248,45 @@ impl MediaIndex {
     }
 }
 
+pub(crate) fn resolve_in_directory(directory: &Path, filename: &str) -> Option<PathBuf> {
+    resolve_exact_in_directory(directory, filename)
+        .or_else(|| resolve_similar_in_directory(directory, filename))
+}
+
+pub(crate) fn resolve_exact_in_directory(directory: &Path, filename: &str) -> Option<PathBuf> {
+    let target = Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(filename);
+    let candidate = directory.join(target);
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn resolve_similar_in_directory(directory: &Path, filename: &str) -> Option<PathBuf> {
+    let target = Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(filename);
+    let entries = std::fs::read_dir(directory).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let candidate_name = path.file_name()?.to_string_lossy();
+        if same_filename(Some(target), Some(candidate_name.as_ref())) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+#[derive(Debug)]
 enum ScanError {
     NoDirectories,
     FirstFileTimeout(String),
@@ -303,4 +360,47 @@ fn scan_directories(directories: &[String]) -> Result<MediaIndexCache, ScanError
     }
 
     Ok(cache)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scan_directories, MediaIndex};
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resolve_path_prefers_last_resolved_directory() {
+        let previous_dir = TempDir::new().unwrap();
+        let media_dir = TempDir::new().unwrap();
+        let previous_file = previous_dir.path().join("episode-01.mkv");
+        let next_file = previous_dir.path().join("episode-02.mkv");
+        let indexed_file = media_dir.path().join("episode-02.mkv");
+        fs::write(&previous_file, b"previous").unwrap();
+        fs::write(&next_file, b"next").unwrap();
+        fs::write(&indexed_file, b"indexed").unwrap();
+
+        let index = MediaIndex::new();
+        index.add_override_path("episode-02.mkv", indexed_file);
+        index.add_override_path("episode-01.mkv", previous_file);
+
+        assert_eq!(index.resolve_path("episode-02.mkv"), Some(next_file));
+    }
+
+    #[test]
+    fn scan_directories_preserves_directory_order_for_duplicate_names() {
+        let first_dir = TempDir::new().unwrap();
+        let second_dir = TempDir::new().unwrap();
+        let first_file = first_dir.path().join("movie.mp4");
+        let second_file = second_dir.path().join("movie.mp4");
+        fs::write(&first_file, b"first").unwrap();
+        fs::write(&second_file, b"second").unwrap();
+
+        let directories = vec![
+            second_dir.path().to_string_lossy().to_string(),
+            first_dir.path().to_string_lossy().to_string(),
+        ];
+        let cache = scan_directories(&directories).unwrap();
+
+        assert_eq!(cache.resolve("movie.mp4"), Some(second_file));
+    }
 }
