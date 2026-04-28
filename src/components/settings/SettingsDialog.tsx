@@ -5,7 +5,10 @@ import { getAppliedTheme } from "../../services/theme";
 import {
   checkForUpdates,
   downloadAndInstallUpdate,
+  formatBytes,
   formatUpdateError,
+  nextUpdateProgress,
+  type UpdateProgress,
 } from "../../services/updater";
 import {
   ChatInputPosition,
@@ -32,18 +35,6 @@ type UpdateStatus =
   | "error"
   | "installing"
   | "unsupported";
-
-const formatBytes = (value: number) => {
-  if (!Number.isFinite(value) || value <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  let size = value;
-  let index = 0;
-  while (size >= 1024 && index < units.length - 1) {
-    size /= 1024;
-    index += 1;
-  }
-  return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
-};
 
 const privacyOptions: Array<{ label: string; value: PrivacyMode }> = [
   { label: "Send raw", value: "send_raw" },
@@ -85,13 +76,8 @@ export function SettingsDialog({
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const [updateInfo, setUpdateInfo] = useState<Update | null>(null);
-  const [updateProgress, setUpdateProgress] = useState<{
-    downloaded: number;
-    total?: number;
-  } | null>(null);
-  const updateProgressRef = useRef<{ downloaded: number; total?: number }>({
-    downloaded: 0,
-  });
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
+  const updateProgressRef = useRef<UpdateProgress>({ downloaded: 0 });
 
   useEffect(() => {
     if (!isOpen) {
@@ -190,24 +176,7 @@ export function SettingsDialog({
 
     try {
       await downloadAndInstallUpdate(updateInfo, (event: DownloadEvent) => {
-        if (event.event === "Started") {
-          updateProgressRef.current = {
-            downloaded: 0,
-            total: event.data.contentLength,
-          };
-        }
-        if (event.event === "Progress") {
-          updateProgressRef.current = {
-            ...updateProgressRef.current,
-            downloaded: updateProgressRef.current.downloaded + event.data.chunkLength,
-          };
-        }
-        if (event.event === "Finished") {
-          updateProgressRef.current = {
-            ...updateProgressRef.current,
-            total: updateProgressRef.current.total ?? updateProgressRef.current.downloaded,
-          };
-        }
+        updateProgressRef.current = nextUpdateProgress(updateProgressRef.current, event);
         setUpdateProgress({ ...updateProgressRef.current });
       });
     } catch (err) {
