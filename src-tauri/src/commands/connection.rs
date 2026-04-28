@@ -1669,23 +1669,15 @@ async fn handle_set_message(state: &Arc<AppState>, set_msg: SetMessage) {
                 };
                 let mut skipped_load = false;
                 let user = index_update.user.clone();
-                if let Some(user) = user.as_ref() {
-                    let current_user = state.client_state.get_username();
-                    if user == &current_user {
-                        let items = state.playlist.get_item_filenames();
-                        if let Some(filename) = items.get(index) {
-                            if same_filename(
-                                state.client_state.get_file().as_deref(),
-                                Some(filename),
-                            ) {
-                                state.playlist.set_current_index(index);
-                                state
-                                    .playlist
-                                    .set_queued_index_filename(Some(filename.clone()));
-                                emit_playlist_update(state);
-                                skipped_load = true;
-                            }
-                        }
+                let items = state.playlist.get_item_filenames();
+                if let Some(filename) = items.get(index) {
+                    if same_filename(state.client_state.get_file().as_deref(), Some(filename)) {
+                        state.playlist.set_current_index(index);
+                        state
+                            .playlist
+                            .set_queued_index_filename(Some(filename.clone()));
+                        emit_playlist_update(state);
+                        skipped_load = true;
                     }
                 }
                 if !skipped_load {
