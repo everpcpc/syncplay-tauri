@@ -285,6 +285,7 @@ fn apply_playlist_change_local(
     let room = state.client_state.get_room();
     state.playlist.set_queued_index_filename(None);
     state.playlist.update_previous_playlist(&new_items, &room);
+    let previous_index = state.playlist.get_current_index();
 
     let new_index = if new_items.is_empty() {
         None
@@ -317,13 +318,25 @@ fn apply_playlist_change_local(
     };
     send_to_server(state, message)?;
 
-    if let Some(index) = new_index {
+    if should_send_playlist_index(previous_index, new_index, reset_index) {
+        let Some(index) = new_index else {
+            emit_playlist_update(state);
+            return Ok(());
+        };
         send_playlist_index(state, index, false)?;
     } else {
         emit_playlist_update(state);
     }
 
     Ok(())
+}
+
+fn should_send_playlist_index(
+    previous_index: Option<usize>,
+    next_index: Option<usize>,
+    reset_index: bool,
+) -> bool {
+    next_index.is_some() && (reset_index || previous_index != next_index)
 }
 
 fn normalize_playlist_entry(entry: &str) -> (String, Option<PathBuf>) {
@@ -395,4 +408,29 @@ fn send_to_server(state: &Arc<AppState>, message: ProtocolMessage) -> Result<(),
     connection
         .send(message)
         .map_err(|e| format!("Failed to send message: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_playlist_index_does_not_need_broadcast() {
+        assert!(!should_send_playlist_index(Some(0), Some(0), false));
+    }
+
+    #[test]
+    fn changed_playlist_index_needs_broadcast() {
+        assert!(should_send_playlist_index(Some(1), Some(0), false));
+    }
+
+    #[test]
+    fn reset_playlist_index_needs_broadcast() {
+        assert!(should_send_playlist_index(Some(0), Some(0), true));
+    }
+
+    #[test]
+    fn empty_playlist_index_does_not_need_broadcast() {
+        assert!(!should_send_playlist_index(Some(0), None, false));
+    }
 }
