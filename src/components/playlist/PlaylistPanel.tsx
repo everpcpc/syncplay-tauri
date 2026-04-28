@@ -23,6 +23,8 @@ import { createPortal } from "react-dom";
 import { MediaDirectoriesDialog } from "./MediaDirectoriesDialog";
 import { TrustedDomainsDialog } from "./TrustedDomainsDialog";
 
+const LAST_ADD_FILE_DIRECTORY_KEY = "syncplay.lastAddFileDirectory";
+
 interface PlaylistItemStatus {
   filename: string;
   path: string | null;
@@ -233,6 +235,44 @@ export function PlaylistPanel() {
     []
   );
 
+  const isPathInsideDirectory = useCallback(
+    (path: string, directory: string) => {
+      const normalizedPath = normalizePath(path);
+      const normalizedDirectory = normalizePath(directory);
+      return (
+        normalizedPath === normalizedDirectory ||
+        normalizedPath.startsWith(`${normalizedDirectory}/`)
+      );
+    },
+    [normalizePath]
+  );
+
+  const getParentDirectory = (path: string) => {
+    const normalized = path.replace(/\\/g, "/");
+    const index = normalized.lastIndexOf("/");
+    return index > 0 ? path.slice(0, index) : null;
+  };
+
+  const getLastAddFileDirectory = useCallback(
+    (mediaDirectories: string[]) => {
+      const lastDirectory = window.localStorage.getItem(LAST_ADD_FILE_DIRECTORY_KEY)?.trim();
+      if (
+        lastDirectory &&
+        mediaDirectories.some((dir) => isPathInsideDirectory(lastDirectory, dir))
+      ) {
+        return lastDirectory;
+      }
+      return mediaDirectories[0];
+    },
+    [isPathInsideDirectory]
+  );
+
+  const rememberAddFileDirectory = (path: string) => {
+    const parentDirectory = getParentDirectory(path);
+    if (!parentDirectory) return;
+    window.localStorage.setItem(LAST_ADD_FILE_DIRECTORY_KEY, parentDirectory);
+  };
+
   const normalizeFilename = (value: string | null | undefined) => {
     if (!value) return "";
     const base = value.split(/[/\\\\]/).pop() || value;
@@ -309,7 +349,7 @@ export function PlaylistPanel() {
       selected = await open({
         multiple: false,
         directory: false,
-        defaultPath: mediaDirectories[0],
+        defaultPath: getLastAddFileDirectory(mediaDirectories),
       });
     } catch (error) {
       addNotification({
@@ -324,8 +364,9 @@ export function PlaylistPanel() {
     }
 
     const normalizedFile = normalizePath(selected);
-    const normalizedDirs = mediaDirectories.map(normalizePath);
-    const isInDirectory = normalizedDirs.some((dir) => normalizedFile.startsWith(`${dir}/`));
+    const isInDirectory = mediaDirectories.some((dir) =>
+      isPathInsideDirectory(normalizedFile, dir)
+    );
     if (!isInDirectory) {
       addNotification({
         type: "error",
@@ -339,6 +380,7 @@ export function PlaylistPanel() {
         action: "add",
         filename: selected,
       });
+      rememberAddFileDirectory(selected);
     } catch (error) {
       addNotification({
         type: "error",
