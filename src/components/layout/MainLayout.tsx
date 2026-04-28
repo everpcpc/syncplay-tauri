@@ -20,6 +20,7 @@ import {
 import { getVersion } from "@tauri-apps/api/app";
 import { PhysicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import { useWindowDrag } from "../../hooks/useWindowDrag";
 import { PlaylistPanel } from "../playlist/PlaylistPanel";
 import { ConnectionDialog } from "../connection/ConnectionDialog";
@@ -36,7 +37,15 @@ import {
   TransparencyPreference,
   normalizeTransparency,
 } from "../../services/theme";
-import { checkForUpdates, shouldAutoCheckUpdates } from "../../services/updater";
+import {
+  checkForUpdates,
+  downloadAndInstallUpdate,
+  formatBytes,
+  formatUpdateError,
+  nextUpdateProgress,
+  shouldAutoCheckUpdates,
+  type UpdateProgress,
+} from "../../services/updater";
 import { SyncplayConfig, UserPreferences } from "../../types/config";
 
 type UiLayoutPreferencePatch = Partial<
@@ -62,6 +71,8 @@ export function MainLayout() {
   const [sidePanelSize, setSidePanelSize] = useState<number | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
+  const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
   const [settingsInitialTab, setSettingsInitialTab] = useState<
     "sync" | "ready" | "privacy" | "chat" | "osd" | "misc" | undefined
   >(undefined);
@@ -73,6 +84,8 @@ export function MainLayout() {
   const addNotification = useNotificationStore((state) => state.addNotification);
   const initializedRef = useRef(false);
   const autoUpdateCheckedRef = useRef(false);
+  const availableUpdateRef = useRef<Update | null>(null);
+  const updateProgressRef = useRef<UpdateProgress>({ downloaded: 0 });
   const showPlaylistRef = useRef<boolean | null>(null);
   const pendingUiLayoutPatchRef = useRef<UiLayoutPreferencePatch | null>(null);
   const uiLayoutPersistTimerRef = useRef<number | null>(null);
@@ -86,6 +99,17 @@ export function MainLayout() {
   const SIDE_PANEL_MIN = 200;
   const resolveSidePanelMin = (total: number) =>
     Math.min(SIDE_PANEL_MIN, Math.max(0, Math.floor((total - GAP_SIZE) / 2)));
+
+  const replaceAvailableUpdate = useCallback((nextUpdate: Update | null) => {
+    const previousUpdate = availableUpdateRef.current;
+    availableUpdateRef.current = nextUpdate;
+    setUpdateVersion(nextUpdate?.version ?? null);
+    if (previousUpdate && previousUpdate !== nextUpdate) {
+      void previousUpdate.close().catch((error) => {
+        console.warn("Failed to close updater resource", error);
+      });
+    }
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -131,18 +155,13 @@ export function MainLayout() {
           autoUpdateCheckedRef.current = true;
           const updateResult = await checkForUpdates();
           if (updateResult.status === "available") {
-            setUpdateVersion(updateResult.update.version);
+            replaceAvailableUpdate(updateResult.update);
             addNotification({
               type: "info",
-              message: `Update ${updateResult.update.version} available. Open Settings > Misc to install.`,
+              message: `Update ${updateResult.update.version} available. Click Update in the header to install.`,
             });
-            try {
-              await updateResult.update.close();
-            } catch (closeError) {
-              console.warn("Failed to close updater resource", closeError);
-            }
           } else {
-            setUpdateVersion(null);
+            replaceAvailableUpdate(null);
             if (updateResult.status === "error") {
               console.warn("Auto update check failed", updateResult.message);
             }
@@ -180,7 +199,18 @@ export function MainLayout() {
     };
 
     initFromConfig();
-  }, [connection.connected, addNotification, setConfig]);
+  }, [connection.connected, addNotification, replaceAvailableUpdate, setConfig]);
+
+  useEffect(() => {
+    return () => {
+      if (availableUpdateRef.current) {
+        void availableUpdateRef.current.close().catch((error) => {
+          console.warn("Failed to close updater resource", error);
+        });
+        availableUpdateRef.current = null;
+      }
+    };
+  }, []);
 
   const flushUiLayoutPatch = useCallback(async () => {
     if (uiLayoutPersistingRef.current) {
@@ -590,6 +620,47 @@ export function MainLayout() {
     setShowSettingsDialog(true);
   };
 
+  const handleInstallHeaderUpdate = async () => {
+    const availableUpdate = availableUpdateRef.current;
+    if (!availableUpdate) {
+      handleOpenSettings("misc");
+      return;
+    }
+
+    setIsInstallingUpdate(true);
+    updateProgressRef.current = { downloaded: 0 };
+    setUpdateProgress({ downloaded: 0 });
+
+    try {
+      await downloadAndInstallUpdate(availableUpdate, (event: DownloadEvent) => {
+        updateProgressRef.current = nextUpdateProgress(updateProgressRef.current, event);
+        setUpdateProgress({ ...updateProgressRef.current });
+      });
+      replaceAvailableUpdate(null);
+    } catch (error) {
+      addNotification({
+        type: "error",
+        message: `Update failed: ${formatUpdateError(error)}`,
+      });
+      setIsInstallingUpdate(false);
+      setUpdateProgress(null);
+    }
+  };
+
+  const handleSettingsUpdateAvailable = (version: string | null) => {
+    const availableUpdate = availableUpdateRef.current;
+    if (!version) {
+      replaceAvailableUpdate(null);
+      return;
+    }
+    if (availableUpdate?.version === version) {
+      setUpdateVersion(version);
+      return;
+    }
+    replaceAvailableUpdate(null);
+    setUpdateVersion(version);
+  };
+
   const handleCloseSettings = () => {
     setShowSettingsDialog(false);
     setSettingsInitialTab(undefined);
@@ -648,12 +719,19 @@ export function MainLayout() {
                 )}
                 {updateVersion && (
                   <button
-                    onClick={() => handleOpenSettings("misc")}
+                    onClick={handleInstallHeaderUpdate}
+                    disabled={isInstallingUpdate}
                     className="btn-primary px-2.5 py-1 rounded-full text-xs"
                     aria-label={`Update available: ${updateVersion}`}
-                    title={`Update available: ${updateVersion}`}
+                    title={
+                      isInstallingUpdate && updateProgress
+                        ? `Installing ${updateVersion}: ${formatBytes(updateProgress.downloaded)}${
+                            updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""
+                          }`
+                        : `Install update ${updateVersion}`
+                    }
                   >
-                    Update
+                    {isInstallingUpdate ? "Installing..." : "Update"}
                   </button>
                 )}
               </div>
@@ -839,7 +917,7 @@ export function MainLayout() {
         onClose={handleCloseSettings}
         initialTab={settingsInitialTab}
         appVersion={appVersion}
-        onUpdateAvailable={setUpdateVersion}
+        onUpdateAvailable={handleSettingsUpdateAvailable}
       />
     </div>
   );
