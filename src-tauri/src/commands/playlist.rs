@@ -185,7 +185,6 @@ pub(crate) fn send_playlist_index(
     state.playlist.set_current_index(index);
     emit_playlist_update(state);
 
-    let username = state.client_state.get_username();
     let message = ProtocolMessage::Set {
         Set: Box::new(SetMessage {
             room: None,
@@ -193,7 +192,7 @@ pub(crate) fn send_playlist_index(
             user: None,
             ready: None,
             playlist_index: Some(PlaylistIndexUpdate {
-                user: Some(username),
+                user: None,
                 index: Some(index),
             }),
             playlist_change: None,
@@ -299,7 +298,6 @@ fn apply_playlist_change_local(
         .playlist
         .set_items_with_index(new_items.clone(), new_index);
 
-    let username = state.client_state.get_username();
     let message = ProtocolMessage::Set {
         Set: Box::new(SetMessage {
             room: None,
@@ -308,7 +306,7 @@ fn apply_playlist_change_local(
             ready: None,
             playlist_index: None,
             playlist_change: Some(PlaylistChange {
-                user: Some(username),
+                user: None,
                 files: new_items,
             }),
             controller_auth: None,

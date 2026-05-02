@@ -1,4 +1,5 @@
 use parking_lot::RwLock;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ pub struct User {
     pub file_duration: Option<f64>,
     pub is_ready: Option<bool>,
     pub is_controller: bool,
+    pub features: Option<Value>,
 }
 
 impl User {
@@ -46,7 +48,7 @@ pub struct ClientState {
     /// Global playback state
     global_state: RwLock<GlobalPlayState>,
     /// Local ready state
-    is_ready: RwLock<bool>,
+    is_ready: RwLock<Option<bool>>,
     /// Server version
     server_version: RwLock<Option<String>>,
 }
@@ -65,7 +67,7 @@ impl ClientState {
                 paused: true,
                 set_by: None,
             }),
-            is_ready: RwLock::new(false),
+            is_ready: RwLock::new(None),
             server_version: RwLock::new(None),
         })
     }
@@ -157,10 +159,18 @@ impl ClientState {
 
     // Ready state methods
     pub fn is_ready(&self) -> bool {
+        self.ready_state().unwrap_or(false)
+    }
+
+    pub fn ready_state(&self) -> Option<bool> {
         *self.is_ready.read()
     }
 
     pub fn set_ready(&self, ready: bool) {
+        self.set_ready_state(Some(ready));
+    }
+
+    pub fn set_ready_state(&self, ready: Option<bool>) {
         *self.is_ready.write() = ready;
     }
 
@@ -188,7 +198,7 @@ impl Default for ClientState {
                 paused: true,
                 set_by: None,
             }),
-            is_ready: RwLock::new(false),
+            is_ready: RwLock::new(None),
             server_version: RwLock::new(None),
         }
     }

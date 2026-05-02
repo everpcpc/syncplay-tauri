@@ -44,6 +44,21 @@ impl Connection {
     }
 }
 
+#[derive(Debug, Clone)]
+struct VlcPositionHistory {
+    previous_previous: f64,
+    previous: f64,
+}
+
+impl Default for VlcPositionHistory {
+    fn default() -> Self {
+        Self {
+            previous_previous: -2.0,
+            previous: -1.0,
+        }
+    }
+}
+
 pub struct VlcSyncplayBackend {
     state: Arc<Mutex<PlayerState>>,
     connection: Connection,
@@ -103,6 +118,7 @@ impl VlcSyncplayBackend {
         let last_position_update = Arc::new(Mutex::new(None));
         let last_duration = Arc::new(Mutex::new(None));
         let last_loaded = Arc::new(Mutex::new(initial_file.map(|s| s.to_string())));
+        let position_history = Arc::new(Mutex::new(VlcPositionHistory::default()));
 
         spawn_reader(
             connection.clone(),
@@ -111,6 +127,7 @@ impl VlcSyncplayBackend {
             last_position_update.clone(),
             last_duration.clone(),
             last_loaded.clone(),
+            position_history,
         );
 
         let backend = Self {
@@ -150,7 +167,6 @@ impl PlayerBackend for VlcSyncplayBackend {
 
     fn get_state(&self) -> PlayerState {
         let mut snapshot = self.state.lock().clone();
-        let base_position = snapshot.position;
         let last_update = *self.last_position_update.lock();
         if snapshot.paused == Some(false) {
             if let (Some(position), Some(last_update)) = (snapshot.position, last_update) {
@@ -160,18 +176,6 @@ impl PlayerBackend for VlcSyncplayBackend {
                         warn!("VLC position update delayed: {}s", diff);
                     }
                     snapshot.position = Some(position + diff);
-                }
-            }
-        }
-        if snapshot.paused == Some(false) {
-            if let (Some(duration), Some(position), Some(last_update)) =
-                (snapshot.duration, base_position, last_update)
-            {
-                if duration > 10.0
-                    && duration - position < 2.0
-                    && last_update.elapsed().as_secs_f64() > VLC_LATENCY_ERROR_THRESHOLD
-                {
-                    snapshot.paused = Some(true);
                 }
             }
         }
@@ -244,6 +248,7 @@ fn spawn_reader(
     last_position_update: Arc<Mutex<Option<Instant>>>,
     last_duration: Arc<Mutex<Option<f64>>>,
     _last_loaded: Arc<Mutex<Option<String>>>,
+    position_history: Arc<Mutex<VlcPositionHistory>>,
 ) {
     tokio::spawn(async move {
         let reader = BufReader::new(read_half);
@@ -257,6 +262,7 @@ fn spawn_reader(
                 &state,
                 &last_position_update,
                 &last_duration,
+                &position_history,
                 &line,
             )
             .await;
@@ -269,6 +275,7 @@ async fn handle_line(
     state: &Arc<Mutex<PlayerState>>,
     last_position_update: &Arc<Mutex<Option<Instant>>>,
     last_duration: &Arc<Mutex<Option<f64>>>,
+    position_history: &Arc<Mutex<VlcPositionHistory>>,
     line: &str,
 ) {
     debug!("vlc >> {}", line);
@@ -282,13 +289,26 @@ async fn handle_line(
     let (command, argument) = parse_line(line);
     match command.as_str() {
         "playstate" if !argument.is_empty() => {
-            let paused = argument != "playing";
+            let mut paused = argument != "playing";
+            if !paused
+                && should_treat_vlc_playing_as_eof_pause(
+                    state,
+                    last_position_update,
+                    position_history,
+                )
+            {
+                paused = true;
+                let _ = connection.send_line("set-playstate: paused").await;
+            }
             state.lock().paused = Some(paused);
         }
         "position" => {
             if argument != "no-input" {
                 if let Ok(pos) = argument.replace(',', ".").parse::<f64>() {
-                    state.lock().position = Some(pos);
+                    if should_ignore_duplicate_vlc_position(state, position_history, pos) {
+                        return;
+                    }
+                    store_vlc_position(state, position_history, pos);
                     *last_position_update.lock() = Some(Instant::now());
                 }
             } else {
@@ -345,6 +365,68 @@ async fn handle_line(
         }
         _ => {}
     }
+}
+
+fn should_treat_vlc_playing_as_eof_pause(
+    state: &Arc<Mutex<PlayerState>>,
+    last_position_update: &Arc<Mutex<Option<Instant>>>,
+    position_history: &Arc<Mutex<VlcPositionHistory>>,
+) -> bool {
+    let snapshot = state.lock().clone();
+    let history = position_history.lock().clone();
+    let diff = last_position_update
+        .lock()
+        .map(|instant| instant.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    matches!(
+        (snapshot.position, snapshot.duration),
+        (Some(position), Some(duration))
+            if position == history.previous_previous
+                && history.previous == position
+                && duration > 10.0
+                && duration - position < 2.0
+                && diff > VLC_LATENCY_ERROR_THRESHOLD
+    )
+}
+
+fn should_ignore_duplicate_vlc_position(
+    state: &Arc<Mutex<PlayerState>>,
+    position_history: &Arc<Mutex<VlcPositionHistory>>,
+    new_position: f64,
+) -> bool {
+    let snapshot = state.lock().clone();
+    let history = position_history.lock().clone();
+    if snapshot.paused != Some(false) {
+        return false;
+    }
+    if Some(new_position) == snapshot.duration {
+        return false;
+    }
+    if new_position != history.previous {
+        return false;
+    }
+    let mut history = position_history.lock();
+    history.previous_previous = history.previous;
+    if let Some(position) = snapshot.position {
+        history.previous = position;
+    }
+    true
+}
+
+fn store_vlc_position(
+    state: &Arc<Mutex<PlayerState>>,
+    position_history: &Arc<Mutex<VlcPositionHistory>>,
+    position: f64,
+) {
+    let previous_position = state.lock().position;
+    {
+        let mut history = position_history.lock();
+        history.previous_previous = history.previous;
+        if let Some(previous_position) = previous_position {
+            history.previous = previous_position;
+        }
+    }
+    state.lock().position = Some(position);
 }
 
 fn parse_line(line: &str) -> (String, String) {

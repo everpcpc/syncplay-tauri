@@ -745,73 +745,6 @@ fn mpc_filename_from_path(path: &str) -> Option<String> {
         .map(|segment| segment.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{mpc_filename_from_path, split_mpc_fields};
-
-    #[test]
-    fn split_mpc_fields_keeps_windows_path_separators() {
-        let input = "0|1|Movie|C:\\Videos\\Example.mkv|123.4";
-        let parts = split_mpc_fields(input);
-
-        assert_eq!(
-            parts.get(3).map(std::string::String::as_str),
-            Some(r"C:\Videos\Example.mkv")
-        );
-    }
-
-    #[test]
-    fn split_mpc_fields_keeps_escaped_pipe_sequence() {
-        let input = r"0|1|Name\|Part|\\server\share\Clip.mkv|321";
-        let parts = split_mpc_fields(input);
-
-        assert_eq!(
-            parts.get(2).map(std::string::String::as_str),
-            Some(r"Name\|Part")
-        );
-        assert_eq!(
-            parts.get(3).map(std::string::String::as_str),
-            Some(r"\\server\share\Clip.mkv")
-        );
-    }
-
-    #[test]
-    fn split_mpc_fields_keeps_trailing_empty_field() {
-        let parts = split_mpc_fields("0|1|2|3|");
-
-        assert_eq!(
-            parts,
-            vec![
-                "0".to_string(),
-                "1".to_string(),
-                "2".to_string(),
-                "3".to_string(),
-                "".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn mpc_filename_from_path_extracts_windows_basename() {
-        assert_eq!(
-            mpc_filename_from_path(r"C:\Videos\Example.mkv").as_deref(),
-            Some("Example.mkv")
-        );
-    }
-
-    #[test]
-    fn mpc_filename_from_path_handles_doubled_separators() {
-        assert_eq!(
-            mpc_filename_from_path(r"C:\\Videos\\Example.mkv").as_deref(),
-            Some("Example.mkv")
-        );
-        assert_eq!(
-            mpc_filename_from_path(r"\\server\share\Clip.mkv").as_deref(),
-            Some("Clip.mkv")
-        );
-    }
-}
-
 fn meets_min_version(version: &str, min: &str) -> bool {
     let parse = |value: &str| -> Vec<i32> {
         value
@@ -905,5 +838,72 @@ impl PlayerBackend for MpcApiBackend {
 
     fn show_osd(&self, _text: &str, _duration_ms: Option<u64>) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("MPC backend is only supported on Windows"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mpc_filename_from_path, split_mpc_fields};
+
+    #[test]
+    fn split_mpc_fields_keeps_windows_path_separators() {
+        let input = "0|1|Movie|C:\\Videos\\Example.mkv|123.4";
+        let parts = split_mpc_fields(input);
+
+        assert_eq!(
+            parts.get(3).map(std::string::String::as_str),
+            Some(r"C:\Videos\Example.mkv")
+        );
+    }
+
+    #[test]
+    fn split_mpc_fields_keeps_escaped_pipe_sequence() {
+        let input = r"0|1|Name\|Part|\\server\share\Clip.mkv|321";
+        let parts = split_mpc_fields(input);
+
+        assert_eq!(
+            parts.get(2).map(std::string::String::as_str),
+            Some(r"Name\|Part")
+        );
+        assert_eq!(
+            parts.get(3).map(std::string::String::as_str),
+            Some(r"\\server\share\Clip.mkv")
+        );
+    }
+
+    #[test]
+    fn split_mpc_fields_keeps_trailing_empty_field() {
+        let parts = split_mpc_fields("0|1|2|3|");
+
+        assert_eq!(
+            parts,
+            vec![
+                "0".to_string(),
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn mpc_filename_from_path_extracts_windows_basename() {
+        assert_eq!(
+            mpc_filename_from_path(r"C:\Videos\Example.mkv").as_deref(),
+            Some("Example.mkv")
+        );
+    }
+
+    #[test]
+    fn mpc_filename_from_path_handles_doubled_separators() {
+        assert_eq!(
+            mpc_filename_from_path(r"C:\\Videos\\Example.mkv").as_deref(),
+            Some("Example.mkv")
+        );
+        assert_eq!(
+            mpc_filename_from_path(r"\\server\share\Clip.mkv").as_deref(),
+            Some("Clip.mkv")
+        );
     }
 }
