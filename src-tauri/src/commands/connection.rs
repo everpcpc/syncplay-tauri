@@ -16,9 +16,7 @@ use crate::network::messages::{
 };
 use crate::network::tls::create_tls_connector;
 use crate::player::backend::PlayerBackend;
-use crate::player::controller::{
-    ensure_player_connected, load_media_by_name, load_placeholder_if_empty, stop_player,
-};
+use crate::player::controller::{ensure_player_connected, load_media_by_name, stop_player};
 use crate::player::properties::PlayerState;
 use crate::utils::{
     is_controlled_room, parse_controlled_room_input, same_filename, strip_control_password,
@@ -226,11 +224,10 @@ async fn establish_connection(
     })
 }
 
-async fn finalize_connection_setup(
+fn start_connection_session(
     state: &Arc<AppState>,
     snapshot: &ConnectionSnapshot,
     mut receiver: mpsc::UnboundedReceiver<ProtocolMessage>,
-    server_label: String,
 ) {
     let config = state.config.lock().clone();
     state.client_state.set_username(snapshot.username.clone());
@@ -245,21 +242,6 @@ async fn finalize_connection_setup(
     state.sync_engine.lock().update_from_config(&config.user);
     update_autoplay_state(state, &config);
 
-    if let Err(e) = ensure_player_connected(state).await {
-        tracing::warn!("Failed to connect to player: {}", e);
-    } else if let Err(e) = load_placeholder_if_empty(state).await {
-        tracing::warn!("Failed to load placeholder: {}", e);
-    }
-    start_room_warning_loop(state.clone());
-
-    state.emit_event(
-        "connection-status-changed",
-        ConnectionStatusEvent {
-            connected: true,
-            server: Some(server_label),
-        },
-    );
-
     let state_clone = state.clone();
     tokio::spawn(async move {
         while let Some(message) = receiver.recv().await {
@@ -269,6 +251,83 @@ async fn finalize_connection_setup(
         tracing::info!("Message processing loop ended");
         handle_connection_closed(&state_clone).await;
     });
+}
+
+async fn complete_server_login(state: &Arc<AppState>, hello: HelloMessage) {
+    if let Some(connection) = state.connection.lock().clone() {
+        connection.set_authenticated();
+    }
+
+    let server_version = hello.realversion.clone();
+    let feature_list = hello.features.clone();
+
+    state.client_state.set_username(hello.username.clone());
+    if let Some(room) = hello.room.as_ref() {
+        state.client_state.set_room(room.name.clone());
+    }
+    *state.last_connect_time.lock() = Some(std::time::Instant::now());
+
+    if let Some(motd) = hello.motd {
+        state.emit_event(
+            "chat-message-received",
+            serde_json::json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "username": null,
+                "message": motd,
+                "messageType": "system",
+            }),
+        );
+    }
+    emit_system_message(state, "Successfully connected to server");
+
+    let config = state.config.lock().clone();
+    let ready_at_login = state
+        .client_state
+        .ready_state()
+        .unwrap_or(config.user.ready_at_start);
+    if let Err(e) = send_ready_state(state, ready_at_login, false) {
+        tracing::warn!("Failed to send ready-at-start: {}", e);
+    }
+    reidentify_as_controller(state);
+
+    if let Err(e) = ensure_player_connected(state).await {
+        tracing::warn!("Failed to connect to player after login: {}", e);
+    }
+    if let Some(player) = state.player.lock().clone() {
+        let player_state = player.get_state();
+        if (player_state.filename.is_some() || player_state.path.is_some())
+            && !crate::player::controller::is_placeholder_file(state, &player_state)
+        {
+            crate::player::controller::send_file_update(state, &player_state);
+        }
+    }
+
+    state
+        .client_state
+        .set_server_version(server_version.clone());
+    update_server_features(state, &server_version, feature_list);
+    if let Some(player) = state.player.lock().clone() {
+        if let Err(e) = player.set_features() {
+            tracing::warn!("Failed to send feature update to player: {}", e);
+        }
+    }
+    start_room_warning_loop(state.clone());
+
+    state.emit_event(
+        "connection-status-changed",
+        ConnectionStatusEvent {
+            connected: true,
+            server: current_server_label(state),
+        },
+    );
+}
+
+fn current_server_label(state: &Arc<AppState>) -> Option<String> {
+    state
+        .reconnect_snapshot
+        .lock()
+        .as_ref()
+        .map(|snapshot| format!("{}:{}", snapshot.host, snapshot.port))
 }
 
 fn reset_reconnect_state(state: &Arc<AppState>) {
@@ -347,13 +406,7 @@ fn start_reconnect_loop(state: Arc<AppState>) {
 
             match establish_connection(&state, &snapshot, false).await {
                 Ok(established) => {
-                    finalize_connection_setup(
-                        &state,
-                        &snapshot,
-                        established.receiver,
-                        format!("{}:{}", snapshot.host, snapshot.port),
-                    )
-                    .await;
+                    start_connection_session(&state, &snapshot, established.receiver);
                     reset_reconnect_state(&state);
                     break;
                 }
@@ -423,13 +476,7 @@ pub async fn connect_to_server<R: Runtime>(
     match establish_connection(state.inner(), &snapshot, true).await {
         Ok(established) => {
             maybe_autosave_connection(state.inner(), &app, &config, snapshot.clone());
-            finalize_connection_setup(
-                state.inner(),
-                &snapshot,
-                established.receiver,
-                format!("{}:{}", host, port),
-            )
-            .await;
+            start_connection_session(state.inner(), &snapshot, established.receiver);
             Ok(())
         }
         Err(err) => {
@@ -443,41 +490,8 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
     match message {
         ProtocolMessage::Hello { Hello } => {
             tracing::info!("Received hello message: {:?}", Hello);
-            if let Some(connection) = state.connection.lock().clone() {
-                connection.set_authenticated();
-            }
-            state
-                .client_state
-                .set_server_version(Hello.realversion.clone());
-            update_server_features(state, &Hello.realversion, Hello.features.clone());
-            *state.last_connect_time.lock() = Some(std::time::Instant::now());
             emit_system_message(state, &format!("Hello {},", Hello.username));
-            if let Some(motd) = Hello.motd {
-                state.emit_event(
-                    "chat-message-received",
-                    serde_json::json!({
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                        "username": null,
-                        "message": motd,
-                        "messageType": "system",
-                    }),
-                );
-            }
-            emit_system_message(state, "Successfully connected to server");
-            if let Some(connection) = state.connection.lock().clone() {
-                if let Err(e) = connection.send(ProtocolMessage::List { List: None }) {
-                    tracing::warn!("Failed to request user list: {}", e);
-                }
-            }
-            reidentify_as_controller(state);
-            if let Some(player) = state.player.lock().clone() {
-                let player_state = player.get_state();
-                if (player_state.filename.is_some() || player_state.path.is_some())
-                    && !crate::player::controller::is_placeholder_file(state, &player_state)
-                {
-                    crate::player::controller::send_file_update(state, &player_state);
-                }
-            }
+            complete_server_login(state, Hello).await;
         }
         ProtocolMessage::List { List } => {
             tracing::info!("Received user list: {:?}", List);
@@ -503,6 +517,7 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
                             file_duration,
                             is_ready: user_info.is_ready,
                             is_controller: user_info.controller.unwrap_or(false),
+                            features: user_info.features,
                         });
                     }
                 }
@@ -1006,6 +1021,12 @@ pub(crate) fn emit_error_message(state: &Arc<AppState>, message: &str) {
     );
 }
 
+pub(crate) fn reset_room_sync_state(state: &Arc<AppState>) {
+    *state.last_global_update.lock() = None;
+    *state.had_first_playlist_index.lock() = false;
+    *state.playlist_may_need_restoring.lock() = false;
+}
+
 pub(crate) fn maybe_show_osd(
     state: &Arc<AppState>,
     config: &crate::config::SyncplayConfig,
@@ -1453,20 +1474,12 @@ async fn handle_set_message(state: &Arc<AppState>, set_msg: SetMessage) {
     let has_index_update = set_msg.playlist_index.is_some();
     if let Some(room) = set_msg.room {
         state.client_state.set_room(room.name);
-        *state.had_first_playlist_index.lock() = false;
-        *state.playlist_may_need_restoring.lock() = false;
+        reset_room_sync_state(state);
         reidentify_as_controller(state);
     }
 
-    if let Some(file) = set_msg.file {
-        if let Some(name) = file.name {
-            state.client_state.set_file(Some(name.clone()));
-            state.client_state.set_file_size(file.size.clone());
-            state.client_state.set_file_duration(file.duration);
-            if let Err(e) = load_media_by_name(state, &name, false, true).await {
-                tracing::warn!("Failed to load file from set: {}", e);
-            }
-        }
+    if set_msg.file.is_some() {
+        tracing::debug!("Ignoring inbound top-level Set.file; original client treats it as client-to-server only");
     }
 
     let mut users_changed = false;
@@ -1496,13 +1509,7 @@ async fn handle_set_message(state: &Arc<AppState>, set_msg: SetMessage) {
             if is_placeholder_username(&username) {
                 tracing::debug!("Ready update contains placeholder username, ignoring");
             } else {
-                let is_ready = match ready.is_ready {
-                    Some(value) => Some(value),
-                    None => state
-                        .client_state
-                        .get_user(&username)
-                        .and_then(|user| user.is_ready),
-                };
+                let is_ready = ready.is_ready;
 
                 if let Some(mut user) = state.client_state.get_user(&username) {
                     user.is_ready = is_ready;
@@ -1517,18 +1524,17 @@ async fn handle_set_message(state: &Arc<AppState>, set_msg: SetMessage) {
                         file_duration: None,
                         is_ready,
                         is_controller: false,
+                        features: None,
                     });
                     users_changed = true;
                 }
 
-                if let Some(value) = ready.is_ready {
-                    if username == state.client_state.get_username() {
-                        state.client_state.set_ready(value);
-                    }
+                if username == state.client_state.get_username() {
+                    state.client_state.set_ready_state(is_ready);
                 }
 
                 if let Some(set_by) = ready.set_by {
-                    let message = if ready.is_ready.unwrap_or(false) {
+                    let message = if is_ready.unwrap_or(false) {
                         format!("{} was set as ready by {}", username, set_by)
                     } else {
                         format!("{} was set as not ready by {}", username, set_by)
@@ -1547,6 +1553,12 @@ async fn handle_set_message(state: &Arc<AppState>, set_msg: SetMessage) {
 
     if let Some(new_room) = set_msg.new_controlled_room {
         handle_new_controlled_room(state, new_room).await;
+    }
+
+    if let Some(features) = set_msg.features {
+        if apply_user_features_update(state, features) {
+            users_changed = true;
+        }
     }
 
     if users_changed {
@@ -1756,6 +1768,7 @@ async fn handle_new_controlled_room(state: &Arc<AppState>, room: NewControlledRo
     emit_system_message(state, &message);
 
     state.client_state.set_room(room_name.clone());
+    reset_room_sync_state(state);
     if let Some(connection) = state.connection.lock().clone() {
         let set_room = ProtocolMessage::Set {
             Set: Box::new(SetMessage {
@@ -1793,6 +1806,39 @@ async fn handle_new_controlled_room(state: &Arc<AppState>, room: NewControlledRo
     }
 }
 
+fn apply_user_features_update(state: &Arc<AppState>, value: Value) -> bool {
+    let Value::Object(mut map) = value else {
+        return false;
+    };
+    let username = map
+        .remove("username")
+        .and_then(|value| value.as_str().map(|s| s.to_string()));
+    let features = map.remove("features");
+    let (Some(username), Some(features)) = (username, features) else {
+        return false;
+    };
+    if is_placeholder_username(&username) {
+        return false;
+    }
+
+    let mut user = state
+        .client_state
+        .get_user(&username)
+        .unwrap_or(crate::client::state::User {
+            username: username.clone(),
+            room: state.client_state.get_room(),
+            file: None,
+            file_size: None,
+            file_duration: None,
+            is_ready: None,
+            is_controller: false,
+            features: None,
+        });
+    user.features = Some(features);
+    state.client_state.add_user(user);
+    true
+}
+
 fn set_user_controller_status(
     state: &Arc<AppState>,
     username: &str,
@@ -1812,6 +1858,7 @@ fn set_user_controller_status(
             file_duration: None,
             is_ready: None,
             is_controller: false,
+            features: None,
         });
     if let Some(room) = room {
         user.room = room.to_string();
@@ -1887,11 +1934,6 @@ fn send_hello(state: &Arc<AppState>) {
 
     *hello_sent = true;
     tracing::info!("Sent Hello message");
-
-    let config = state.config.lock().clone();
-    if let Err(e) = send_ready_state(state, config.user.ready_at_start, false) {
-        tracing::warn!("Failed to send ready-at-start: {}", e);
-    }
 }
 
 fn update_autoplay_state(state: &Arc<AppState>, config: &crate::config::SyncplayConfig) {
@@ -1970,7 +2012,7 @@ fn user_can_control_in_room(state: &Arc<AppState>, user: &crate::client::state::
 
 fn current_user_ready_with_file(state: &Arc<AppState>) -> Option<bool> {
     state.client_state.get_file()?;
-    Some(state.client_state.is_ready())
+    state.client_state.ready_state()
 }
 
 fn is_readiness_supported(state: &Arc<AppState>, requires_other_users: bool) -> bool {
@@ -2152,14 +2194,13 @@ fn send_ready_state(
         return Ok(());
     }
     state.client_state.set_ready(is_ready);
-    let username = state.client_state.get_username();
     let message = ProtocolMessage::Set {
         Set: Box::new(SetMessage {
             room: None,
             file: None,
             user: None,
             ready: Some(crate::network::messages::ReadyState {
-                username: Some(username),
+                username: None,
                 is_ready: Some(is_ready),
                 manually_initiated: Some(manually_initiated),
                 set_by: None,
@@ -2363,6 +2404,7 @@ fn apply_user_update(state: &Arc<AppState>, username: String, update: UserUpdate
             file_duration: None,
             is_ready: None,
             is_controller: false,
+            features: None,
         });
 
     if let Some(room) = update.room {
@@ -2381,6 +2423,9 @@ fn apply_user_update(state: &Arc<AppState>, username: String, update: UserUpdate
     }
     if let Some(controller) = update.controller {
         user.is_controller = controller;
+    }
+    if let Some(features) = update.features {
+        user.features = Some(features);
     }
 
     let room_changed = old_user
@@ -2579,14 +2624,10 @@ pub async fn disconnect_from_server(state: State<'_, Arc<AppState>>) -> Result<(
         connection.disconnect();
     }
 
-    if let Err(e) = stop_player(state.inner()).await {
-        tracing::warn!("Failed to stop player: {}", e);
-    }
-
     state.client_state.clear_users();
     state.playlist.clear();
     state.client_state.set_file(None);
-    state.client_state.set_ready(false);
+    state.client_state.set_ready_state(None);
     *state.server_features.lock() = ServerFeatures::default();
     *state.playlist_may_need_restoring.lock() = false;
     *state.had_first_playlist_index.lock() = false;

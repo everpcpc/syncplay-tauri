@@ -166,7 +166,7 @@ pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String
             };
             let stdout = child.as_mut().and_then(|process| process.stdout.take());
             let osc_compatible = match kind {
-                PlayerKind::Iina => true,
+                PlayerKind::Iina | PlayerKind::MpvNet => true,
                 _ => check_mpv_version(&player_path)?.osc_visibility_change_compatible,
             };
             let backend = Arc::new(MpvBackend::new(
@@ -224,6 +224,8 @@ pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String
         }
     };
 
+    prepare_player_after_connect(&backend).await;
+
     *state.player.lock() = Some(backend);
     if !should_spawn && child.is_some() {
         *state.last_player_spawn.lock() = Some(Instant::now());
@@ -238,6 +240,21 @@ pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String
         *state.player_process.lock() = None;
     }
     Ok(())
+}
+
+async fn prepare_player_after_connect(player: &Arc<dyn PlayerBackend>) {
+    if should_pause_on_prepare(player.kind()) {
+        if let Err(e) = player.set_paused(true).await {
+            tracing::warn!("Failed to pause player during startup: {}", e);
+        }
+    }
+}
+
+fn should_pause_on_prepare(kind: PlayerKind) -> bool {
+    matches!(
+        kind,
+        PlayerKind::Mpv | PlayerKind::MpvNet | PlayerKind::Iina | PlayerKind::Mplayer
+    )
 }
 
 pub async fn restart_player(state: &Arc<AppState>) -> Result<(), String> {
@@ -730,13 +747,18 @@ struct MpvVersionFlags {
 }
 
 fn check_mpv_version(player_path: &str) -> Result<MpvVersionFlags, String> {
-    let output = std::process::Command::new(player_path)
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("Failed to run mpv for version check: {}", e))?;
+    let Ok(output) = run_mpv_version_command(player_path) else {
+        return Ok(MpvVersionFlags {
+            osc_visibility_change_compatible: false,
+        });
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_mpv_version_flags(&stdout)
+}
+
+fn parse_mpv_version_flags(stdout: &str) -> Result<MpvVersionFlags, String> {
     let re = Regex::new(r"mpv\s+(\d+)\.(\d+)\.").map_err(|e| e.to_string())?;
-    if let Some(captures) = re.captures(&stdout) {
+    if let Some(captures) = re.captures(stdout) {
         let major = captures
             .get(1)
             .and_then(|m| m.as_str().parse::<u32>().ok())
@@ -760,6 +782,24 @@ fn check_mpv_version(player_path: &str) -> Result<MpvVersionFlags, String> {
         osc_visibility_change_compatible: false,
     })
 }
+
+fn run_mpv_version_command(player_path: &str) -> std::io::Result<std::process::Output> {
+    let mut command = std::process::Command::new(player_path);
+    command.arg("--version");
+    configure_hidden_version_command(&mut command);
+    command.output()
+}
+
+#[cfg(target_os = "windows")]
+fn configure_hidden_version_command(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_hidden_version_command(_command: &mut std::process::Command) {}
 
 fn should_spawn_player(state: &AppState, kind: PlayerKind) -> bool {
     if kind != PlayerKind::Iina {
@@ -1508,14 +1548,13 @@ fn send_ready_state(
         return Ok(());
     }
     state.client_state.set_ready(is_ready);
-    let username = state.client_state.get_username();
     let message = ProtocolMessage::Set {
         Set: Box::new(SetMessage {
             room: None,
             file: None,
             user: None,
             ready: Some(ReadyState {
-                username: Some(username),
+                username: None,
                 is_ready: Some(is_ready),
                 manually_initiated: Some(manually_initiated),
                 set_by: None,
@@ -1538,7 +1577,10 @@ fn send_ready_state(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_media_path;
+    use super::{
+        check_mpv_version, parse_mpv_version_flags, resolve_media_path, should_pause_on_prepare,
+    };
+    use crate::player::backend::PlayerKind;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1562,5 +1604,43 @@ mod tests {
     fn test_resolve_media_path_empty() {
         let directories: Vec<String> = Vec::new();
         assert!(resolve_media_path(&directories, "file.mp4").is_none());
+    }
+
+    #[test]
+    fn pause_on_prepare_matches_original_player_prepare_flow() {
+        assert!(should_pause_on_prepare(PlayerKind::Mpv));
+        assert!(should_pause_on_prepare(PlayerKind::MpvNet));
+        assert!(should_pause_on_prepare(PlayerKind::Iina));
+        assert!(should_pause_on_prepare(PlayerKind::Mplayer));
+        assert!(!should_pause_on_prepare(PlayerKind::Vlc));
+        assert!(!should_pause_on_prepare(PlayerKind::MpcHc));
+        assert!(!should_pause_on_prepare(PlayerKind::MpcBe));
+    }
+
+    #[test]
+    fn missing_mpv_version_check_matches_original_unknown_version_fallback() {
+        let flags = check_mpv_version("/path/to/missing/mpv").unwrap();
+
+        assert!(!flags.osc_visibility_change_compatible);
+    }
+
+    #[test]
+    fn mpv_version_flags_match_original_thresholds() {
+        assert!(parse_mpv_version_flags("mpv 0.22.0 Copyright").is_err());
+        assert!(
+            !parse_mpv_version_flags("mpv 0.23.0 Copyright")
+                .unwrap()
+                .osc_visibility_change_compatible
+        );
+        assert!(
+            parse_mpv_version_flags("mpv 0.28.0 Copyright")
+                .unwrap()
+                .osc_visibility_change_compatible
+        );
+        assert!(
+            !parse_mpv_version_flags("unexpected output")
+                .unwrap()
+                .osc_visibility_change_compatible
+        );
     }
 }

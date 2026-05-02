@@ -1,7 +1,9 @@
 // Room command handlers
 
 use crate::app_state::AppState;
-use crate::commands::connection::{reidentify_as_controller, store_control_password};
+use crate::commands::connection::{
+    reidentify_as_controller, reset_room_sync_state, store_control_password,
+};
 use crate::config::save_config;
 use crate::network::messages::{ProtocolMessage, ReadyState, RoomInfo, SetMessage};
 use crate::utils::parse_controlled_room_input;
@@ -34,8 +36,7 @@ pub async fn change_room<R: Runtime>(
 
     // Update client state
     state.client_state.set_room(room.clone());
-    *state.had_first_playlist_index.lock() = false;
-    *state.playlist_may_need_restoring.lock() = false;
+    reset_room_sync_state(state.inner());
 
     let message = ProtocolMessage::Set {
         Set: Box::new(SetMessage {
@@ -86,14 +87,13 @@ pub async fn set_ready(is_ready: bool, state: State<'_, Arc<AppState>>) -> Resul
     // Update client state
     state.client_state.set_ready(is_ready);
 
-    let username = state.client_state.get_username();
     let message = ProtocolMessage::Set {
         Set: Box::new(SetMessage {
             room: None,
             file: None,
             user: None,
             ready: Some(ReadyState {
-                username: Some(username),
+                username: None,
                 is_ready: Some(is_ready),
                 manually_initiated: Some(true),
                 set_by: None,

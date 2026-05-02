@@ -2,7 +2,9 @@
 
 use crate::app_state::AppState;
 use crate::client::chat::ChatCommand;
-use crate::commands::connection::{reidentify_as_controller, store_control_password};
+use crate::commands::connection::{
+    reidentify_as_controller, reset_room_sync_state, store_control_password,
+};
 use crate::network::messages::ProtocolMessage;
 use crate::network::messages::{
     ChatMessage as ProtocolChatMessage, ReadyState, RoomInfo, SetMessage,
@@ -45,7 +47,8 @@ async fn send_chat_message_inner(state: &Arc<AppState>, message: &str) -> Result
         .lock()
         .max_chat_message_length
         .unwrap_or(150);
-    let message = truncate_text(trimmed, max_length);
+    let sanitized = trimmed.replace(['\n', '\r'], "");
+    let message = truncate_text(&sanitized, max_length);
     tracing::info!("Sending chat message: {}", message);
 
     if !state.is_connected() {
@@ -69,6 +72,7 @@ async fn send_chat_message_inner(state: &Arc<AppState>, message: &str) -> Result
                     store_control_password(state, &room, &password, true);
                 }
                 state.client_state.set_room(room);
+                reset_room_sync_state(state);
                 let set_msg = ProtocolMessage::Set {
                     Set: Box::new(SetMessage {
                         room: Some(RoomInfo {
@@ -128,14 +132,13 @@ async fn send_chat_message_inner(state: &Arc<AppState>, message: &str) -> Result
                     return Err("Ready state is not supported by the server".to_string());
                 }
                 state.client_state.set_ready(true);
-                let username = state.client_state.get_username();
                 let set_msg = ProtocolMessage::Set {
                     Set: Box::new(SetMessage {
                         room: None,
                         file: None,
                         user: None,
                         ready: Some(ReadyState {
-                            username: Some(username),
+                            username: None,
                             is_ready: Some(true),
                             manually_initiated: Some(true),
                             set_by: None,
@@ -155,14 +158,13 @@ async fn send_chat_message_inner(state: &Arc<AppState>, message: &str) -> Result
                     return Err("Ready state is not supported by the server".to_string());
                 }
                 state.client_state.set_ready(false);
-                let username = state.client_state.get_username();
                 let set_msg = ProtocolMessage::Set {
                     Set: Box::new(SetMessage {
                         room: None,
                         file: None,
                         user: None,
                         ready: Some(ReadyState {
-                            username: Some(username),
+                            username: None,
                             is_ready: Some(false),
                             manually_initiated: Some(true),
                             set_by: None,

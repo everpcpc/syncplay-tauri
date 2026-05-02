@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::env;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedPlayer {
@@ -55,125 +59,30 @@ pub fn detect_players() -> Vec<DetectedPlayer> {
 }
 
 fn detect_mpv() -> Option<DetectedPlayer> {
-    let paths = get_mpv_paths();
-
-    for path in paths {
-        if let Ok(output) = Command::new(&path).arg("--version").output() {
-            if output.status.success() {
-                let version_str = String::from_utf8_lossy(&output.stdout);
-                let version = parse_mpv_version(&version_str);
-
-                return Some(DetectedPlayer {
-                    name: "MPV".to_string(),
-                    path: path.to_string_lossy().to_string(),
-                    version,
-                });
-            }
-        }
-    }
-
-    None
+    detect_from_paths("MPV", get_mpv_paths(), &["mpv.exe"])
 }
 
 fn detect_vlc() -> Option<DetectedPlayer> {
-    let paths = get_vlc_paths();
-
-    for path in paths {
-        if let Ok(output) = Command::new(&path).arg("--version").output() {
-            if output.status.success() {
-                let version_str = String::from_utf8_lossy(&output.stdout);
-                let version = parse_vlc_version(&version_str);
-
-                return Some(DetectedPlayer {
-                    name: "VLC".to_string(),
-                    path: path.to_string_lossy().to_string(),
-                    version,
-                });
-            }
-        }
-    }
-
-    None
+    detect_from_paths("VLC", get_vlc_paths(), &["vlc.exe", "VLCPortable.exe"])
 }
 
 #[cfg(target_os = "windows")]
 fn detect_mpvnet() -> Option<DetectedPlayer> {
-    let paths = get_mpvnet_paths();
-
-    for path in paths {
-        if path.exists() {
-            let version = Command::new(&path)
-                .arg("--version")
-                .output()
-                .ok()
-                .and_then(|output| {
-                    if output.status.success() {
-                        let version_str = String::from_utf8_lossy(&output.stdout);
-                        parse_mpv_version(&version_str)
-                    } else {
-                        None
-                    }
-                });
-
-            return Some(DetectedPlayer {
-                name: "mpv.net".to_string(),
-                path: path.to_string_lossy().to_string(),
-                version,
-            });
-        }
-    }
-
-    None
+    detect_from_paths("mpv.net", get_mpvnet_paths(), &["mpvnet.exe"])
 }
 
 fn detect_mplayer() -> Option<DetectedPlayer> {
-    let paths = get_mplayer_paths();
-
-    for path in paths {
-        if let Ok(output) = Command::new(&path).arg("-version").output() {
-            if output.status.success() {
-                let version_str = String::from_utf8_lossy(&output.stdout);
-                let version = parse_mplayer_version(&version_str);
-                return Some(DetectedPlayer {
-                    name: "MPlayer".to_string(),
-                    path: path.to_string_lossy().to_string(),
-                    version,
-                });
-            }
-        }
-    }
-
-    None
+    detect_from_paths("MPlayer", get_mplayer_paths(), &["mplayer.exe"])
 }
 
 #[cfg(target_os = "windows")]
 fn detect_mpc_hc() -> Option<DetectedPlayer> {
-    let paths = get_mpc_hc_paths();
-    for path in paths {
-        if path.exists() {
-            return Some(DetectedPlayer {
-                name: "MPC-HC".to_string(),
-                path: path.to_string_lossy().to_string(),
-                version: None,
-            });
-        }
-    }
-    None
+    detect_from_paths("MPC-HC", get_mpc_hc_paths(), &MPC_HC_EXECUTABLES)
 }
 
 #[cfg(target_os = "windows")]
 fn detect_mpc_be() -> Option<DetectedPlayer> {
-    let paths = get_mpc_be_paths();
-    for path in paths {
-        if path.exists() {
-            return Some(DetectedPlayer {
-                name: "MPC-BE".to_string(),
-                path: path.to_string_lossy().to_string(),
-                version: None,
-            });
-        }
-    }
-    None
+    detect_from_paths("MPC-BE", get_mpc_be_paths(), &MPC_BE_EXECUTABLES)
 }
 
 #[cfg(target_os = "macos")]
@@ -196,55 +105,40 @@ fn detect_iina() -> Option<DetectedPlayer> {
     None
 }
 
+fn base_mpv_paths() -> Vec<PathBuf> {
+    vec![PathBuf::from("mpv"), PathBuf::from("/opt/mpv/mpv")]
+}
+
+#[cfg(target_os = "macos")]
 fn get_mpv_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+    let mut paths = base_mpv_paths();
+    paths.push(PathBuf::from("/Applications/mpv.app/Contents/MacOS/mpv"));
+    paths
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        paths.push(PathBuf::from("/usr/local/bin/mpv"));
-        paths.push(PathBuf::from("/opt/homebrew/bin/mpv"));
-        paths.push(PathBuf::from("/opt/mpv/mpv"));
-        paths.push(PathBuf::from("/Applications/mpv.app/Contents/MacOS/mpv"));
-    }
+#[cfg(target_os = "windows")]
+fn get_mpv_paths() -> Vec<PathBuf> {
+    let mut paths = base_mpv_paths();
+    paths.push(PathBuf::from("C:\\Program Files\\mpv\\mpv.exe"));
+    paths.push(PathBuf::from("C:\\Program Files\\mpv-player\\mpv.exe"));
+    paths.push(PathBuf::from("C:\\Program Files (x86)\\mpv\\mpv.exe"));
+    paths.push(PathBuf::from(
+        "C:\\Program Files (x86)\\mpv-player\\mpv.exe",
+    ));
 
-    #[cfg(target_os = "linux")]
-    {
-        paths.push(PathBuf::from("/usr/bin/mpv"));
-        paths.push(PathBuf::from("/usr/local/bin/mpv"));
-        paths.push(PathBuf::from("/opt/mpv/mpv"));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        paths.push(PathBuf::from("C:\\Program Files\\mpv\\mpv.exe"));
-        paths.push(PathBuf::from("C:\\Program Files\\mpv-player\\mpv.exe"));
-        paths.push(PathBuf::from("C:\\Program Files (x86)\\mpv\\mpv.exe"));
-        paths.push(PathBuf::from(
-            "C:\\Program Files (x86)\\mpv-player\\mpv.exe",
-        ));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-            paths.push(PathBuf::from(format!(
-                "{}\\Microsoft\\WindowsApps\\mpv.exe",
-                local_appdata
-            )));
-        }
-    }
-
-    // Also check PATH
-    if let Ok(output) = Command::new("which").arg("mpv").output() {
-        if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path_str.is_empty() {
-                paths.push(PathBuf::from(path_str));
-            }
-        }
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        paths.push(PathBuf::from(format!(
+            "{}\\Microsoft\\WindowsApps\\mpv.exe",
+            local_appdata
+        )));
     }
 
     paths
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn get_mpv_paths() -> Vec<PathBuf> {
+    base_mpv_paths()
 }
 
 #[cfg(target_os = "windows")]
@@ -267,78 +161,47 @@ fn get_mpvnet_paths() -> Vec<PathBuf> {
     paths
 }
 
+#[cfg(target_os = "windows")]
 fn get_vlc_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-
-    #[cfg(target_os = "macos")]
-    {
-        paths.push(PathBuf::from("/Applications/VLC.app/Contents/MacOS/VLC"));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        paths.push(PathBuf::from("/usr/bin/vlc"));
-        paths.push(PathBuf::from("/usr/bin/vlc-wrapper"));
-        paths.push(PathBuf::from("/usr/local/bin/vlc"));
-        paths.push(PathBuf::from("/usr/local/bin/vlc-wrapper"));
-        paths.push(PathBuf::from("/snap/bin/vlc"));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        paths.push(PathBuf::from("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"));
-        paths.push(PathBuf::from(
-            "C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe",
-        ));
-    }
-
-    // Also check PATH
-    if let Ok(output) = Command::new("which").arg("vlc").output() {
-        if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path_str.is_empty() {
-                paths.push(PathBuf::from(path_str));
-            }
-        }
-    }
-
-    paths
+    vec![
+        PathBuf::from("C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe"),
+        PathBuf::from("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"),
+        PathBuf::from("/usr/bin/vlc"),
+        PathBuf::from("/usr/bin/vlc-wrapper"),
+        PathBuf::from("/Applications/VLC.app/Contents/MacOS/VLC"),
+        PathBuf::from("/usr/local/bin/vlc"),
+        PathBuf::from("/usr/local/bin/vlc-wrapper"),
+        PathBuf::from("/snap/bin/vlc"),
+        PathBuf::from("vlc"),
+    ]
 }
 
+#[cfg(not(target_os = "windows"))]
+fn get_vlc_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/usr/bin/vlc"),
+        PathBuf::from("/usr/bin/vlc-wrapper"),
+        PathBuf::from("/Applications/VLC.app/Contents/MacOS/VLC"),
+        PathBuf::from("/usr/local/bin/vlc"),
+        PathBuf::from("/usr/local/bin/vlc-wrapper"),
+        PathBuf::from("/snap/bin/vlc"),
+        PathBuf::from("vlc"),
+    ]
+}
+
+#[cfg(target_os = "windows")]
 fn get_mplayer_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+    vec![
+        PathBuf::from("mplayer2"),
+        PathBuf::from("mplayer"),
+        PathBuf::from("C:\\Program Files\\mplayer\\mplayer.exe"),
+        PathBuf::from("C:\\Program Files (x86)\\mplayer\\mplayer.exe"),
+    ]
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        paths.push(PathBuf::from("/usr/bin/mplayer"));
-        paths.push(PathBuf::from("/usr/local/bin/mplayer"));
-        paths.push(PathBuf::from("/usr/bin/mplayer2"));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        paths.push(PathBuf::from("/usr/local/bin/mplayer"));
-        paths.push(PathBuf::from("/opt/homebrew/bin/mplayer"));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        paths.push(PathBuf::from("C:\\Program Files\\mplayer\\mplayer.exe"));
-        paths.push(PathBuf::from(
-            "C:\\Program Files (x86)\\mplayer\\mplayer.exe",
-        ));
-    }
-
-    if let Ok(output) = Command::new("which").arg("mplayer").output() {
-        if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path_str.is_empty() {
-                paths.push(PathBuf::from(path_str));
-            }
-        }
-    }
-
-    paths
+#[cfg(not(target_os = "windows"))]
+fn get_mplayer_paths() -> Vec<PathBuf> {
+    vec![PathBuf::from("mplayer2"), PathBuf::from("mplayer")]
 }
 
 #[cfg(target_os = "windows")]
@@ -369,29 +232,196 @@ fn get_mpc_be_paths() -> Vec<PathBuf> {
         PathBuf::from("C:\\Program Files\\MPC-BE x64\\mpc-be.exe"),
         PathBuf::from("C:\\Program Files\\MPC-BE\\mpc-be64.exe"),
         PathBuf::from("C:\\Program Files\\MPC-BE\\mpc-be.exe"),
-        PathBuf::from("C:\\Program Files (x86)\\MPC-BE\\mpc-be.exe"),
     ]
 }
 
-fn parse_mpv_version(output: &str) -> Option<String> {
-    // Parse version from output like "mpv 0.35.0 Copyright ..."
-    output
-        .lines()
+fn detect_from_paths(
+    name: &str,
+    paths: Vec<PathBuf>,
+    executable_suffixes: &[&str],
+) -> Option<DetectedPlayer> {
+    expand_player_paths(paths, executable_suffixes)
+        .into_iter()
         .next()
-        .and_then(|line| line.split_whitespace().nth(1).map(|v| v.to_string()))
+        .map(|path| DetectedPlayer {
+            name: name.to_string(),
+            path: path.to_string_lossy().to_string(),
+            version: None,
+        })
 }
 
-fn parse_vlc_version(output: &str) -> Option<String> {
-    // Parse version from VLC output
-    output
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(2).map(|v| v.to_string()))
+fn expand_player_paths(paths: Vec<PathBuf>, executable_suffixes: &[&str]) -> Vec<PathBuf> {
+    let mut expanded = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in paths {
+        for candidate in expand_player_path(&path, executable_suffixes) {
+            let key = normalize_path_key(&candidate);
+            if seen.insert(key) {
+                expanded.push(candidate);
+            }
+        }
+    }
+
+    expanded
 }
 
-fn parse_mplayer_version(output: &str) -> Option<String> {
-    output
-        .lines()
-        .find(|line| line.to_ascii_lowercase().contains("mplayer"))
-        .and_then(|line| line.split_whitespace().nth(1).map(|v| v.to_string()))
+fn expand_player_path(path: &Path, executable_suffixes: &[&str]) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if is_runnable_file(path) {
+        candidates.push(path.to_path_buf());
+        return candidates;
+    }
+
+    for suffix in executable_suffixes {
+        let direct = PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix));
+        if is_runnable_file(&direct) {
+            candidates.push(direct);
+            return candidates;
+        }
+
+        let joined = path.join(suffix);
+        if is_runnable_file(&joined) {
+            candidates.push(joined);
+            return candidates;
+        }
+    }
+
+    if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+        candidates.extend(find_on_path(file_name));
+    }
+
+    candidates
+}
+
+fn find_on_path(program: &str) -> Vec<PathBuf> {
+    let Some(paths) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    for dir in env::split_paths(&paths) {
+        for candidate in path_candidates(&dir, program) {
+            if is_runnable_file(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
+fn path_candidates(dir: &Path, program: &str) -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates = vec![dir.join(program)];
+        let has_extension = Path::new(program).extension().is_some();
+        if !has_extension {
+            for extension in windows_path_extensions() {
+                candidates.push(dir.join(format!("{}{}", program, extension)));
+            }
+        }
+        candidates
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![dir.join(program)]
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_path_extensions() -> Vec<String> {
+    env::var_os("PATHEXT")
+        .map(|value| {
+            env::split_paths(&value)
+                .map(|extension| extension.to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            vec![
+                ".COM".to_string(),
+                ".EXE".to_string(),
+                ".BAT".to_string(),
+                ".CMD".to_string(),
+            ]
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn is_runnable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(unix)]
+fn is_runnable_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+fn is_runnable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn normalize_path_key(path: &Path) -> String {
+    path.to_string_lossy().to_ascii_lowercase()
+}
+
+#[cfg(target_os = "windows")]
+const MPC_HC_EXECUTABLES: [&str; 6] = [
+    "mpc-hc.exe",
+    "mpc-hc64.exe",
+    "mpc-hcportable.exe",
+    "mpc-hc_nvo.exe",
+    "mpc-hc64_nvo.exe",
+    "shoukaku.exe",
+];
+
+#[cfg(target_os = "windows")]
+const MPC_BE_EXECUTABLES: [&str; 3] = ["mpc-be.exe", "mpc-beportable.exe", "mpc-be64.exe"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    #[cfg(unix)]
+    fn mark_runnable(path: &Path) {
+        let mut permissions = path.metadata().unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn mark_runnable(_path: &Path) {}
+
+    #[test]
+    fn expanded_path_appends_player_executable_in_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vlc_path = temp_dir.path().join("vlc.exe");
+        File::create(&vlc_path).unwrap();
+        mark_runnable(&vlc_path);
+
+        let expanded = expand_player_path(temp_dir.path(), &["vlc.exe"]);
+
+        assert_eq!(expanded, vec![vlc_path]);
+    }
+
+    #[test]
+    fn detection_scan_does_not_collect_versions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let player_path = temp_dir.path().join("mpv.exe");
+        File::create(&player_path).unwrap();
+        mark_runnable(&player_path);
+
+        let detected = detect_from_paths("MPV", vec![player_path.clone()], &["mpv.exe"]).unwrap();
+
+        assert_eq!(detected.name, "MPV");
+        assert_eq!(detected.path, player_path.to_string_lossy());
+        assert_eq!(detected.version, None);
+    }
 }
