@@ -26,7 +26,7 @@ enum QueueMessage {
     SetReady(bool),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueKey {
     SetTimePos,
     LoadFile,
@@ -346,18 +346,37 @@ impl MpvIpc {
 
     /// Set playback position
     pub async fn set_position(&self, position: f64) -> Result<()> {
-        let cmd = MpvCommand::seek(position, "absolute", 0);
+        let cmd = MpvCommand::set_property(
+            "time-pos",
+            serde_json::Value::Number(serde_json::Number::from_f64(position).unwrap()),
+            0,
+        );
         self.send_command_async(cmd).await?;
-        self.state.lock().position = Some(position);
+        self.store_position_state(position);
         Ok(())
+    }
+
+    fn store_position_state(&self, position: f64) {
+        self.state.lock().position = Some(position);
+        *self.last_position_update.lock() = Some(Instant::now());
     }
 
     /// Set pause state
     pub async fn set_paused(&self, paused: bool) -> Result<()> {
+        if self.get_state().paused == Some(paused) {
+            return Ok(());
+        }
         let cmd = MpvCommand::set_property("pause", serde_json::Value::Bool(paused), 0);
         self.send_command_async(cmd).await?;
-        self.state.lock().paused = Some(paused);
+        self.store_pause_state(paused);
         Ok(())
+    }
+
+    fn store_pause_state(&self, paused: bool) {
+        self.state.lock().paused = Some(paused);
+        if !paused {
+            *self.last_position_update.lock() = Some(Instant::now());
+        }
     }
 
     /// Set playback speed
@@ -503,5 +522,73 @@ async fn send_with_throttle(
     }
     if cmd_tx.send(cmd).is_ok() {
         *last_send = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_pause_state_refreshes_position_clock_when_unpausing() {
+        let ipc = MpvIpc::new("unused");
+        ipc.update_pause_and_position(Some(true), Some(10.0));
+        let before_unpause = ipc.last_position_update().expect("position update missing");
+
+        std::thread::sleep(Duration::from_millis(1));
+        ipc.store_pause_state(false);
+
+        let after_unpause = ipc.last_position_update().expect("position update missing");
+        assert!(after_unpause > before_unpause);
+        assert_eq!(ipc.get_state().paused, Some(false));
+    }
+
+    #[test]
+    fn store_pause_state_keeps_position_clock_when_pausing() {
+        let ipc = MpvIpc::new("unused");
+        ipc.update_pause_and_position(Some(false), Some(10.0));
+        let before_pause = ipc.last_position_update().expect("position update missing");
+
+        std::thread::sleep(Duration::from_millis(1));
+        ipc.store_pause_state(true);
+
+        let after_pause = ipc.last_position_update().expect("position update missing");
+        assert_eq!(after_pause, before_pause);
+        assert_eq!(ipc.get_state().paused, Some(true));
+    }
+
+    #[tokio::test]
+    async fn set_paused_skips_command_when_state_already_matches() {
+        let ipc = MpvIpc::new("unused");
+        ipc.update_pause_and_position(Some(true), Some(10.0));
+
+        let result = ipc.set_paused(true).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn store_position_state_refreshes_position_clock_after_seek() {
+        let ipc = MpvIpc::new("unused");
+        ipc.update_pause_and_position(Some(false), Some(10.0));
+        let before_seek = ipc.last_position_update().expect("position update missing");
+
+        std::thread::sleep(Duration::from_millis(1));
+        ipc.store_position_state(25.0);
+
+        let after_seek = ipc.last_position_update().expect("position update missing");
+        assert!(after_seek > before_seek);
+        assert_eq!(ipc.get_state().position, Some(25.0));
+    }
+
+    #[test]
+    fn set_time_pos_command_is_deduplicated_like_original_mpv() {
+        let cmd = MpvCommand::set_property(
+            "time-pos",
+            serde_json::Value::Number(serde_json::Number::from_f64(25.0).unwrap()),
+            0,
+        );
+
+        assert_eq!(queue_key(&cmd), Some(QueueKey::SetTimePos));
     }
 }

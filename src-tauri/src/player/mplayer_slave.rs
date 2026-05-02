@@ -207,12 +207,14 @@ impl PlayerBackend for MplayerBackend {
     }
 
     async fn set_position(&self, position: f64) -> anyhow::Result<()> {
-        self.send_command(&format!("seek {} 2", position)).await
+        self.state.lock().position = Some(position.max(0.0));
+        self.send_command(&set_position_command(position)).await
     }
 
     async fn set_paused(&self, paused: bool) -> anyhow::Result<()> {
         let current = self.state.lock().paused.unwrap_or(false);
         if paused != current {
+            self.state.lock().paused = Some(paused);
             self.send_command("pause").await
         } else {
             Ok(())
@@ -225,7 +227,7 @@ impl PlayerBackend for MplayerBackend {
     }
 
     async fn load_file(&self, path: &str) -> anyhow::Result<()> {
-        self.send_command(&format!("loadfile \"{}\" 0", path)).await
+        self.send_command(&load_file_command(path)).await
     }
 
     fn show_osd(&self, text: &str, _duration_ms: Option<u64>) -> anyhow::Result<()> {
@@ -241,5 +243,42 @@ impl PlayerBackend for MplayerBackend {
 
     async fn shutdown(&self) -> anyhow::Result<()> {
         self.send_command("quit").await
+    }
+}
+
+fn set_position_command(position: f64) -> String {
+    format!("set_property time_pos {}", position)
+}
+
+fn load_file_command(path: &str) -> String {
+    format!(
+        "loadfile \"{}\"",
+        path.replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_position_command_matches_original_mplayer_property_set() {
+        assert_eq!(set_position_command(12.5), "set_property time_pos 12.5");
+    }
+
+    #[test]
+    fn load_file_command_does_not_append_mode_argument() {
+        assert_eq!(
+            load_file_command("/tmp/example.mkv"),
+            "loadfile \"/tmp/example.mkv\""
+        );
+    }
+
+    #[test]
+    fn load_file_command_quotes_special_characters() {
+        assert_eq!(
+            load_file_command("/tmp/a \"quoted\" file.mkv"),
+            "loadfile \"/tmp/a \\\"quoted\\\" file.mkv\""
+        );
     }
 }

@@ -190,7 +190,13 @@ impl PlayerBackend for MpvBackend {
         let mut state = self.ipc.get_state();
         let is_loaded = self.file_loaded.load(Ordering::SeqCst);
         if let Some(app_state) = self.state.upgrade() {
-            if !is_loaded || self.recently_reset() {
+            if self.recently_reset() {
+                let global = app_state.client_state.get_global_state();
+                state.position = Some(0.0);
+                state.paused = Some(global.paused);
+                return state;
+            }
+            if !is_loaded {
                 let global = app_state.client_state.get_global_state();
                 state.position = Some(global.position);
                 state.paused = Some(global.paused);
@@ -264,6 +270,18 @@ impl PlayerBackend for MpvBackend {
         *self.reset_ignore_until.lock() = Some(until);
     }
 
+    fn set_features(&self) -> anyhow::Result<()> {
+        let Some(state) = self.state.upgrade() else {
+            return Ok(());
+        };
+        send_syncplayintf_options(
+            self.ipc.clone(),
+            state,
+            self.osc_visibility_change_compatible,
+        );
+        Ok(())
+    }
+
     fn show_osd(&self, text: &str, duration_ms: Option<u64>) -> anyhow::Result<()> {
         if let Some(state) = self.state.upgrade() {
             let config = state.config.lock().clone();
@@ -305,6 +323,31 @@ impl PlayerBackend for MpvBackend {
     async fn shutdown(&self) -> anyhow::Result<()> {
         self.ipc.quit()
     }
+}
+
+fn send_syncplayintf_options(
+    ipc: Arc<MpvIpc>,
+    state: Arc<AppState>,
+    osc_visibility_change_compatible: bool,
+) {
+    tokio::spawn(async move {
+        let options = build_syncplayintf_options(&state, osc_visibility_change_compatible);
+        let cmd = MpvCommand::script_message_to(
+            "syncplayintf",
+            "set_syncplayintf_options",
+            vec![Value::String(options)],
+        );
+        let _ = ipc.send_command_async(cmd).await;
+        let socket = ipc.socket_path().to_string();
+        let _ = ipc
+            .send_command_async(MpvCommand::set_property(
+                "input-ipc-server",
+                Value::String(socket),
+                0,
+            ))
+            .await;
+        apply_osd_position(&ipc, &state).await;
+    });
 }
 
 async fn handle_syncplayintf_line(
@@ -361,22 +404,7 @@ async fn handle_syncplayintf_line(
     }
     if line.contains("<get_syncplayintf_options>") {
         if let Some(state) = state.upgrade() {
-            let options = build_syncplayintf_options(&state, osc_visibility_change_compatible);
-            let cmd = MpvCommand::script_message_to(
-                "syncplayintf",
-                "set_syncplayintf_options",
-                vec![Value::String(options)],
-            );
-            let _ = ipc.send_command_async(cmd).await;
-            let socket = ipc.socket_path().to_string();
-            let _ = ipc
-                .send_command_async(MpvCommand::set_property(
-                    "input-ipc-server",
-                    Value::String(socket),
-                    0,
-                ))
-                .await;
-            apply_osd_position(ipc, &state).await;
+            send_syncplayintf_options(ipc.clone(), state, osc_visibility_change_compatible);
         }
         return;
     }
@@ -642,4 +670,60 @@ fn sanitize_mpv_text(input: &str) -> String {
     text = text.replace('\\', MPV_INPUT_BACKSLASH_SUBSTITUTE);
     text = text.replace('"', "'");
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::AppState;
+
+    #[test]
+    fn get_state_reports_zero_position_while_recently_reset() {
+        let app_state = AppState::new();
+        app_state
+            .client_state
+            .set_global_state(42.0, true, Some("peer".to_string()));
+
+        let backend = MpvBackend::new(
+            PlayerKind::Mpv,
+            MpvIpc::new("unused"),
+            Arc::downgrade(&app_state),
+            true,
+            None,
+        );
+        backend.file_loaded.store(true, Ordering::SeqCst);
+        backend
+            .ipc
+            .update_pause_and_position(Some(false), Some(12.0));
+        backend.mark_reset(false);
+
+        let state = backend.get_state();
+
+        assert_eq!(state.position, Some(0.0));
+        assert_eq!(state.paused, Some(true));
+    }
+
+    #[test]
+    fn get_state_uses_global_state_until_file_is_loaded() {
+        let app_state = AppState::new();
+        app_state
+            .client_state
+            .set_global_state(42.0, false, Some("peer".to_string()));
+
+        let backend = MpvBackend::new(
+            PlayerKind::Mpv,
+            MpvIpc::new("unused"),
+            Arc::downgrade(&app_state),
+            true,
+            None,
+        );
+        backend
+            .ipc
+            .update_pause_and_position(Some(true), Some(12.0));
+
+        let state = backend.get_state();
+
+        assert_eq!(state.position, Some(42.0));
+        assert_eq!(state.paused, Some(false));
+    }
 }

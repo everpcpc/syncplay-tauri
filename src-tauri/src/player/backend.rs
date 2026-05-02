@@ -77,6 +77,9 @@ pub trait PlayerBackend: Send + Sync {
     async fn set_paused(&self, paused: bool) -> anyhow::Result<()>;
     async fn set_speed(&self, speed: f64) -> anyhow::Result<()>;
     async fn load_file(&self, path: &str) -> anyhow::Result<()>;
+    fn set_features(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn mark_reset(&self, _is_stream: bool) {}
     fn show_osd(&self, text: &str, duration_ms: Option<u64>) -> anyhow::Result<()>;
     fn show_chat_message(&self, _username: Option<&str>, _message: &str) -> anyhow::Result<()> {
