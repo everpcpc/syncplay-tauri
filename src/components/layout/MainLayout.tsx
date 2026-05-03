@@ -711,7 +711,8 @@ export function MainLayout() {
                   <button
                     onClick={handleInstallHeaderUpdate}
                     disabled={isInstallingUpdate}
-                    className="btn-primary px-2.5 py-1 rounded-full text-xs"
+                    className="btn-primary app-tag-accent px-3 py-1.5 rounded-md text-xs"
+                    data-tauri-drag-region="false"
                     aria-label={`Update available: ${updateVersion}`}
                     title={
                       isInstallingUpdate && updateProgress
