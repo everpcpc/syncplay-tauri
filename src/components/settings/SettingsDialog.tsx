@@ -1,15 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import { getAppliedTheme } from "../../services/theme";
-import {
-  checkForUpdates,
-  downloadAndInstallUpdate,
-  formatBytes,
-  formatUpdateError,
-  nextUpdateProgress,
-  type UpdateProgress,
-} from "../../services/updater";
 import {
   ChatInputPosition,
   ChatOutputMode,
@@ -22,19 +13,9 @@ interface SettingsDialogProps {
   isOpen: boolean;
   onClose: () => void;
   initialTab?: SettingsTab;
-  appVersion?: string | null;
-  onUpdateAvailable?: (version: string | null) => void;
 }
 
 type SettingsTab = "sync" | "ready" | "privacy" | "chat" | "osd" | "misc";
-type UpdateStatus =
-  | "idle"
-  | "checking"
-  | "available"
-  | "up-to-date"
-  | "error"
-  | "installing"
-  | "unsupported";
 
 const privacyOptions: Array<{ label: string; value: PrivacyMode }> = [
   { label: "Send raw", value: "send_raw" },
@@ -60,24 +41,13 @@ const chatOutputModes: Array<{ label: string; value: ChatOutputMode }> = [
   { label: "Scrolling", value: "scrolling" },
 ];
 
-export function SettingsDialog({
-  isOpen,
-  onClose,
-  initialTab,
-  appVersion,
-  onUpdateAvailable,
-}: SettingsDialogProps) {
+export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogProps) {
   const [config, setConfig] = useState<SyncplayConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab ?? "sync");
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skipAutoSaveRef = useRef(true);
-  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
-  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
-  const [updateInfo, setUpdateInfo] = useState<Update | null>(null);
-  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
-  const updateProgressRef = useRef<UpdateProgress>({ downloaded: 0 });
 
   useEffect(() => {
     if (!isOpen) {
@@ -86,7 +56,6 @@ export function SettingsDialog({
         saveTimeoutRef.current = null;
       }
       skipAutoSaveRef.current = true;
-      void resetUpdateState();
       return;
     }
     loadConfig();
@@ -108,88 +77,6 @@ export function SettingsDialog({
       setError(err as string);
     } finally {
       setLoading(false);
-    }
-  };
-
-  const resetUpdateState = async () => {
-    if (updateInfo) {
-      try {
-        await updateInfo.close();
-      } catch (err) {
-        console.warn("Failed to close updater resource", err);
-      }
-    }
-    setUpdateInfo(null);
-    setUpdateStatus("idle");
-    setUpdateMessage(null);
-    setUpdateProgress(null);
-    updateProgressRef.current = { downloaded: 0 };
-  };
-
-  const handleCheckUpdates = async () => {
-    setUpdateStatus("checking");
-    setUpdateMessage(null);
-    setUpdateProgress(null);
-    updateProgressRef.current = { downloaded: 0 };
-    if (updateInfo) {
-      try {
-        await updateInfo.close();
-      } catch (err) {
-        console.warn("Failed to close updater resource", err);
-      }
-      setUpdateInfo(null);
-    }
-
-    const result = await checkForUpdates();
-    if (result.status === "available") {
-      setUpdateInfo(result.update);
-      setUpdateStatus("available");
-      setUpdateMessage(
-        `Update ${result.update.version} is available (current ${result.update.currentVersion}).`
-      );
-      onUpdateAvailable?.(result.update.version);
-      return;
-    }
-    if (result.status === "up-to-date") {
-      setUpdateStatus("up-to-date");
-      setUpdateMessage("You're already on the latest version.");
-      onUpdateAvailable?.(null);
-      return;
-    }
-    if (result.status === "unsupported") {
-      setUpdateStatus("unsupported");
-      setUpdateMessage("Updates are only available in the desktop app.");
-      onUpdateAvailable?.(null);
-      return;
-    }
-    setUpdateStatus("error");
-    setUpdateMessage(result.message);
-    onUpdateAvailable?.(null);
-  };
-
-  const handleInstallUpdate = async () => {
-    if (!updateInfo) return;
-    setUpdateStatus("installing");
-    setUpdateMessage("Downloading update...");
-    updateProgressRef.current = { downloaded: 0 };
-    setUpdateProgress({ downloaded: 0 });
-
-    try {
-      await downloadAndInstallUpdate(updateInfo, (event: DownloadEvent) => {
-        updateProgressRef.current = nextUpdateProgress(updateProgressRef.current, event);
-        setUpdateProgress({ ...updateProgressRef.current });
-      });
-    } catch (err) {
-      setUpdateStatus("error");
-      setUpdateMessage(formatUpdateError(err));
-      setUpdateProgress(null);
-    } finally {
-      try {
-        await updateInfo.close();
-      } catch (closeError) {
-        console.warn("Failed to close updater resource", closeError);
-      }
-      setUpdateInfo(null);
     }
   };
 
@@ -1108,62 +995,6 @@ export function SettingsDialog({
 
             {activeTab === "misc" && (
               <div className="space-y-4">
-                <div className="space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-medium">App updates</p>
-                      <p className="text-xs app-text-muted">
-                        Check for new releases and install without leaving the app.
-                      </p>
-                      {appVersion && (
-                        <p className="text-xs app-text-muted">Current version {appVersion}</p>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={handleCheckUpdates}
-                      disabled={updateStatus === "checking" || updateStatus === "installing"}
-                      className="btn-secondary px-3 py-2 rounded-md text-sm"
-                    >
-                      {updateStatus === "checking" ? "Checking..." : "Check now"}
-                    </button>
-                  </div>
-
-                  {updateMessage && (
-                    <div
-                      className={
-                        updateStatus === "error" || updateStatus === "unsupported"
-                          ? "app-alert app-alert-danger px-3 py-2 text-xs"
-                          : "app-message text-xs"
-                      }
-                    >
-                      {updateMessage}
-                    </div>
-                  )}
-
-                  {updateStatus === "installing" && updateProgress && (
-                    <div className="text-xs app-text-muted">
-                      Downloaded {formatBytes(updateProgress.downloaded)}
-                      {updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""}
-                    </div>
-                  )}
-
-                  {updateInfo &&
-                    (updateStatus === "available" || updateStatus === "installing") && (
-                      <div className="flex flex-wrap items-center gap-3">
-                        <button
-                          type="button"
-                          onClick={handleInstallUpdate}
-                          disabled={updateStatus === "installing"}
-                          className="btn-primary px-3 py-2 rounded-md text-sm"
-                        >
-                          {updateStatus === "installing" ? "Installing..." : "Download and install"}
-                        </button>
-                        <span className="text-xs app-text-muted">Version {updateInfo.version}</span>
-                      </div>
-                    )}
-                </div>
-
                 <div>
                   <label className="block text-sm font-medium mb-1">
                     Check for updates automatically

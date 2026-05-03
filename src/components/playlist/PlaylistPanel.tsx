@@ -4,6 +4,7 @@ import {
   LuChevronRight,
   LuFolder,
   LuListMusic,
+  LuPause,
   LuPlay,
   LuPlus,
   LuRefreshCw,
@@ -713,12 +714,18 @@ export function PlaylistPanel() {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-3 text-sm">
-            <div
-              className="flex items-center justify-center w-7 h-7 rounded-md app-panel-muted app-tooltip"
+            <button
+              type="button"
+              disabled
+              className="btn-neutral app-icon-button disabled:opacity-100 disabled:cursor-default"
               aria-label={player.paused ? "Paused" : "Playing"}
             >
-              {player.paused ? <span className="app-text-warning">⏸</span> : <span>▶</span>}
-            </div>
+              {player.paused ? (
+                <LuPause className="app-icon app-text-warning" />
+              ) : (
+                <LuPlay className="app-icon" />
+              )}
+            </button>
             {player.position !== null && player.duration !== null && (
               <span className="font-mono text-xs">
                 {formatTime(player.position)}/{formatTime(player.duration)}

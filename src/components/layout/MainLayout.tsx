@@ -623,7 +623,11 @@ export function MainLayout() {
   const handleInstallHeaderUpdate = async () => {
     const availableUpdate = availableUpdateRef.current;
     if (!availableUpdate) {
-      handleOpenSettings("misc");
+      addNotification({
+        type: "warning",
+        message: "Update is no longer available. Restart the app to check again.",
+      });
+      replaceAvailableUpdate(null);
       return;
     }
 
@@ -645,20 +649,6 @@ export function MainLayout() {
       setIsInstallingUpdate(false);
       setUpdateProgress(null);
     }
-  };
-
-  const handleSettingsUpdateAvailable = (version: string | null) => {
-    const availableUpdate = availableUpdateRef.current;
-    if (!version) {
-      replaceAvailableUpdate(null);
-      return;
-    }
-    if (availableUpdate?.version === version) {
-      setUpdateVersion(version);
-      return;
-    }
-    replaceAvailableUpdate(null);
-    setUpdateVersion(version);
   };
 
   const handleCloseSettings = () => {
@@ -916,8 +906,6 @@ export function MainLayout() {
         isOpen={showSettingsDialog}
         onClose={handleCloseSettings}
         initialTab={settingsInitialTab}
-        appVersion={appVersion}
-        onUpdateAvailable={handleSettingsUpdateAvailable}
       />
     </div>
   );
