@@ -623,7 +623,11 @@ export function MainLayout() {
   const handleInstallHeaderUpdate = async () => {
     const availableUpdate = availableUpdateRef.current;
     if (!availableUpdate) {
-      handleOpenSettings("misc");
+      addNotification({
+        type: "warning",
+        message: "Update is no longer available. Restart the app to check again.",
+      });
+      replaceAvailableUpdate(null);
       return;
     }
 
