@@ -84,7 +84,7 @@ export function ChatPanel() {
       </div>
 
       {/* Input area */}
-      <div className="border-t app-divider p-4 app-surface">
+      <div className="border-t app-divider px-4 py-3.5 app-surface">
         <input
           type="text"
           value={inputValue}
@@ -97,7 +97,7 @@ export function ChatPanel() {
                 ? "Type a message... (or /help for commands)"
                 : "Chat input disabled"
           }
-          className="w-full app-input px-4 py-2 rounded-md focus:outline-none focus:border-blue-500"
+          className="w-full h-8 app-input px-3 py-0 leading-4 rounded-md focus:outline-none focus:border-blue-500"
           disabled={!connection.connected || !chatInputEnabled}
         />
       </div>

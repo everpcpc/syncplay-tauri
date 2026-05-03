@@ -647,20 +647,6 @@ export function MainLayout() {
     }
   };
 
-  const handleSettingsUpdateAvailable = (version: string | null) => {
-    const availableUpdate = availableUpdateRef.current;
-    if (!version) {
-      replaceAvailableUpdate(null);
-      return;
-    }
-    if (availableUpdate?.version === version) {
-      setUpdateVersion(version);
-      return;
-    }
-    replaceAvailableUpdate(null);
-    setUpdateVersion(version);
-  };
-
   const handleCloseSettings = () => {
     setShowSettingsDialog(false);
     setSettingsInitialTab(undefined);
@@ -916,8 +902,6 @@ export function MainLayout() {
         isOpen={showSettingsDialog}
         onClose={handleCloseSettings}
         initialTab={settingsInitialTab}
-        appVersion={appVersion}
-        onUpdateAvailable={handleSettingsUpdateAvailable}
       />
     </div>
   );
