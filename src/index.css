@@ -192,6 +192,7 @@
   display: grid;
   gap: 0;
   position: relative;
+  z-index: 4;
   background: transparent;
   overflow: visible;
 }
