@@ -294,8 +294,6 @@
   display: flex;
   gap: 8px;
   align-items: center;
-  position: relative;
-  z-index: 4;
   -webkit-app-region: no-drag;
 }
 
