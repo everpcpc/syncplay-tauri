@@ -14,12 +14,14 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
   const [config, setConfig] = useState<SyncplayConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [mediaDirectoryInput, setMediaDirectoryInput] = useState("");
+  const [mediaIndexTimeoutInput, setMediaIndexTimeoutInput] = useState("20");
   const addNotification = useNotificationStore((state) => state.addNotification);
 
   useEffect(() => {
     if (!isOpen) {
       setConfig(null);
       setMediaDirectoryInput("");
+      setMediaIndexTimeoutInput("20");
       return;
     }
     const loadConfig = async () => {
@@ -27,6 +29,7 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
       try {
         const loaded = await invoke<SyncplayConfig>("get_config");
         setConfig(loaded);
+        setMediaIndexTimeoutInput(String(loaded.player.media_index_timeout_seconds));
       } catch (error) {
         addNotification({
           type: "error",
@@ -49,6 +52,31 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
         message: "Failed to update media directories",
       });
     }
+  };
+
+  const saveMediaIndexTimeout = async () => {
+    if (!config) return;
+    const timeoutSeconds = Number(mediaIndexTimeoutInput);
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1) {
+      addNotification({
+        type: "warning",
+        message: "Media scan timeout must be a positive whole number",
+      });
+      setMediaIndexTimeoutInput(String(config.player.media_index_timeout_seconds));
+      return;
+    }
+    if (timeoutSeconds === config.player.media_index_timeout_seconds) {
+      return;
+    }
+
+    const nextConfig: SyncplayConfig = {
+      ...config,
+      player: {
+        ...config.player,
+        media_index_timeout_seconds: timeoutSeconds,
+      },
+    };
+    await saveConfig(nextConfig);
   };
 
   const addMediaDirectory = async () => {
@@ -163,6 +191,30 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
           </div>
         ) : config ? (
           <div className="space-y-4">
+            <div>
+              <label className="text-sm font-medium mb-2 block">Scan timeout</label>
+              <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={mediaIndexTimeoutInput}
+                  onChange={(e) => setMediaIndexTimeoutInput(e.target.value)}
+                  onBlur={saveMediaIndexTimeout}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      e.currentTarget.blur();
+                    }
+                  }}
+                  className="w-full sm:w-32 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                />
+                <span className="text-xs app-text-muted">
+                  Seconds allowed for media directory scanning.
+                </span>
+              </div>
+            </div>
+
             <div>
               <label className="text-sm font-medium mb-2 block">Add directory</label>
               <div className="flex flex-col sm:flex-row gap-2">

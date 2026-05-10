@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub const DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS: u64 = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivacyMode {
@@ -164,6 +166,8 @@ pub struct PlayerConfig {
     #[serde(default)]
     pub player_path: String,
     pub media_directories: Vec<String>,
+    #[serde(default = "default_media_index_timeout_seconds")]
+    pub media_index_timeout_seconds: u64,
     #[serde(default)]
     pub player_arguments: Vec<String>,
     #[serde(default)]
@@ -175,10 +179,15 @@ impl Default for PlayerConfig {
         Self {
             player_path: "mpv".to_string(),
             media_directories: Vec::new(),
+            media_index_timeout_seconds: default_media_index_timeout_seconds(),
             player_arguments: Vec::new(),
             per_player_arguments: HashMap::new(),
         }
     }
+}
+
+fn default_media_index_timeout_seconds() -> u64 {
+    DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS
 }
 
 impl Default for UserPreferences {
@@ -376,6 +385,10 @@ impl SyncplayConfig {
             return Err("Autoplay min users must be >= -1".to_string());
         }
 
+        if self.player.media_index_timeout_seconds == 0 {
+            return Err("Media index timeout must be positive".to_string());
+        }
+
         Ok(())
     }
 
@@ -403,6 +416,10 @@ mod tests {
         assert_eq!(config.server.host, "syncplay.pl");
         assert_eq!(config.server.port, 8999);
         assert_eq!(config.user.default_room, "default");
+        assert_eq!(
+            config.player.media_index_timeout_seconds,
+            DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS
+        );
     }
 
     #[test]
@@ -417,6 +434,13 @@ mod tests {
         let mut config = SyncplayConfig::default();
         config.user.username = String::new();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_media_index_timeout() {
+        let mut config = SyncplayConfig::default();
+        config.player.media_index_timeout_seconds = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

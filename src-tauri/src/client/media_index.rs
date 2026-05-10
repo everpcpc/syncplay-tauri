@@ -1,5 +1,6 @@
 use crate::app_state::AppState;
 use crate::commands::connection::emit_error_message;
+use crate::config::DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS;
 use crate::player::controller::load_media_by_name;
 use crate::utils::{hash_filename, same_filename, strip_filename, PRIVACY_HIDDEN_FILENAME};
 use parking_lot::RwLock;
@@ -9,9 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
-
-const MEDIA_INDEX_TIMEOUT_SECONDS: u64 = 20;
-const MEDIA_INDEX_FIRST_FILE_TIMEOUT_SECONDS: u64 = 25;
 
 #[derive(Default)]
 struct MediaIndexCache {
@@ -94,6 +92,7 @@ impl MediaIndexCache {
 pub struct MediaIndex {
     cache: RwLock<MediaIndexCache>,
     directories: RwLock<Vec<String>>,
+    timeout_seconds: RwLock<u64>,
     last_resolved_directory: RwLock<Option<PathBuf>>,
     updating: AtomicBool,
     disabled: AtomicBool,
@@ -104,23 +103,27 @@ impl MediaIndex {
         Arc::new(Self {
             cache: RwLock::new(MediaIndexCache::default()),
             directories: RwLock::new(Vec::new()),
+            timeout_seconds: RwLock::new(DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS),
             last_resolved_directory: RwLock::new(None),
             updating: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
         })
     }
 
-    pub fn update_directories(&self, directories: Vec<String>) -> bool {
+    pub fn update_settings(&self, directories: Vec<String>, timeout_seconds: u64) -> bool {
         let cleaned: Vec<String> = directories
             .into_iter()
             .map(|dir| dir.trim().to_string())
             .filter(|dir| !dir.is_empty())
             .collect();
-        let mut guard = self.directories.write();
-        if *guard == cleaned {
+        let timeout_seconds = timeout_seconds.max(1);
+        let mut directories_guard = self.directories.write();
+        let mut timeout_guard = self.timeout_seconds.write();
+        if *directories_guard == cleaned && *timeout_guard == timeout_seconds {
             return false;
         }
-        *guard = cleaned;
+        *directories_guard = cleaned;
+        *timeout_guard = timeout_seconds;
         self.disabled.store(false, Ordering::SeqCst);
         true
     }
@@ -193,6 +196,7 @@ impl MediaIndex {
             serde_json::json!({ "refreshing": true }),
         );
         let directories = self.directories.read().clone();
+        let timeout_seconds = *self.timeout_seconds.read();
         if directories.is_empty() {
             self.updating.store(false, Ordering::SeqCst);
             state.emit_event(
@@ -201,7 +205,9 @@ impl MediaIndex {
             );
             return;
         }
-        let result = tokio::task::spawn_blocking(move || scan_directories(&directories)).await;
+        let result =
+            tokio::task::spawn_blocking(move || scan_directories(&directories, timeout_seconds))
+                .await;
         match result {
             Ok(Ok(cache)) => {
                 *self.cache.write() = cache;
@@ -294,13 +300,16 @@ enum ScanError {
     Io(std::io::Error),
 }
 
-fn scan_directories(directories: &[String]) -> Result<MediaIndexCache, ScanError> {
+fn scan_directories(
+    directories: &[String],
+    timeout_seconds: u64,
+) -> Result<MediaIndexCache, ScanError> {
     if directories.is_empty() {
         return Err(ScanError::NoDirectories);
     }
     let mut cache = MediaIndexCache::default();
     let start = Instant::now();
-    let timeout = Duration::from_secs(MEDIA_INDEX_TIMEOUT_SECONDS);
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
 
     for directory in directories {
         let directory = directory.trim();
@@ -314,7 +323,7 @@ fn scan_directories(directories: &[String]) -> Result<MediaIndexCache, ScanError
         let first_start = Instant::now();
         let mut entries = std::fs::read_dir(root).map_err(ScanError::Io)?;
         let _ = entries.next();
-        if first_start.elapsed() > Duration::from_secs(MEDIA_INDEX_FIRST_FILE_TIMEOUT_SECONDS) {
+        if first_start.elapsed() > timeout {
             return Err(ScanError::FirstFileTimeout(directory.to_string()));
         }
     }
@@ -365,6 +374,7 @@ fn scan_directories(directories: &[String]) -> Result<MediaIndexCache, ScanError
 #[cfg(test)]
 mod tests {
     use super::{scan_directories, MediaIndex};
+    use crate::config::DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS;
     use std::fs;
     use tempfile::TempDir;
 
@@ -399,7 +409,7 @@ mod tests {
             second_dir.path().to_string_lossy().to_string(),
             first_dir.path().to_string_lossy().to_string(),
         ];
-        let cache = scan_directories(&directories).unwrap();
+        let cache = scan_directories(&directories, DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS).unwrap();
 
         assert_eq!(cache.resolve("movie.mp4"), Some(second_file));
     }

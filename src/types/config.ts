@@ -101,6 +101,7 @@ export interface UserPreferences {
 export interface PlayerConfig {
   player_path: string;
   media_directories: string[];
+  media_index_timeout_seconds: number;
   player_arguments: string[];
   per_player_arguments: Record<string, string[]>;
 }

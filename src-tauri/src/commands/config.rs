@@ -34,10 +34,10 @@ pub async fn update_config<R: Runtime>(
 
     *state.config.lock() = config.clone();
     state.sync_engine.lock().update_from_config(&config.user);
-    if state
-        .media_index
-        .update_directories(config.player.media_directories.clone())
-    {
+    if state.media_index.update_settings(
+        config.player.media_directories.clone(),
+        config.player.media_index_timeout_seconds,
+    ) {
         state
             .media_index
             .clone()
