@@ -73,9 +73,10 @@ fn main() {
                 .sync_engine
                 .lock()
                 .update_from_config(&config.user);
-            app_state
-                .media_index
-                .update_directories(config.player.media_directories.clone());
+            app_state.media_index.update_settings(
+                config.player.media_directories.clone(),
+                config.player.media_index_timeout_seconds,
+            );
             app_state
                 .media_index
                 .clone()
