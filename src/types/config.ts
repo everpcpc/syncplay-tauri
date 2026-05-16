@@ -7,7 +7,7 @@ export type UnpauseAction =
 export type ChatInputPosition = "top" | "middle" | "bottom";
 export type ChatOutputMode = "chatroom" | "scrolling";
 export type TransparencyMode = "off" | "low" | "high";
-export type SidePanelLayout = "rows" | "columns" | "chat-bottom";
+export type SidePanelLayout = "three-rows" | "three-columns" | "left-chat";
 
 export interface ServerConfig {
   host: string;

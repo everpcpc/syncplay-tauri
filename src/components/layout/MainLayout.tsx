@@ -12,8 +12,8 @@ import {
   LuListMinus,
   LuListMusic,
   LuMoon,
-  LuPanelBottom,
-  LuRows2,
+  LuPanelLeft,
+  LuRows3,
   LuSettings,
   LuSun,
   LuZap,
@@ -60,10 +60,14 @@ type UiLayoutPreferencePatch = Partial<
   >
 >;
 
-const SIDE_LAYOUTS: SidePanelLayout[] = ["rows", "columns", "chat-bottom"];
+const SIDE_LAYOUTS: SidePanelLayout[] = ["three-rows", "three-columns", "left-chat"];
 
-const normalizeSidePanelLayout = (layout: unknown): SidePanelLayout =>
-  SIDE_LAYOUTS.includes(layout as SidePanelLayout) ? (layout as SidePanelLayout) : "rows";
+const normalizeSidePanelLayout = (layout: unknown): SidePanelLayout => {
+  if (layout === "rows" || layout === "left-chat") return "left-chat";
+  if (layout === "columns" || layout === "three-columns") return "three-columns";
+  if (layout === "chat-bottom" || layout === "three-rows") return "three-rows";
+  return "left-chat";
+};
 
 export function MainLayout() {
   const appWindow = isTauri() ? getCurrentWindow() : null;
@@ -72,9 +76,9 @@ export function MainLayout() {
   const [showConnectionDialog, setShowConnectionDialog] = useState(false);
   const [showSettingsDialog, setShowSettingsDialog] = useState(false);
   const [showPlaylist, setShowPlaylist] = useState(true);
-  const [sideLayout, setSideLayout] = useState<SidePanelLayout>("rows");
-  const isChatBottomLayout = sideLayout === "chat-bottom";
-  const sidePanelsDirection = sideLayout === "rows" ? "rows" : "columns";
+  const [sideLayout, setSideLayout] = useState<SidePanelLayout>("left-chat");
+  const isLeftChatLayout = sideLayout === "left-chat";
+  const sidePanelsDirection = sideLayout === "left-chat" ? "rows" : "columns";
   const [theme, setTheme] = useState<ThemePreference>("dark");
   const [transparencyMode, setTransparencyMode] = useState<TransparencyPreference>("off");
   const [layoutSize, setLayoutSize] = useState({ width: 0, height: 0 });
@@ -513,7 +517,7 @@ export function MainLayout() {
   const clampValue = (value: number, min: number, max: number) =>
     Math.min(Math.max(value, min), max);
   const layoutMainWidth =
-    !isChatBottomLayout && sideWidth && layoutSize.width
+    isLeftChatLayout && sideWidth && layoutSize.width
       ? Math.max(MAIN_MIN_WIDTH, layoutSize.width - sideWidth - GAP_SIZE)
       : null;
   const sidePanelPrimarySize = showPlaylist && sidePanelSize !== null ? sidePanelSize : null;
@@ -679,19 +683,19 @@ export function MainLayout() {
   };
 
   const layoutLabel =
-    sideLayout === "rows"
-      ? "Layout stacked"
-      : sideLayout === "columns"
-        ? "Layout split"
-        : "Layout chat bottom";
+    sideLayout === "three-columns"
+      ? "Layout: three columns"
+      : sideLayout === "three-rows"
+        ? "Layout: three rows"
+        : "Layout: left chat, right stacked panels";
 
   const layoutIcon =
-    sideLayout === "rows" ? (
-      <LuRows2 className="app-icon" />
-    ) : sideLayout === "columns" ? (
+    sideLayout === "three-columns" ? (
       <LuColumns2 className="app-icon" />
+    ) : sideLayout === "three-rows" ? (
+      <LuRows3 className="app-icon" />
     ) : (
-      <LuPanelBottom className="app-icon" />
+      <LuPanelLeft className="app-icon" />
     );
 
   const chatPanel = (
@@ -713,14 +717,14 @@ export function MainLayout() {
         data-layout={sideLayout}
         style={{
           gridTemplateColumns:
-            !isChatBottomLayout && layoutMainWidth && sideWidth
+            isLeftChatLayout && layoutMainWidth && sideWidth
               ? `${layoutMainWidth}px ${sideWidth}px`
               : undefined,
         }}
       >
-        {!isChatBottomLayout && chatPanel}
+        {isLeftChatLayout && chatPanel}
 
-        {!isChatBottomLayout && (
+        {isLeftChatLayout && (
           <div
             className="app-resizer app-resizer-vertical app-resizer-overlay"
             role="separator"
@@ -915,7 +919,7 @@ export function MainLayout() {
               </aside>
             )}
           </div>
-          {isChatBottomLayout && chatPanel}
+          {!isLeftChatLayout && chatPanel}
         </section>
       </div>
 
