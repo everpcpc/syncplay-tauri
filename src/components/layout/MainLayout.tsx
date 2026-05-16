@@ -12,6 +12,7 @@ import {
   LuListMinus,
   LuListMusic,
   LuMoon,
+  LuPanelBottom,
   LuRows2,
   LuSettings,
   LuSun,
@@ -46,14 +47,23 @@ import {
   shouldAutoCheckUpdates,
   type UpdateProgress,
 } from "../../services/updater";
-import { SyncplayConfig, UserPreferences } from "../../types/config";
+import { SyncplayConfig, SidePanelLayout, UserPreferences } from "../../types/config";
 
 type UiLayoutPreferencePatch = Partial<
   Pick<
     UserPreferences,
-    "side_column_width" | "side_panel_primary_size" | "window_width" | "window_height"
+    | "side_column_width"
+    | "side_panel_primary_size"
+    | "window_width"
+    | "window_height"
+    | "side_panel_layout"
   >
 >;
+
+const SIDE_LAYOUTS: SidePanelLayout[] = ["rows", "columns", "chat-bottom"];
+
+const normalizeSidePanelLayout = (layout: unknown): SidePanelLayout =>
+  SIDE_LAYOUTS.includes(layout as SidePanelLayout) ? (layout as SidePanelLayout) : "rows";
 
 export function MainLayout() {
   const appWindow = isTauri() ? getCurrentWindow() : null;
@@ -62,7 +72,9 @@ export function MainLayout() {
   const [showConnectionDialog, setShowConnectionDialog] = useState(false);
   const [showSettingsDialog, setShowSettingsDialog] = useState(false);
   const [showPlaylist, setShowPlaylist] = useState(true);
-  const [sideLayout, setSideLayout] = useState<"columns" | "rows">("rows");
+  const [sideLayout, setSideLayout] = useState<SidePanelLayout>("rows");
+  const isChatBottomLayout = sideLayout === "chat-bottom";
+  const sidePanelsDirection = sideLayout === "rows" ? "rows" : "columns";
   const [theme, setTheme] = useState<ThemePreference>("dark");
   const [transparencyMode, setTransparencyMode] = useState<TransparencyPreference>("off");
   const [layoutSize, setLayoutSize] = useState({ width: 0, height: 0 });
@@ -284,7 +296,7 @@ export function MainLayout() {
       setShowPlaylist(config.user.show_playlist);
     }
     if (config.user.side_panel_layout) {
-      setSideLayout(config.user.side_panel_layout);
+      setSideLayout(normalizeSidePanelLayout(config.user.side_panel_layout));
     }
     const normalizedTheme = normalizeTheme(config.user.theme);
     setTheme(normalizedTheme);
@@ -398,7 +410,7 @@ export function MainLayout() {
 
   useEffect(() => {
     if (!showPlaylist) return;
-    const total = sideLayout === "rows" ? sidePanelsSize.height : sidePanelsSize.width;
+    const total = sidePanelsDirection === "rows" ? sidePanelsSize.height : sidePanelsSize.width;
     if (!total) return;
     setSidePanelSize((previous) => {
       const min = resolveSidePanelMin(total);
@@ -501,20 +513,21 @@ export function MainLayout() {
   const clampValue = (value: number, min: number, max: number) =>
     Math.min(Math.max(value, min), max);
   const layoutMainWidth =
-    sideWidth && layoutSize.width
+    !isChatBottomLayout && sideWidth && layoutSize.width
       ? Math.max(MAIN_MIN_WIDTH, layoutSize.width - sideWidth - GAP_SIZE)
       : null;
   const sidePanelPrimarySize = showPlaylist && sidePanelSize !== null ? sidePanelSize : null;
-  const sidePanelTotal = sideLayout === "rows" ? sidePanelsSize.height : sidePanelsSize.width;
+  const sidePanelTotal =
+    sidePanelsDirection === "rows" ? sidePanelsSize.height : sidePanelsSize.width;
   const sidePanelMin = resolveSidePanelMin(sidePanelTotal);
   const sidePanelSecondarySize =
     sidePanelPrimarySize !== null && sidePanelTotal
       ? Math.max(sidePanelMin, sidePanelTotal - sidePanelPrimarySize - GAP_SIZE)
       : null;
   const sidePanelFallback =
-    showPlaylist && sideLayout === "columns"
+    showPlaylist && sidePanelsDirection === "columns"
       ? `minmax(0, 1fr) minmax(0, 1fr)`
-      : showPlaylist && sideLayout === "rows"
+      : showPlaylist && sidePanelsDirection === "rows"
         ? `minmax(0, 1fr) minmax(0, 1fr)`
         : "minmax(0, 1fr)";
   const mainResizerStyle =
@@ -529,7 +542,7 @@ export function MainLayout() {
       : undefined;
   const sideResizerStyle =
     showPlaylist && sidePanelPrimarySize !== null
-      ? sideLayout === "rows"
+      ? sidePanelsDirection === "rows"
         ? {
             top: `${sidePanelPrimarySize + GAP_SIZE / 2}px`,
             left: 0,
@@ -581,7 +594,7 @@ export function MainLayout() {
   const handleSideResizeStart = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!sidePanelsRef.current || sidePanelPrimarySize === null) return;
     event.preventDefault();
-    const isRows = sideLayout === "rows";
+    const isRows = sidePanelsDirection === "rows";
     const startOffset = isRows ? event.clientY : event.clientX;
     const startSize = sidePanelPrimarySize;
     let latestSize = startSize;
@@ -656,6 +669,39 @@ export function MainLayout() {
     setSettingsInitialTab(undefined);
   };
 
+  const handleToggleLayout = () => {
+    setSideLayout((prev) => {
+      const currentIndex = SIDE_LAYOUTS.indexOf(normalizeSidePanelLayout(prev));
+      const next = SIDE_LAYOUTS[(currentIndex + 1) % SIDE_LAYOUTS.length];
+      queueUiLayoutPatch({ side_panel_layout: next }, 120);
+      return next;
+    });
+  };
+
+  const layoutLabel =
+    sideLayout === "rows"
+      ? "Layout stacked"
+      : sideLayout === "columns"
+        ? "Layout split"
+        : "Layout chat bottom";
+
+  const layoutIcon =
+    sideLayout === "rows" ? (
+      <LuRows2 className="app-icon" />
+    ) : sideLayout === "columns" ? (
+      <LuColumns2 className="app-icon" />
+    ) : (
+      <LuPanelBottom className="app-icon" />
+    );
+
+  const chatPanel = (
+    <section className="app-main-column">
+      <main className="app-main-panel">
+        <ChatPanel />
+      </main>
+    </section>
+  );
+
   return (
     <div className="app-shell">
       <NotificationContainer />
@@ -664,24 +710,25 @@ export function MainLayout() {
       <div
         className="app-layout"
         ref={layoutRef}
+        data-layout={sideLayout}
         style={{
           gridTemplateColumns:
-            layoutMainWidth && sideWidth ? `${layoutMainWidth}px ${sideWidth}px` : undefined,
+            !isChatBottomLayout && layoutMainWidth && sideWidth
+              ? `${layoutMainWidth}px ${sideWidth}px`
+              : undefined,
         }}
       >
-        <section className="app-main-column">
-          <main className="app-main-panel">
-            <ChatPanel />
-          </main>
-        </section>
+        {!isChatBottomLayout && chatPanel}
 
-        <div
-          className="app-resizer app-resizer-vertical app-resizer-overlay"
-          role="separator"
-          aria-orientation="vertical"
-          onPointerDown={handleMainResizeStart}
-          style={mainResizerStyle}
-        />
+        {!isChatBottomLayout && (
+          <div
+            className="app-resizer app-resizer-vertical app-resizer-overlay"
+            role="separator"
+            aria-orientation="vertical"
+            onPointerDown={handleMainResizeStart}
+            style={mainResizerStyle}
+          />
+        )}
 
         <section className="app-side-column">
           <header
@@ -744,38 +791,13 @@ export function MainLayout() {
                     )}
                   </button>
                   <button
-                    onClick={() =>
-                      setSideLayout((prev) => {
-                        const next = prev === "columns" ? "rows" : "columns";
-                        void (async () => {
-                          try {
-                            const config = await invoke<SyncplayConfig>("get_config");
-                            await invoke("update_config", {
-                              config: {
-                                ...config,
-                                user: { ...config.user, side_panel_layout: next },
-                              },
-                            });
-                          } catch (error) {
-                            setSideLayout(prev);
-                            addNotification({
-                              type: "error",
-                              message: "Failed to save layout",
-                            });
-                          }
-                        })();
-                        return next;
-                      })
-                    }
+                    onClick={handleToggleLayout}
                     className="btn-neutral app-icon-button"
                     data-tauri-drag-region="false"
-                    aria-label={sideLayout === "columns" ? "Layout split" : "Layout stacked"}
+                    aria-label={layoutLabel}
+                    title={layoutLabel}
                   >
-                    {sideLayout === "rows" ? (
-                      <LuRows2 className="app-icon" />
-                    ) : (
-                      <LuColumns2 className="app-icon" />
-                    )}
+                    {layoutIcon}
                   </button>
                   <button
                     onClick={handleToggleTheme}
@@ -858,13 +880,13 @@ export function MainLayout() {
             data-layout={sideLayout}
             style={{
               gridTemplateColumns:
-                sideLayout === "columns"
+                sidePanelsDirection === "columns"
                   ? showPlaylist && sidePanelPrimarySize !== null && sidePanelSecondarySize !== null
                     ? `${sidePanelPrimarySize}px ${sidePanelSecondarySize}px`
                     : sidePanelFallback
                   : "minmax(0, 1fr)",
               gridTemplateRows:
-                sideLayout === "rows"
+                sidePanelsDirection === "rows"
                   ? showPlaylist && sidePanelPrimarySize !== null && sidePanelSecondarySize !== null
                     ? `${sidePanelPrimarySize}px ${sidePanelSecondarySize}px`
                     : sidePanelFallback
@@ -878,10 +900,10 @@ export function MainLayout() {
             {showPlaylist && (
               <div
                 className={`app-resizer app-resizer-overlay ${
-                  sideLayout === "rows" ? "app-resizer-horizontal" : "app-resizer-vertical"
+                  sidePanelsDirection === "rows" ? "app-resizer-horizontal" : "app-resizer-vertical"
                 }`}
                 role="separator"
-                aria-orientation={sideLayout === "rows" ? "horizontal" : "vertical"}
+                aria-orientation={sidePanelsDirection === "rows" ? "horizontal" : "vertical"}
                 onPointerDown={handleSideResizeStart}
                 style={sideResizerStyle}
               />
@@ -893,6 +915,7 @@ export function MainLayout() {
               </aside>
             )}
           </div>
+          {isChatBottomLayout && chatPanel}
         </section>
       </div>
 

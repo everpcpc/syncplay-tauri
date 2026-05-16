@@ -152,6 +152,11 @@
   overflow: hidden;
 }
 
+.app-layout[data-layout="chat-bottom"] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
 .drag-strip {
   position: absolute;
   top: 0;
@@ -182,7 +187,7 @@
   flex-direction: column;
   gap: 0;
   background: transparent;
-  overflow: visible;
+  overflow: hidden;
 }
 
 .app-side-panels {
@@ -195,6 +200,19 @@
   z-index: 4;
   background: transparent;
   overflow: visible;
+}
+
+.app-layout[data-layout="chat-bottom"] .app-side-panels {
+  flex: 1 1 0;
+}
+
+.app-layout[data-layout="chat-bottom"] .app-main-column {
+  flex: 1 1 0;
+  border-top: 1px solid var(--app-border);
+}
+
+.app-layout[data-layout="chat-bottom"] .app-main-panel {
+  border-right: none;
 }
 
 .app-resizer {
