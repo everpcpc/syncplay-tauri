@@ -692,7 +692,7 @@ export function MainLayout() {
           >
             {(appVersion || updateVersion) && (
               <div
-                className="absolute top-2 flex items-center gap-2 app-header-actions"
+                className="absolute top-2 z-10 flex items-center gap-2 app-header-actions"
                 data-tauri-drag-region="false"
                 style={{
                   right: "calc(16px + var(--tauri-frame-controls-width, 0px))",
