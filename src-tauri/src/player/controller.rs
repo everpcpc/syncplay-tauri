@@ -1357,6 +1357,9 @@ fn seamless_music_override(state: &Arc<AppState>) -> bool {
 }
 
 fn is_readiness_supported(state: &Arc<AppState>, requires_other_users: bool) -> bool {
+    if state.client_state.get_server_version().is_none() {
+        return false;
+    }
     if !state.server_features.lock().readiness {
         return false;
     }

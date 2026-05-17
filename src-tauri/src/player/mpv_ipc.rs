@@ -345,14 +345,21 @@ impl MpvIpc {
     }
 
     /// Set playback position
+    ///
+    /// Mirrors original Syncplay's mpv integration: remote seeks are sent as
+    /// fire-and-forget property updates and local state is updated immediately.
+    /// Waiting for a JSON IPC response here is dangerous because seek commands
+    /// are deliberately coalesced while mpv is busy/loading; an older queued seek
+    /// may be dropped in favour of a newer one and would otherwise leave the
+    /// caller waiting forever during seek storms.
     pub async fn set_position(&self, position: f64) -> Result<()> {
-        let cmd = MpvCommand::set_property(
-            "time-pos",
-            serde_json::Value::Number(serde_json::Number::from_f64(position).unwrap()),
-            0,
-        );
-        self.send_command_async(cmd).await?;
-        self.store_position_state(position);
+        let Some(number) = serde_json::Number::from_f64(position.max(0.0)) else {
+            anyhow::bail!("Invalid mpv position: {}", position);
+        };
+        let cmd = MpvCommand::set_property_no_reply("time-pos", serde_json::Value::Number(number));
+        self.send_command(cmd)?;
+        self.store_position_state(position.max(0.0));
+        tokio::time::sleep(Duration::from_millis(30)).await;
         Ok(())
     }
 
@@ -468,6 +475,19 @@ fn queue_key(cmd: &MpvCommand) -> Option<QueueKey> {
     }
 }
 
+fn drop_replaced_pending_requests(pending: &mut Vec<MpvCommand>, key: QueueKey) {
+    pending.retain(|cmd| {
+        let replaced = queue_key(cmd) == Some(key);
+        if replaced {
+            // If this command was created by send_command_async, resolve its
+            // waiter by dropping the sender rather than leaking a future while
+            // a newer command supersedes it.
+            debug!("Dropping superseded mpv command: {:?}", cmd.command);
+        }
+        !replaced
+    });
+}
+
 async fn handle_command_queue(
     cmd: MpvCommand,
     pending: &mut Vec<MpvCommand>,
@@ -487,7 +507,7 @@ async fn handle_command_queue(
                 }
             }
             QueueKey::SetTimePos | QueueKey::LoadFile => {
-                pending.retain(|c| queue_key(c) != Some(key));
+                drop_replaced_pending_requests(pending, key);
             }
         }
     }
@@ -582,13 +602,18 @@ mod tests {
     }
 
     #[test]
-    fn set_time_pos_command_is_deduplicated_like_original_mpv() {
-        let cmd = MpvCommand::set_property(
-            "time-pos",
-            serde_json::Value::Number(serde_json::Number::from_f64(25.0).unwrap()),
-            0,
-        );
+    fn newer_pending_seek_replaces_older_pending_seek() {
+        let mut pending = vec![
+            MpvCommand::set_property_no_reply(
+                "time-pos",
+                serde_json::Value::Number(serde_json::Number::from_f64(10.0).unwrap()),
+            ),
+            MpvCommand::show_text("keep", Some(1000)),
+        ];
 
-        assert_eq!(queue_key(&cmd), Some(QueueKey::SetTimePos));
+        drop_replaced_pending_requests(&mut pending, QueueKey::SetTimePos);
+
+        assert_eq!(pending.len(), 1);
+        assert_ne!(queue_key(&pending[0]), Some(QueueKey::SetTimePos));
     }
 }

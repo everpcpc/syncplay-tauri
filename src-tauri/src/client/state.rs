@@ -182,6 +182,10 @@ impl ClientState {
     pub fn set_server_version(&self, version: String) {
         *self.server_version.write() = Some(version);
     }
+
+    pub fn clear_server_version(&self) {
+        *self.server_version.write() = None;
+    }
 }
 
 impl Default for ClientState {
