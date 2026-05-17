@@ -66,7 +66,6 @@ pub async fn get_config_path<R: Runtime>(app: AppHandle<R>) -> Result<String, St
         .map_err(|e| format!("Failed to get config path: {}", e))
 }
 
-
 #[tauri::command]
 pub async fn refresh_media_index(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state
