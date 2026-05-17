@@ -152,6 +152,11 @@
   overflow: hidden;
 }
 
+.app-layout[data-layout="left-chat"] {
+  grid-template-columns: minmax(0, 1fr) minmax(420px, 560px);
+  grid-template-rows: minmax(0, 1fr);
+}
+
 .app-layout[data-layout="three-rows"] {
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
@@ -202,17 +207,34 @@
   overflow: visible;
 }
 
-.app-layout[data-layout="three-rows"] .app-side-panels {
-  flex: 1 1 0;
+.app-unified-column {
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+  overflow: hidden;
 }
 
-.app-layout[data-layout="three-rows"] .app-main-column {
-  flex: 1 1 0;
-  border-top: 1px solid var(--app-border);
+.app-unified-panels {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: grid;
+  gap: 0;
+  position: relative;
+  background: transparent;
+  overflow: hidden;
 }
 
-.app-layout[data-layout="three-rows"] .app-main-panel {
+.app-unified-panels[data-layout="three-rows"] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: repeat(3, minmax(0, 1fr));
+}
+
+.app-unified-panels[data-layout="three-rows"] .app-main-panel {
   border-right: none;
+  border-bottom: 1px solid var(--app-border);
 }
 
 .app-resizer {
@@ -518,116 +540,15 @@
 }
 
 .app-icon-button[aria-label]::after,
-.app-tooltip[aria-label]::after {
-  content: attr(aria-label);
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 8px);
-  transform: translate(-50%, 6px);
-  background: var(--app-panel-2);
-  color: var(--app-text);
-  border: 1px solid var(--app-border);
-  padding: 10px 12px;
-  border-radius: 8px;
-  font-size: 11px;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-  opacity: 0;
-  pointer-events: none;
-  transition:
-    opacity 0.15s ease,
-    transform 0.15s ease;
-  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.25);
-  z-index: 30;
-}
-
 .app-icon-button[aria-label]::before,
+.app-tooltip[aria-label]::after,
 .app-tooltip[aria-label]::before {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 2px);
-  transform: translateX(-50%);
-  border: 6px solid transparent;
-  border-top-color: var(--app-panel-2);
-  opacity: 0;
-  transition: opacity 0.15s ease;
-  pointer-events: none;
-  z-index: 29;
-}
-
-.app-tooltip-right[aria-label]::after {
-  left: auto;
-  right: 0;
-  transform: translate(0, 6px);
-}
-
-.app-tooltip-right[aria-label]::before {
-  left: auto;
-  right: 12px;
-  transform: translateX(0);
-}
-
-.app-tooltip-side-right[aria-label]::after {
-  left: calc(100% + 8px);
-  bottom: 50%;
-  transform: translate(-6px, 50%);
-}
-
-.app-tooltip-side-right[aria-label]::before {
-  left: calc(100% + 2px);
-  bottom: 50%;
-  transform: translate(0, 50%);
-  border: 6px solid transparent;
-  border-right-color: var(--app-panel-2);
-}
-
-.app-tooltip-side-left[aria-label]::after {
-  left: auto;
-  right: calc(100% + 8px);
-  bottom: 50%;
-  transform: translate(6px, 50%);
-}
-
-.app-tooltip-side-left[aria-label]::before {
-  left: auto;
-  right: calc(100% + 2px);
-  bottom: 50%;
-  transform: translate(0, 50%);
-  border: 6px solid transparent;
-  border-left-color: var(--app-panel-2);
-}
-
-.app-icon-button[aria-label]:hover::after,
-.app-icon-button[aria-label]:focus-visible::after,
-.app-icon-button[aria-label]:hover::before,
-.app-icon-button[aria-label]:focus-visible::before,
-.app-tooltip[aria-label]:hover::after,
-.app-tooltip[aria-label]:focus-visible::after,
-.app-tooltip[aria-label]:hover::before,
-.app-tooltip[aria-label]:focus-visible::before {
-  opacity: 1;
-  transform: translate(-50%, 0);
-}
-
-.app-tooltip-right[aria-label]:hover::after,
-.app-tooltip-right[aria-label]:focus-visible::after {
-  transform: translate(0, 0);
-}
-
-.app-tooltip-side-right[aria-label]:hover::after,
-.app-tooltip-side-right[aria-label]:focus-visible::after {
-  transform: translate(0, 50%);
-}
-
-.app-tooltip-side-left[aria-label]:hover::after,
-.app-tooltip-side-left[aria-label]:focus-visible::after {
-  transform: translate(0, 50%);
+  display: none;
 }
 
 .app-tooltip-portal {
   position: fixed;
-  max-width: min(520px, 80vw);
+  max-width: min(520px, calc(100vw - 16px));
   padding: 10px 12px;
   background: var(--app-panel-2);
   color: var(--app-text);
@@ -636,9 +557,9 @@
   font-size: 11px;
   letter-spacing: 0.01em;
   line-height: 1.4;
-  word-break: break-all;
+  overflow-wrap: anywhere;
   box-shadow: 0 10px 20px rgba(0, 0, 0, 0.25);
-  z-index: 9999;
+  z-index: 2147483647;
   pointer-events: none;
   opacity: 0;
   transition:
