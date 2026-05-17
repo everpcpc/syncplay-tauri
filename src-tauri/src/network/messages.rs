@@ -120,6 +120,7 @@ pub struct HelloMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub room: Option<RoomInfo>,
     pub version: String,
+    #[serde(default)]
     pub realversion: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<Value>,
@@ -364,6 +365,19 @@ pub struct TLSMessage {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_deserialize_hello_without_realversion() {
+        let json = r#"{"Hello":{"username":"u","room":{"name":"r"},"version":"1.2.255"}}"#;
+        let message: ProtocolMessage = serde_json::from_str(json).unwrap();
+        match message {
+            ProtocolMessage::Hello { Hello } => {
+                assert_eq!(Hello.username, "u");
+                assert_eq!(Hello.version, "1.2.255");
+                assert_eq!(Hello.realversion, "");
+            }
+            _ => panic!("Unexpected message type"),
+        }
+    }
     #[test]
     fn test_deserialize_set_ready_null() {
         let json =

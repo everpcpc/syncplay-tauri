@@ -33,6 +33,7 @@ const DIFFERENT_DURATION_THRESHOLD: f64 = 2.5;
 const WARNING_OSD_INTERVAL_SECONDS: u64 = 1;
 const OSD_WARNING_MESSAGE_DURATION_SECONDS: u32 = 5;
 const OSD_MESSAGE_SEPARATOR: &str = "; ";
+const STATE_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(200);
 const LAST_PAUSED_DIFF_THRESHOLD_SECONDS: f64 = 2.0;
 const RECONNECT_RETRIES: u32 = 999;
 const RECONNECT_BASE_DELAY_SECONDS: f64 = 0.1;
@@ -81,6 +82,8 @@ fn update_server_features(
         }
         if let Some(value) = map.get("readiness").and_then(|v| v.as_bool()) {
             features.readiness = value;
+        } else if let Some(value) = map.get("readyState").and_then(|v| v.as_bool()) {
+            features.readiness = value;
         }
         if let Some(value) = map.get("managedRooms").and_then(|v| v.as_bool()) {
             features.managed_rooms = value;
@@ -107,16 +110,19 @@ fn update_server_features(
 
     *state.server_features.lock() = features.clone();
 
-    if !version_meets_min(server_version, SHARED_PLAYLIST_MIN_VERSION) {
-        emit_error_message(
-            state,
-            &format!(
-                "Shared playlists require server version {} or later",
-                SHARED_PLAYLIST_MIN_VERSION
-            ),
-        );
-    } else if !features.shared_playlists {
-        emit_error_message(state, "Shared playlists are disabled by the server");
+    let config = state.config.lock().clone();
+    if config.user.shared_playlist_enabled {
+        if !version_meets_min(server_version, SHARED_PLAYLIST_MIN_VERSION) {
+            emit_error_message(
+                state,
+                &format!(
+                    "Shared playlists require server version {} or later",
+                    SHARED_PLAYLIST_MIN_VERSION
+                ),
+            );
+        } else if !features.shared_playlists {
+            emit_error_message(state, "Shared playlists are disabled by the server");
+        }
     }
 }
 
@@ -183,7 +189,6 @@ async fn establish_connection(
     }
 
     if client_supports_tls && server_supports_tls {
-        emit_system_message(state, "Attempting secure connection");
         let tls_request = ProtocolMessage::TLS {
             TLS: TLSMessage {
                 start_tls: Some("send".to_string()),
@@ -258,7 +263,11 @@ async fn complete_server_login(state: &Arc<AppState>, hello: HelloMessage) {
         connection.set_authenticated();
     }
 
-    let server_version = hello.realversion.clone();
+    let server_version = if hello.realversion.is_empty() {
+        hello.version.clone()
+    } else {
+        hello.realversion.clone()
+    };
     let feature_list = hello.features.clone();
 
     state.client_state.set_username(hello.username.clone());
@@ -667,6 +676,16 @@ async fn try_set_position(
 async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, message_age: f64) {
     let had_last_global = state.last_global_update.lock().is_some();
     *state.last_global_update.lock() = Some(std::time::Instant::now());
+    if !had_last_global {
+        if let Some(connection) = state.connection.lock().clone() {
+            if let Err(e) = connection.send(ProtocolMessage::List { List: None }) {
+                tracing::warn!(
+                    "Failed to request user list after first state update: {}",
+                    e
+                );
+            }
+        }
+    }
     let adjusted_global_position = if !playstate.paused {
         playstate.position + message_age
     } else {
@@ -712,6 +731,10 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
 
     if !had_last_global && state.client_state.get_file().is_some() {
         if try_set_position(state, &player, adjusted_global_position, "init").await {
+            state
+                .local_playback_state
+                .lock()
+                .mark_remote_seek(adjusted_global_position);
             made_change_on_player = true;
         }
         if let Err(e) = player.set_paused(playstate.paused).await {
@@ -731,7 +754,13 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         } else {
             *state.last_seek_from_position.lock() = None;
             if try_set_position(state, &player, adjusted_global_position, "seek").await {
+                state
+                    .local_playback_state
+                    .lock()
+                    .mark_remote_seek(adjusted_global_position);
                 made_change_on_player = true;
+            } else {
+                return;
             }
             local_position
         };
@@ -751,6 +780,10 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         && actor_name != current_username
     {
         if try_set_position(state, &player, adjusted_global_position, "rewind").await {
+            state
+                .local_playback_state
+                .lock()
+                .mark_remote_seek(adjusted_global_position);
             made_change_on_player = true;
         }
         let message = format!("Rewinded due to time difference with {}", actor_name);
@@ -792,6 +825,7 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         if let Some(position) = fastforward_target {
             if actor_name != current_username {
                 if try_set_position(state, &player, position, "fastforward").await {
+                    state.local_playback_state.lock().mark_remote_seek(position);
                     made_change_on_player = true;
                 }
                 let message = format!("Fast-forwarded due to time difference with {}", actor_name);
@@ -841,6 +875,10 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
             if actor_name != current_username
                 && try_set_position(state, &player, adjusted_global_position, "pause-sync").await
             {
+                state
+                    .local_playback_state
+                    .lock()
+                    .mark_remote_seek(adjusted_global_position);
                 made_change_on_player = true;
             }
             if let Err(e) = player.set_paused(true).await {
@@ -967,6 +1005,19 @@ pub(crate) fn send_state_message(
         client_rtt: Some(state.ping_service.lock().get_rtt()),
         server_rtt: None,
     };
+    let now = std::time::Instant::now();
+    {
+        let mut last_sent = state.last_state_message_sent.lock();
+        if !state_change {
+            if let Some(last) = *last_sent {
+                if now.duration_since(last) < STATE_MESSAGE_MIN_INTERVAL {
+                    tracing::debug!("Suppressing non-changing State response to avoid flooding");
+                    return Ok(());
+                }
+            }
+        }
+        *last_sent = Some(now);
+    }
     let message = ProtocolMessage::State {
         State: StateMessage {
             playstate,
@@ -1446,6 +1497,10 @@ pub(crate) async fn handle_connection_closed(state: &Arc<AppState>) {
         *state.manual_disconnect.lock() = false;
         return;
     }
+
+    state.client_state.clear_server_version();
+    *state.server_features.lock() = ServerFeatures::default();
+    state.client_state.set_ready_state(None);
 
     *state.room_warning_state.lock() = crate::app_state::RoomWarningState::default();
     *state.warning_timers.lock() = WarningTimers::default();
@@ -2016,6 +2071,9 @@ fn current_user_ready_with_file(state: &Arc<AppState>) -> Option<bool> {
 }
 
 fn is_readiness_supported(state: &Arc<AppState>, requires_other_users: bool) -> bool {
+    if !server_features_ready(state) {
+        return false;
+    }
     let features = state.server_features.lock();
     if !features.readiness {
         return false;
@@ -2131,6 +2189,10 @@ fn users_in_room_count(state: &Arc<AppState>) -> usize {
         }
     }
     count
+}
+
+fn server_features_ready(state: &Arc<AppState>) -> bool {
+    state.client_state.get_server_version().is_some()
 }
 
 fn shared_playlists_enabled(state: &Arc<AppState>, config: &crate::config::SyncplayConfig) -> bool {
@@ -2628,6 +2690,7 @@ pub async fn disconnect_from_server(state: State<'_, Arc<AppState>>) -> Result<(
     state.playlist.clear();
     state.client_state.set_file(None);
     state.client_state.set_ready_state(None);
+    state.client_state.clear_server_version();
     *state.server_features.lock() = ServerFeatures::default();
     *state.playlist_may_need_restoring.lock() = false;
     *state.had_first_playlist_index.lock() = false;

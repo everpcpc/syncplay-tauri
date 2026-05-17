@@ -72,7 +72,18 @@ impl MpvCommand {
         }
     }
 
-    /// Create an observe_property command
+    /// Create a set_property command without a request id.
+    pub fn set_property_no_reply(property: &str, value: Value) -> Self {
+        Self {
+            command: vec![
+                Value::String("set_property".to_string()),
+                Value::String(property.to_string()),
+                value,
+            ],
+            request_id: None,
+        }
+    }
+
     pub fn observe_property(id: u64, property: &str) -> Self {
         Self {
             command: vec![

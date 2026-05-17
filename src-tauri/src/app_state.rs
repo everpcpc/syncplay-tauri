@@ -50,6 +50,8 @@ pub struct AppState {
     pub last_latency_calculation: Arc<Mutex<Option<f64>>>,
     /// Last time a global playstate was received
     pub last_global_update: Arc<Mutex<Option<Instant>>>,
+    /// Last outbound State message, used to avoid flooding servers during seek storms
+    pub last_state_message_sent: Arc<Mutex<Option<Instant>>>,
     /// Last time we established a connection
     pub last_connect_time: Arc<Mutex<Option<Instant>>>,
     /// Latest local playback state
@@ -164,6 +166,7 @@ impl AppState {
             ping_service: Arc::new(Mutex::new(PingService::default())),
             last_latency_calculation: Arc::new(Mutex::new(None)),
             last_global_update: Arc::new(Mutex::new(None)),
+            last_state_message_sent: Arc::new(Mutex::new(None)),
             last_connect_time: Arc::new(Mutex::new(None)),
             local_playback_state: Arc::new(Mutex::new(LocalPlaybackState::new())),
             ignoring_on_the_fly: Arc::new(Mutex::new(IgnoringOnTheFlyState::default())),
@@ -244,6 +247,7 @@ impl Default for AppState {
             ping_service: Arc::new(Mutex::new(PingService::default())),
             last_latency_calculation: Arc::new(Mutex::new(None)),
             last_global_update: Arc::new(Mutex::new(None)),
+            last_state_message_sent: Arc::new(Mutex::new(None)),
             last_connect_time: Arc::new(Mutex::new(None)),
             local_playback_state: Arc::new(Mutex::new(LocalPlaybackState::new())),
             ignoring_on_the_fly: Arc::new(Mutex::new(IgnoringOnTheFlyState::default())),
