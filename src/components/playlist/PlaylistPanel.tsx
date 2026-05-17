@@ -68,12 +68,6 @@ export function PlaylistPanel() {
     x: number;
     y: number;
   } | null>(null);
-  const [tooltipState, setTooltipState] = useState<{
-    text: string;
-    rect: DOMRect;
-  } | null>(null);
-  const [tooltipVisible, setTooltipVisible] = useState(false);
-  const tooltipHideTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     availabilityRef.current = availability;
@@ -145,66 +139,6 @@ export function PlaylistPanel() {
       cancelledRef.cancelled = true;
     };
   }, [mediaIndexVersion, playlist.items, refreshAvailability]);
-
-  const showItemTooltip = (event: React.MouseEvent<HTMLElement>, text: string) => {
-    if (!text) return;
-    if (tooltipHideTimeoutRef.current !== null) {
-      window.clearTimeout(tooltipHideTimeoutRef.current);
-      tooltipHideTimeoutRef.current = null;
-    }
-    const rect = event.currentTarget.getBoundingClientRect();
-    setTooltipState({ text, rect });
-    requestAnimationFrame(() => {
-      setTooltipVisible(true);
-    });
-  };
-
-  const showItemTooltipOnFocus = (event: React.FocusEvent<HTMLElement>, text: string) => {
-    if (!text) return;
-    if (tooltipHideTimeoutRef.current !== null) {
-      window.clearTimeout(tooltipHideTimeoutRef.current);
-      tooltipHideTimeoutRef.current = null;
-    }
-    const rect = event.currentTarget.getBoundingClientRect();
-    setTooltipState({ text, rect });
-    requestAnimationFrame(() => {
-      setTooltipVisible(true);
-    });
-  };
-
-  const hideItemTooltip = () => {
-    setTooltipVisible(false);
-    if (tooltipHideTimeoutRef.current !== null) {
-      window.clearTimeout(tooltipHideTimeoutRef.current);
-    }
-    tooltipHideTimeoutRef.current = window.setTimeout(() => {
-      setTooltipState(null);
-      tooltipHideTimeoutRef.current = null;
-    }, 160);
-  };
-
-  const renderTooltip = () => {
-    if (!tooltipState || typeof document === "undefined") return null;
-    const margin = 8;
-    const { rect } = tooltipState;
-    const shouldShowAbove = rect.top > 80;
-    const top = shouldShowAbove ? rect.top - margin : rect.bottom + margin;
-    const transform = shouldShowAbove ? "translate(-50%, -100%)" : "translate(-50%, 0)";
-    return createPortal(
-      <div
-        className={`app-tooltip-portal ${tooltipVisible ? "is-visible" : ""}`}
-        style={{
-          top,
-          left: rect.left + rect.width / 2,
-          transform,
-        }}
-        role="tooltip"
-      >
-        {tooltipState.text}
-      </div>,
-      document.body
-    );
-  };
 
   const renderDragGhost = () => {
     if (!dragGhost || typeof document === "undefined") return null;
@@ -662,7 +596,6 @@ export function PlaylistPanel() {
 
   return (
     <div className="flex flex-col h-full min-h-0 min-w-0">
-      {renderTooltip()}
       {renderDragGhost()}
 
       {/* Header */}
@@ -802,10 +735,7 @@ export function PlaylistPanel() {
                       window.addEventListener("pointerup", handlePointerUp);
                     }}
                   >
-                    <div
-                      className="relative flex items-center gap-2"
-                      aria-label={tooltipText || "Unresolved path"}
-                    >
+                    <div className="relative flex items-center gap-2">
                       <button
                         onClick={(event) => {
                           event.stopPropagation();
@@ -829,11 +759,7 @@ export function PlaylistPanel() {
                               : ""
                             : "app-text-muted"
                         }`}
-                        onMouseEnter={(event) => showItemTooltip(event, tooltipText)}
-                        onMouseLeave={hideItemTooltip}
-                        onFocus={(event) => showItemTooltipOnFocus(event, tooltipText)}
-                        onBlur={hideItemTooltip}
-                        tabIndex={0}
+                        aria-label={tooltipText || "Unresolved path"}
                       >
                         {item}
                       </span>

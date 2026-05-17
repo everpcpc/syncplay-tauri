@@ -151,6 +151,10 @@ pub struct UserPreferences {
     #[serde(default)]
     pub side_panel_primary_size: Option<u32>,
     #[serde(default)]
+    pub unified_panel_primary_size: Option<u32>,
+    #[serde(default)]
+    pub unified_panel_secondary_size: Option<u32>,
+    #[serde(default)]
     pub window_width: Option<u32>,
     #[serde(default)]
     pub window_height: Option<u32>,
@@ -270,6 +274,8 @@ impl Default for UserPreferences {
             side_panel_layout: default_side_panel_layout(),
             side_column_width: None,
             side_panel_primary_size: None,
+            unified_panel_primary_size: None,
+            unified_panel_secondary_size: None,
             window_width: None,
             window_height: None,
             auto_connect: false,

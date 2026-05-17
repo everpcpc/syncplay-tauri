@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { AppTooltipPortal } from "./components/common/AppTooltipPortal";
 import { MainLayout } from "./components/layout/MainLayout";
 import { useSyncplayStore } from "./store";
 
@@ -20,7 +21,12 @@ function App() {
     };
   }, []);
 
-  return <MainLayout />;
+  return (
+    <>
+      <MainLayout />
+      <AppTooltipPortal />
+    </>
+  );
 }
 
 export default App;
