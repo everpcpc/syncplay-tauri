@@ -21,6 +21,7 @@ use crate::commands::chat::send_chat_message_from_player;
 use crate::commands::connection::emit_error_message;
 use crate::player::controller::handle_end_of_file;
 use crate::player::controller::is_placeholder_file;
+use crate::player::controller::send_file_update;
 use crate::player::controller::stop_player;
 
 pub struct MpvBackend {
@@ -84,12 +85,20 @@ impl MpvBackend {
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
-                    MpvPlayerEvent::EndFile {
-                        reason: EndFileReason::Eof,
-                    } => {
-                        if let Some(state) = state.upgrade() {
-                            handle_end_of_file(&state).await;
+                    MpvPlayerEvent::EndFile { reason } => {
+                        if matches!(reason, EndFileReason::Eof) {
+                            if let Some(app_state) = state.upgrade() {
+                                handle_end_of_file(&app_state).await;
+                            }
                         }
+                        if matches!(reason, EndFileReason::Quit) {
+                            stop_player_from_weak(&state).await;
+                            break;
+                        }
+                    }
+                    MpvPlayerEvent::Quit | MpvPlayerEvent::SocketDisconnected => {
+                        stop_player_from_weak(&state).await;
+                        break;
                     }
                     MpvPlayerEvent::LogMessage(line) => {
                         handle_syncplayintf_line(
@@ -131,6 +140,7 @@ impl MpvBackend {
                 )
                 .await;
             }
+            stop_player_from_weak(&state).await;
         });
     }
 
@@ -236,8 +246,10 @@ impl PlayerBackend for MpvBackend {
         let cmd =
             MpvCommand::script_message_to("syncplayintf", "get_paused_and_position", Vec::new());
         let _ = timeout(MPV_SCRIPT_MESSAGE_TIMEOUT, self.ipc.send_command_async(cmd)).await;
-        if let Err(err) = self.ipc.refresh_state().await {
-            warn!("Failed to refresh mpv properties: {}", err);
+        match timeout(Duration::from_millis(1200), self.ipc.refresh_state()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!("Failed to refresh mpv properties: {}", err),
+            Err(err) => warn!("Timed out refreshing mpv properties: {}", err),
         }
         self.sync_file_loaded_state();
         Ok(())
@@ -321,7 +333,17 @@ impl PlayerBackend for MpvBackend {
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
-        self.ipc.quit()
+        self.ipc.quit()?;
+        Ok(())
+    }
+}
+
+async fn stop_player_from_weak(state: &Weak<AppState>) {
+    if let Some(app_state) = state.upgrade() {
+        let app_state_clone = app_state.clone();
+        tokio::spawn(async move {
+            let _ = stop_player(&app_state_clone).await;
+        });
     }
 }
 
@@ -433,6 +455,36 @@ async fn handle_syncplayintf_line(
                 let global = app_state.client_state.get_global_state();
                 let _ = ipc.set_position(global.position).await;
                 let _ = ipc.set_paused(global.paused).await;
+                for delay in [50_u64, 150, 300] {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let before_refresh = ipc.get_state();
+                    let before_duration = before_refresh.duration;
+                    let refresh_result =
+                        timeout(Duration::from_millis(1200), ipc.refresh_state()).await;
+                    let mut stable = ipc.get_state();
+                    match refresh_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            warn!("Failed to refresh mpv properties: {}", err);
+                            stable = before_refresh;
+                        }
+                        Err(err) => {
+                            warn!("Timed out refreshing mpv properties: {}", err);
+                            stable = before_refresh;
+                        }
+                    }
+                    if stable.duration == Some(0.0) {
+                        stable.duration = before_duration;
+                        if let Some(duration) = stable.duration {
+                            ipc.update_from_term_playing_message("duration", &duration.to_string());
+                        }
+                    }
+                    if stable.filename.is_some() || stable.path.is_some() {
+                        app_state.client_state.set_file_duration(stable.duration);
+                        send_file_update(&app_state, &stable);
+                        break;
+                    }
+                }
             });
         }
         return;
@@ -676,6 +728,120 @@ fn sanitize_mpv_text(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::app_state::AppState;
+    use crate::config::PrivacyMode;
+    use crate::network::connection::Connection;
+    use crate::network::fake_server::FakeSyncplayServer;
+    use crate::network::messages::{FileSizeInfo, ProtocolMessage};
+    use tokio::time::timeout;
+
+    async fn assert_mpv_lifecycle_event_clears_player_state(event: MpvPlayerEvent) {
+        let app_state = AppState::new();
+        *app_state.player_connecting.lock() = true;
+        *app_state.mpv_socket_path.lock() = Some("stale-socket".to_string());
+
+        let backend = Arc::new(MpvBackend::new(
+            PlayerKind::Mpv,
+            MpvIpc::new("unused"),
+            Arc::downgrade(&app_state),
+            true,
+            None,
+        ));
+        *app_state.player.lock() = Some(backend.clone());
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        backend.spawn_event_loop(rx);
+        tx.send(event).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(app_state.player.lock().is_none());
+        assert!(app_state.player_process.lock().is_none());
+        assert!(!*app_state.player_connecting.lock());
+        assert!(app_state.mpv_socket_path.lock().is_none());
+    }
+
+    async fn connect_fake_server(app_state: &Arc<AppState>) -> FakeSyncplayServer {
+        let server = FakeSyncplayServer::start().await.unwrap();
+        let connection = Arc::new(Connection::new());
+        let (_rx, _peer) = connection
+            .connect(server.host(), server.port())
+            .await
+            .unwrap();
+        *app_state.connection.lock() = Some(connection);
+        server
+    }
+    async fn drive_delayed_file_update(
+        app_state: &Arc<AppState>,
+        ipc: &Arc<MpvIpc>,
+        file_loaded: &Arc<AtomicBool>,
+        last_loaded: &Arc<Mutex<Option<Instant>>>,
+        reset_ignore_until: &Arc<Mutex<Option<Instant>>>,
+        path: &str,
+    ) {
+        let weak_state = Arc::downgrade(app_state);
+
+        handle_syncplayintf_line(
+            ipc,
+            &weak_state,
+            file_loaded,
+            last_loaded,
+            reset_ignore_until,
+            true,
+            "<SyncplayUpdateFile>",
+        )
+        .await;
+        assert!(!file_loaded.load(Ordering::SeqCst));
+
+        handle_syncplayintf_line(
+            ipc,
+            &weak_state,
+            file_loaded,
+            last_loaded,
+            reset_ignore_until,
+            true,
+            "ANS_filename=delayed-file.mkv",
+        )
+        .await;
+        handle_syncplayintf_line(
+            ipc,
+            &weak_state,
+            file_loaded,
+            last_loaded,
+            reset_ignore_until,
+            true,
+            "ANS_duration=123.5",
+        )
+        .await;
+        handle_syncplayintf_line(
+            ipc,
+            &weak_state,
+            file_loaded,
+            last_loaded,
+            reset_ignore_until,
+            true,
+            &format!("ANS_path={path}"),
+        )
+        .await;
+        handle_syncplayintf_line(
+            ipc,
+            &weak_state,
+            file_loaded,
+            last_loaded,
+            reset_ignore_until,
+            true,
+            "<paused=true, pos=0>",
+        )
+        .await;
+        handle_syncplayintf_line(
+            ipc,
+            &weak_state,
+            file_loaded,
+            last_loaded,
+            reset_ignore_until,
+            true,
+            "</SyncplayUpdateFile>",
+        )
+        .await;
+    }
 
     #[test]
     fn get_state_reports_zero_position_while_recently_reset() {
@@ -704,26 +870,112 @@ mod tests {
     }
 
     #[test]
-    fn get_state_uses_global_state_until_file_is_loaded() {
-        let app_state = AppState::new();
-        app_state
-            .client_state
-            .set_global_state(42.0, false, Some("peer".to_string()));
+    fn syncplay_update_file_refreshes_metadata_after_delayed_term_messages() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let app_state = AppState::new();
+            let ipc = Arc::new(MpvIpc::new("unused"));
+            let file_loaded = Arc::new(AtomicBool::new(false));
+            let last_loaded = Arc::new(Mutex::new(None));
+            let reset_ignore_until = Arc::new(Mutex::new(None));
+            drive_delayed_file_update(
+                &app_state,
+                &ipc,
+                &file_loaded,
+                &last_loaded,
+                &reset_ignore_until,
+                "/tmp/delayed-file.mkv",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(80)).await;
 
-        let backend = MpvBackend::new(
-            PlayerKind::Mpv,
-            MpvIpc::new("unused"),
-            Arc::downgrade(&app_state),
-            true,
-            None,
-        );
-        backend
-            .ipc
-            .update_pause_and_position(Some(true), Some(12.0));
+            let state = ipc.get_state();
+            assert!(file_loaded.load(Ordering::SeqCst));
+            assert_eq!(state.filename.as_deref(), Some("delayed-file.mkv"));
+            assert_eq!(state.duration, Some(123.5));
+            assert_eq!(state.path.as_deref(), Some("/tmp/delayed-file.mkv"));
+            assert_eq!(state.paused, Some(true));
+        });
+    }
 
-        let state = backend.get_state();
+    #[test]
+    fn delayed_file_update_sends_stable_fileinfo_with_privacy_and_paused_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let app_state = AppState::new();
+            app_state.config.lock().user.filename_privacy_mode = PrivacyMode::DoNotSend;
+            app_state.config.lock().user.filesize_privacy_mode = PrivacyMode::DoNotSend;
+            let mut server = connect_fake_server(&app_state).await;
+            let ipc = Arc::new(MpvIpc::new("unused"));
+            let file_loaded = Arc::new(AtomicBool::new(false));
+            let last_loaded = Arc::new(Mutex::new(None));
+            let reset_ignore_until = Arc::new(Mutex::new(None));
 
-        assert_eq!(state.position, Some(42.0));
-        assert_eq!(state.paused, Some(false));
+            drive_delayed_file_update(
+                &app_state,
+                &ipc,
+                &file_loaded,
+                &last_loaded,
+                &reset_ignore_until,
+                "file:///tmp/delayed-file.mkv",
+            )
+            .await;
+
+            let outbound = timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(ProtocolMessage::Set { Set }) = server.next_received().await {
+                        if let Some(file) = Set.file {
+                            break file;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for file update");
+
+            let state = ipc.get_state();
+            assert!(file_loaded.load(Ordering::SeqCst));
+            assert_eq!(state.filename.as_deref(), Some("delayed-file.mkv"));
+            assert_eq!(state.duration, Some(123.5));
+            assert_eq!(state.path.as_deref(), Some("file:///tmp/delayed-file.mkv"));
+            assert_eq!(state.paused, Some(true));
+            assert_eq!(
+                app_state.client_state.get_file().as_deref(),
+                Some("delayed-file.mkv")
+            );
+            assert_eq!(app_state.client_state.get_file_duration(), Some(123.5));
+            assert_eq!(outbound.name.as_deref(), Some("**Hidden filename**"));
+            assert!(matches!(outbound.size, Some(FileSizeInfo::Number(0))));
+            assert_eq!(outbound.duration, Some(123.5));
+            assert!(app_state.client_state.get_global_state().paused);
+        });
+    }
+
+    #[test]
+    fn mpv_socket_disconnect_clears_player_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            assert_mpv_lifecycle_event_clears_player_state(MpvPlayerEvent::SocketDisconnected)
+                .await;
+        });
+    }
+
+    #[test]
+    fn mpv_quit_event_clears_player_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            assert_mpv_lifecycle_event_clears_player_state(MpvPlayerEvent::Quit).await;
+        });
+    }
+
+    #[test]
+    fn mpv_end_file_quit_clears_player_state() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            assert_mpv_lifecycle_event_clears_player_state(MpvPlayerEvent::EndFile {
+                reason: EndFileReason::Quit,
+            })
+            .await;
+        });
     }
 }

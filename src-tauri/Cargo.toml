@@ -1,6 +1,6 @@
 [package]
 name = "syncplay-tauri"
-version = "0.7.1"
+version = "0.8.0"
 description = "A Tauri-based Syncplay client"
 authors = ["everpcpc"]
 license = "Apache-2.0"
@@ -57,6 +57,7 @@ windows = { version = "0.62.2", features = [
 
 [dev-dependencies]
 tauri = { version = "2.10.1", features = ["test"] }
+rcgen = "0.12"
 
 [features]
 default = ["custom-protocol"]

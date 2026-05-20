@@ -26,11 +26,10 @@ use tauri::Manager;
 #[cfg(unix)]
 use tempfile::Builder;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::info;
 use url::Url;
 
-const PROTOCOL_TIMEOUT_SECONDS: f64 = 12.5;
 const RECENT_REWIND_THRESHOLD_SECONDS: f64 = 5.0;
 const RECENT_ADVANCE_GRACE_SECONDS: f64 = 8.0;
 const LAST_PAUSED_DIFF_THRESHOLD_SECONDS: f64 = 2.0;
@@ -41,6 +40,8 @@ const DOUBLE_CHECK_REWIND_POSITION_THRESHOLD: f64 = 5.0;
 const DOUBLE_CHECK_REWIND_DELAYS: [f64; 3] = [0.5, 1.0, 1.5];
 const RECENT_REWIND_FILE_UPDATE_SHIFT_SECONDS: f64 = 4.5;
 const FILE_UPDATE_AFTER_LOAD_DELAY_MS: u64 = 200;
+const PLAYER_SHUTDOWN_TIMEOUT_MS: u64 = 750;
+const PLAYER_PROCESS_KILL_TIMEOUT_MS: u64 = 750;
 
 struct PlayerConnectingGuard<'a> {
     flag: &'a parking_lot::Mutex<bool>,
@@ -60,16 +61,38 @@ impl<'a> Drop for PlayerConnectingGuard<'a> {
 
 pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String> {
     if state.is_player_connected() {
+        tracing::debug!("player_lifecycle: ensure connected skipped; backend already connected");
         return Ok(());
     }
     {
         let mut guard = state.player_connecting.lock();
         if *guard {
+            tracing::debug!(
+                "player_lifecycle: ensure connected skipped; connection already in progress"
+            );
             return Ok(());
         }
         *guard = true;
     }
     let _connecting_guard = PlayerConnectingGuard::new(&state.player_connecting);
+    tracing::info!("player_lifecycle: connecting player backend");
+
+    #[cfg(test)]
+    let fake_player_factory = state.fake_player_factory.lock().clone();
+    #[cfg(test)]
+    if let Some(factory) = fake_player_factory {
+        let fake = Arc::new(factory.launch(PlayerKind::Mpv));
+        prepare_player_after_connect(&(fake.clone() as Arc<dyn PlayerBackend>)).await;
+        *state.player.lock() = Some(fake);
+        *state.last_player_spawn.lock() = Some(Instant::now());
+        *state.last_player_kind.lock() = Some(PlayerKind::Mpv);
+        tracing::info!(
+            launch_count = factory.launch_count(),
+            kind = ?PlayerKind::Mpv,
+            "player_lifecycle: fake player launched"
+        );
+        return Ok(());
+    }
 
     let config = state.config.lock().clone();
     let player_path = resolve_player_path(&config);
@@ -263,24 +286,52 @@ pub async fn restart_player(state: &Arc<AppState>) -> Result<(), String> {
 }
 
 pub async fn stop_player(state: &Arc<AppState>) -> Result<(), String> {
-    let player = state.player.lock().clone();
-    *state.player.lock() = None;
+    let player = state.player.lock().take();
+    let child = state.player_process.lock().take();
+    let player_kind = player.as_ref().map(|player| player.kind());
+    let had_child = child.is_some();
+    tracing::info!(
+        kind = ?player_kind,
+        had_process = had_child,
+        "player_lifecycle: stopping player"
+    );
+
     *state.last_player_spawn.lock() = None;
     *state.last_player_kind.lock() = None;
+    *state.player_connecting.lock() = false;
+    *state.mpv_socket_path.lock() = None;
+    *state.mpv_runtime_dir.lock() = None;
+    *state.suppress_next_file_update.lock() = false;
+
     if let Some(player) = player {
-        if let Err(e) = player.shutdown().await {
-            tracing::warn!("Failed to shutdown player: {}", e);
+        match timeout(
+            Duration::from_millis(PLAYER_SHUTDOWN_TIMEOUT_MS),
+            player.shutdown(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                tracing::info!(kind = ?player_kind, "player_lifecycle: backend shutdown completed");
+            }
+            Ok(Err(e)) => tracing::warn!("Failed to shutdown player: {}", e),
+            Err(_) => tracing::warn!("Timed out while shutting down player backend"),
         }
     }
-    let child = {
-        let mut guard = state.player_process.lock();
-        guard.take()
-    };
     if let Some(mut child) = child {
         if let Err(e) = child.kill().await {
             tracing::warn!("Failed to stop player process: {}", e);
         }
-        let _ = child.wait().await;
+        match timeout(
+            Duration::from_millis(PLAYER_PROCESS_KILL_TIMEOUT_MS),
+            child.wait(),
+        )
+        .await
+        {
+            Ok(_) => {
+                tracing::info!(kind = ?player_kind, "player_lifecycle: player process exited after kill");
+            }
+            Err(_) => tracing::warn!("Timed out while waiting for player process to exit"),
+        }
     }
     Ok(())
 }
@@ -294,13 +345,26 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
             interval.tick().await;
             let player = state.player.lock().clone();
             let Some(player) = player else { continue };
+            if !player.is_connected() {
+                tracing::warn!("Player backend disconnected; clearing stale player state");
+                clear_disconnected_player(&state, &player);
+                last_observed = None;
+                eof_sent = false;
+                continue;
+            }
             if let Err(e) = player.poll_state().await {
                 tracing::warn!("Failed to poll player state: {}", e);
+                if !player.is_connected() {
+                    clear_disconnected_player(&state, &player);
+                    last_observed = None;
+                    eof_sent = false;
+                    continue;
+                }
             }
             let player_state = player.get_state();
             emit_player_state(&state, &player_state);
 
-            if state.is_connected() && check_protocol_timeout(&state) {
+            if state.is_connected() && crate::commands::connection::check_protocol_timeout(&state) {
                 continue;
             }
 
@@ -421,6 +485,33 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
     });
 }
 
+fn clear_disconnected_player(state: &Arc<AppState>, disconnected: &Arc<dyn PlayerBackend>) {
+    {
+        let mut guard = state.player.lock();
+        if guard
+            .as_ref()
+            .map(|current| Arc::ptr_eq(current, disconnected))
+            .unwrap_or(false)
+        {
+            *guard = None;
+        }
+    }
+    *state.player_process.lock() = None;
+    *state.last_player_spawn.lock() = None;
+    *state.last_player_kind.lock() = None;
+    *state.player_connecting.lock() = false;
+    *state.suppress_next_file_update.lock() = false;
+    state.emit_event(
+        "player-state-changed",
+        PlayerStateEvent {
+            filename: None,
+            position: None,
+            duration: None,
+            paused: None,
+            speed: None,
+        },
+    );
+}
 pub async fn load_media_by_name(
     state: &Arc<AppState>,
     filename: &str,
@@ -1399,26 +1490,6 @@ fn recently_advanced(state: &Arc<AppState>) -> bool {
     last_advance.elapsed().as_secs_f64() < RECENT_ADVANCE_GRACE_SECONDS
 }
 
-fn check_protocol_timeout(state: &Arc<AppState>) -> bool {
-    let guard = state.last_global_update.lock();
-    let Some(last_global) = guard.as_ref() else {
-        return false;
-    };
-    if last_global.elapsed().as_secs_f64() <= PROTOCOL_TIMEOUT_SECONDS {
-        return false;
-    }
-    *state.last_global_update.lock() = None;
-    crate::commands::connection::emit_error_message(state, "Server timed out");
-    if let Some(connection) = state.connection.lock().clone() {
-        connection.disconnect();
-    }
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        crate::commands::connection::handle_connection_closed(&state_clone).await;
-    });
-    true
-}
-
 async fn apply_ready_toggle(
     state: &Arc<AppState>,
     player: &Arc<dyn PlayerBackend>,
@@ -1581,10 +1652,13 @@ fn send_ready_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_mpv_version, parse_mpv_version_flags, resolve_media_path, should_pause_on_prepare,
+        check_mpv_version, clear_disconnected_player, parse_mpv_version_flags, resolve_media_path,
+        should_pause_on_prepare, stop_player,
     };
-    use crate::player::backend::PlayerKind;
+    use crate::app_state::AppState;
+    use crate::player::backend::{FakePlayerBackend, FakePlayerCommand, PlayerBackend, PlayerKind};
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -1645,5 +1719,90 @@ mod tests {
                 .unwrap()
                 .osc_visibility_change_compatible
         );
+    }
+
+    #[tokio::test]
+    async fn stop_player_shuts_down_non_mpv_fake_backends_without_real_players() {
+        for kind in [PlayerKind::Vlc, PlayerKind::Mplayer, PlayerKind::MpcHc] {
+            let state = AppState::new();
+            let fake = Arc::new(FakePlayerBackend::new(kind));
+            let player: Arc<dyn PlayerBackend> = fake.clone();
+            *state.player.lock() = Some(player);
+
+            stop_player(&state).await.unwrap();
+            stop_player(&state).await.unwrap();
+
+            assert!(state.player.lock().is_none());
+            assert_eq!(
+                fake.shutdown_count(),
+                1,
+                "{kind:?} shutdown must be idempotent"
+            );
+            assert_eq!(fake.commands(), vec![FakePlayerCommand::Shutdown]);
+        }
+    }
+
+    #[test]
+    fn app_state_player_connected_uses_backend_freshness() {
+        let state = AppState::new();
+        let fake = Arc::new(FakePlayerBackend::new(PlayerKind::Mplayer));
+        let player: Arc<dyn PlayerBackend> = fake.clone();
+        *state.player.lock() = Some(player);
+
+        assert!(state.is_player_connected());
+
+        fake.set_connected(false);
+
+        assert!(!state.is_player_connected());
+    }
+
+    #[test]
+    fn disconnected_non_mpv_backend_clears_stale_app_state() {
+        let state = AppState::new();
+        let fake = Arc::new(FakePlayerBackend::new(PlayerKind::Vlc));
+        let player: Arc<dyn PlayerBackend> = fake.clone();
+        *state.player.lock() = Some(player.clone());
+        *state.last_player_spawn.lock() = Some(std::time::Instant::now());
+        *state.last_player_kind.lock() = Some(PlayerKind::Vlc);
+        *state.player_connecting.lock() = true;
+        *state.suppress_next_file_update.lock() = true;
+
+        clear_disconnected_player(&state, &player);
+
+        assert!(state.player.lock().is_none());
+        assert!(state.player_process.lock().is_none());
+        assert!(state.last_player_spawn.lock().is_none());
+        assert!(state.last_player_kind.lock().is_none());
+        assert!(!*state.player_connecting.lock());
+        assert!(!*state.suppress_next_file_update.lock());
+    }
+    #[tokio::test]
+    async fn stop_player_shuts_down_fake_backend_and_is_idempotent() {
+        let state = AppState::new();
+        let fake = Arc::new(FakePlayerBackend::new(PlayerKind::Mpv));
+        let player: Arc<dyn PlayerBackend> = fake.clone();
+        *state.player.lock() = Some(player);
+        *state.last_player_spawn.lock() = Some(std::time::Instant::now());
+        *state.last_player_kind.lock() = Some(PlayerKind::Mpv);
+        *state.player_connecting.lock() = true;
+        *state.mpv_socket_path.lock() = Some("stale-socket".to_string());
+        *state.mpv_runtime_dir.lock() = Some(TempDir::new().unwrap());
+        *state.suppress_next_file_update.lock() = true;
+
+        stop_player(&state).await.unwrap();
+
+        assert!(state.player.lock().is_none());
+        assert!(state.player_process.lock().is_none());
+        assert!(state.last_player_spawn.lock().is_none());
+        assert!(state.last_player_kind.lock().is_none());
+        assert!(!*state.player_connecting.lock());
+        assert!(state.mpv_socket_path.lock().is_none());
+        assert!(state.mpv_runtime_dir.lock().is_none());
+        assert!(!*state.suppress_next_file_update.lock());
+        assert_eq!(fake.shutdown_count(), 1);
+        assert_eq!(fake.commands(), vec![FakePlayerCommand::Shutdown]);
+
+        stop_player(&state).await.unwrap();
+        assert_eq!(fake.shutdown_count(), 1);
     }
 }

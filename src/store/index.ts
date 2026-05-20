@@ -9,7 +9,15 @@ interface ConnectionState {
   server: string | null;
 }
 
-type TlsStatus = "unknown" | "pending" | "enabled" | "unsupported";
+type TlsStatus =
+  | "unknown"
+  | "pending"
+  | "accepted"
+  | "enabled"
+  | "unsupported"
+  | "rejected"
+  | "certificate-invalid"
+  | "closed";
 
 interface User {
   username: string;

@@ -34,6 +34,9 @@ const WARNING_OSD_INTERVAL_SECONDS: u64 = 1;
 const OSD_WARNING_MESSAGE_DURATION_SECONDS: u32 = 5;
 const OSD_MESSAGE_SEPARATOR: &str = "; ";
 const STATE_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(200);
+const TLS_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(8);
+const PROTOCOL_TIMEOUT_SECONDS: f64 = 12.5;
+const PROTOCOL_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const LAST_PAUSED_DIFF_THRESHOLD_SECONDS: f64 = 2.0;
 const RECONNECT_RETRIES: u32 = 999;
 const RECONNECT_BASE_DELAY_SECONDS: f64 = 0.1;
@@ -126,16 +129,19 @@ fn update_server_features(
     }
 }
 
-struct EstablishedConnection {
-    connection: Arc<Connection>,
-    receiver: mpsc::UnboundedReceiver<ProtocolMessage>,
-}
-
 async fn establish_connection(
     state: &Arc<AppState>,
     snapshot: &ConnectionSnapshot,
     emit_reachout: bool,
-) -> Result<EstablishedConnection, String> {
+) -> Result<(Arc<Connection>, mpsc::UnboundedReceiver<ProtocolMessage>), String> {
+    tracing::info!(
+        host = %snapshot.host,
+        port = snapshot.port,
+        username = %snapshot.username,
+        room = %snapshot.room,
+        reconnecting = state.reconnect_state.lock().running,
+        "connection_lifecycle: opening transport"
+    );
     let connection = Arc::new(Connection::new());
     let (receiver, peer_address) = connection
         .connect(snapshot.host.clone(), snapshot.port)
@@ -174,6 +180,8 @@ async fn establish_connection(
     *state.hello_sent.lock() = false;
 
     let client_supports_tls = create_tls_connector().is_ok();
+    #[cfg(test)]
+    let client_supports_tls = client_supports_tls && *state.client_supports_tls.lock();
     *state.client_supports_tls.lock() = client_supports_tls;
     let server_supports_tls = *state.server_supports_tls.lock();
 
@@ -187,6 +195,8 @@ async fn establish_connection(
             emit_system_message(state, &format!("Successfully reached {}", snapshot.host));
         }
     }
+
+    *state.connection.lock() = Some(connection.clone());
 
     if client_supports_tls && server_supports_tls {
         let tls_request = ProtocolMessage::TLS {
@@ -221,12 +231,7 @@ async fn establish_connection(
         send_hello(state);
     }
 
-    *state.connection.lock() = Some(connection.clone());
-
-    Ok(EstablishedConnection {
-        connection,
-        receiver,
-    })
+    Ok((connection, receiver))
 }
 
 fn start_connection_session(
@@ -238,14 +243,40 @@ fn start_connection_session(
     state.client_state.set_username(snapshot.username.clone());
     state.client_state.set_room(snapshot.room.clone());
     *state.had_first_playlist_index.lock() = false;
-    *state.playlist_may_need_restoring.lock() = false;
+    if !state.reconnect_state.lock().running {
+        *state.playlist_may_need_restoring.lock() = false;
+    }
     *state.last_advance_time.lock() = None;
     *state.last_rewind_time.lock() = None;
     *state.last_updated_file_time.lock() = None;
     *state.last_paused_on_leave_time.lock() = None;
     *state.last_global_update.lock() = None;
+    *state.last_protocol_activity.lock() = Some(std::time::Instant::now());
     state.sync_engine.lock().update_from_config(&config.user);
     update_autoplay_state(state, &config);
+
+    let state_clone = state.clone();
+    let session_connection = state.connection.lock().clone();
+    let timeout_session_connection = session_connection.clone();
+    tokio::spawn(async move {
+        let mut ticker = interval(PROTOCOL_TIMEOUT_CHECK_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let same_session = match (
+                &timeout_session_connection,
+                state_clone.connection.lock().as_ref(),
+            ) {
+                (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
+                _ => false,
+            };
+            if !same_session {
+                break;
+            }
+            if check_protocol_timeout(&state_clone) {
+                break;
+            }
+        }
+    });
 
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -254,13 +285,44 @@ fn start_connection_session(
             handle_server_message(message, &state_clone).await;
         }
         tracing::info!("Message processing loop ended");
-        handle_connection_closed(&state_clone).await;
+        handle_connection_closed_for_session(&state_clone, session_connection).await;
     });
 }
 
-async fn complete_server_login(state: &Arc<AppState>, hello: HelloMessage) {
+pub(crate) fn check_protocol_timeout(state: &Arc<AppState>) -> bool {
+    let timed_out = {
+        let guard = state.last_protocol_activity.lock();
+        let Some(last_activity) = guard.as_ref() else {
+            return false;
+        };
+        last_activity.elapsed().as_secs_f64() > PROTOCOL_TIMEOUT_SECONDS
+    };
+    if !timed_out {
+        return false;
+    }
+    tracing::warn!(
+        timeout_seconds = PROTOCOL_TIMEOUT_SECONDS,
+        "protocol_timeout: no server activity within timeout; disconnecting"
+    );
+    *state.last_protocol_activity.lock() = None;
+    emit_error_message(state, "Server timed out");
     if let Some(connection) = state.connection.lock().clone() {
+        connection.disconnect();
+    }
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        handle_connection_closed(&state_clone).await;
+    });
+    true
+}
+
+async fn complete_server_login(state: &Arc<AppState>, hello: HelloMessage) {
+    let connection = state.connection.lock().clone();
+    if let Some(connection) = connection {
         connection.set_authenticated();
+    }
+    if state.reconnect_state.lock().running {
+        reset_reconnect_state(state);
     }
 
     let server_version = if hello.realversion.is_empty() {
@@ -270,11 +332,18 @@ async fn complete_server_login(state: &Arc<AppState>, hello: HelloMessage) {
     };
     let feature_list = hello.features.clone();
 
+    tracing::info!(
+        username = %hello.username,
+        room = hello.room.as_ref().map(|room| room.name.as_str()).unwrap_or(""),
+        server_version = %server_version,
+        "connection_lifecycle: server login completed"
+    );
+
     state.client_state.set_username(hello.username.clone());
     if let Some(room) = hello.room.as_ref() {
         state.client_state.set_room(room.name.clone());
     }
-    *state.last_connect_time.lock() = Some(std::time::Instant::now());
+    *state.last_protocol_activity.lock() = Some(std::time::Instant::now());
 
     if let Some(motd) = hello.motd {
         state.emit_event(
@@ -354,15 +423,22 @@ fn reconnect_delay(attempt: u32) -> Duration {
 fn start_reconnect_loop(state: Arc<AppState>) {
     let snapshot = state.reconnect_snapshot.lock().clone();
     if snapshot.is_none() {
+        tracing::debug!("reconnect_lifecycle: no snapshot available; reconnect skipped");
         return;
     }
     {
         let mut reconnect = state.reconnect_state.lock();
         if reconnect.running || !reconnect.enabled {
+            tracing::debug!(
+                running = reconnect.running,
+                enabled = reconnect.enabled,
+                "reconnect_lifecycle: reconnect loop already running or disabled"
+            );
             return;
         }
         reconnect.running = true;
     }
+    tracing::info!("reconnect_lifecycle: reconnect loop started");
 
     tokio::spawn(async move {
         loop {
@@ -380,8 +456,16 @@ fn start_reconnect_loop(state: Arc<AppState>) {
                 reconnect.attempts
             };
 
+            tracing::info!(
+                attempt,
+                host = %snapshot.host,
+                port = snapshot.port,
+                room = %snapshot.room,
+                "reconnect_lifecycle: attempting reconnect"
+            );
+
             if attempt == 1 {
-                *state.last_global_update.lock() = None;
+                reset_transient_connection_state(&state);
                 *state.playlist_may_need_restoring.lock() = true;
                 state.emit_event(
                     "tls-status-changed",
@@ -414,9 +498,9 @@ fn start_reconnect_loop(state: Arc<AppState>) {
             }
 
             match establish_connection(&state, &snapshot, false).await {
-                Ok(established) => {
-                    start_connection_session(&state, &snapshot, established.receiver);
-                    reset_reconnect_state(&state);
+                Ok((_connection, receiver)) => {
+                    tracing::info!(attempt, "reconnect_lifecycle: transport re-established");
+                    start_connection_session(&state, &snapshot, receiver);
                     break;
                 }
                 Err(err) => {
@@ -438,6 +522,31 @@ pub async fn connect_to_server<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    connect_to_server_state(
+        host,
+        port,
+        username,
+        room,
+        password,
+        Some(&app),
+        state.inner(),
+    )
+    .await
+}
+
+fn mark_protocol_activity(state: &Arc<AppState>) {
+    *state.last_protocol_activity.lock() = Some(std::time::Instant::now());
+}
+
+async fn connect_to_server_state<R: Runtime>(
+    host: String,
+    port: u16,
+    username: String,
+    room: String,
+    password: Option<String>,
+    app: Option<&AppHandle<R>>,
+    state: &Arc<AppState>,
+) -> Result<(), String> {
     tracing::info!(
         "Connecting to {}:{} as {} in room {}",
         host,
@@ -446,7 +555,7 @@ pub async fn connect_to_server<R: Runtime>(
         room
     );
     emit_system_message(
-        state.inner(),
+        state,
         &format!("Attempting to connect to {}:{}", host, port),
     );
 
@@ -458,7 +567,7 @@ pub async fn connect_to_server<R: Runtime>(
     let (normalized_room, control_password) = parse_controlled_room_input(&room);
     let room = truncate_text(&normalized_room, FALLBACK_MAX_ROOM_NAME_LENGTH);
     if let Some(password) = control_password {
-        store_control_password(state.inner(), &room, &password, true);
+        store_control_password(state, &room, &password, true);
     }
     let username = truncate_text(&username, FALLBACK_MAX_USERNAME_LENGTH);
 
@@ -482,10 +591,12 @@ pub async fn connect_to_server<R: Runtime>(
 
     let config = state.config.lock().clone();
 
-    match establish_connection(state.inner(), &snapshot, true).await {
-        Ok(established) => {
-            maybe_autosave_connection(state.inner(), &app, &config, snapshot.clone());
-            start_connection_session(state.inner(), &snapshot, established.receiver);
+    match establish_connection(state, &snapshot, true).await {
+        Ok((_connection, receiver)) => {
+            if let Some(app) = app {
+                maybe_autosave_connection(state, app, &config, snapshot.clone());
+            }
+            start_connection_session(state, &snapshot, receiver);
             Ok(())
         }
         Err(err) => {
@@ -498,11 +609,13 @@ pub async fn connect_to_server<R: Runtime>(
 async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) {
     match message {
         ProtocolMessage::Hello { Hello } => {
+            mark_protocol_activity(state);
             tracing::info!("Received hello message: {:?}", Hello);
             emit_system_message(state, &format!("Hello {},", Hello.username));
             complete_server_login(state, Hello).await;
         }
         ProtocolMessage::List { List } => {
+            mark_protocol_activity(state);
             tracing::info!("Received user list: {:?}", List);
             if let Some(users_by_room) = List {
                 state.client_state.clear_users();
@@ -536,6 +649,7 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
             }
         }
         ProtocolMessage::Chat { Chat } => {
+            mark_protocol_activity(state);
             tracing::info!("Received chat message: {:?}", Chat);
             let config = state.config.lock().clone();
             if !state.server_features.lock().chat {
@@ -563,6 +677,7 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
             state.emit_event("chat-message-received", chat_msg);
         }
         ProtocolMessage::State { State: state_msg } => {
+            mark_protocol_activity(state);
             if state_msg.playstate.is_some() || state_msg.ignoring_on_the_fly.is_some() {
                 tracing::info!(
                     "Received state update: playstate={:?}, ignoring_on_the_fly={:?}",
@@ -606,8 +721,22 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
             ) {
                 tracing::warn!("Failed to send state response: {}", e);
             }
+            if state.reconnect_state.lock().running
+                && state
+                    .connection
+                    .lock()
+                    .as_ref()
+                    .map(|connection| {
+                        connection.state()
+                            == crate::network::connection::ConnectionState::Authenticated
+                    })
+                    .unwrap_or(false)
+            {
+                reset_reconnect_state(state);
+            }
         }
         ProtocolMessage::Error { Error } => {
+            mark_protocol_activity(state);
             tracing::error!("Received error from server: {:?}", Error);
             let authenticated = state
                 .connection
@@ -637,10 +766,12 @@ async fn handle_server_message(message: ProtocolMessage, state: &Arc<AppState>) 
             }
         }
         ProtocolMessage::Set { Set } => {
+            mark_protocol_activity(state);
             tracing::info!("Received set message: {:?}", Set);
             handle_set_message(state, *Set).await;
         }
         ProtocolMessage::TLS { TLS } => {
+            mark_protocol_activity(state);
             tracing::info!("Received TLS message: {:?}", TLS);
             handle_tls_message(state, TLS).await;
         }
@@ -999,10 +1130,19 @@ pub(crate) fn send_state_message(
     }
     drop(ignoring);
 
+    let include_client_timing = state.last_state_message_sent.lock().is_some() || state_change;
     let ping = PingInfo {
         latency_calculation,
-        client_latency_calculation: Some(crate::network::ping::PingService::new_timestamp()),
-        client_rtt: Some(state.ping_service.lock().get_rtt()),
+        client_latency_calculation: if include_client_timing {
+            Some(crate::network::ping::PingService::new_timestamp())
+        } else {
+            None
+        },
+        client_rtt: if include_client_timing {
+            Some(state.ping_service.lock().get_rtt())
+        } else {
+            None
+        },
         server_rtt: None,
     };
     let now = std::time::Instant::now();
@@ -1487,14 +1627,70 @@ fn send_controller_auth(state: &Arc<AppState>, room: &str, password: &str) -> Re
         .map_err(|e| format!("Failed to send controller auth: {}", e))
 }
 
+pub(crate) fn reset_transient_connection_state(state: &Arc<AppState>) {
+    state.client_state.clear_users();
+    state.client_state.set_file(None);
+    state.client_state.set_ready_state(None);
+    state.client_state.clear_server_version();
+    state.client_state.set_global_state(0.0, true, None);
+    *state.local_playback_state.lock() = crate::client::local_state::LocalPlaybackState::new();
+    state.playlist.clear();
+    state.emit_event(
+        "playlist-updated",
+        crate::app_state::PlaylistEvent {
+            items: Vec::new(),
+            current_index: None,
+        },
+    );
+    *state.server_features.lock() = ServerFeatures::default();
+    *state.ignoring_on_the_fly.lock() = crate::app_state::IgnoringOnTheFlyState::default();
+    *state.last_global_update.lock() = None;
+    *state.last_latency_calculation.lock() = None;
+    *state.last_protocol_activity.lock() = None;
+    *state.last_rewind_time.lock() = None;
+    *state.last_seek_from_position.lock() = None;
+    *state.last_advance_time.lock() = None;
+    *state.last_updated_file_time.lock() = None;
+    *state.last_paused_on_leave_time.lock() = None;
+    *state.playlist_may_need_restoring.lock() = false;
+    *state.had_first_playlist_index.lock() = false;
+    *state.room_warning_state.lock() = crate::app_state::RoomWarningState::default();
+    *state.warning_timers.lock() = WarningTimers::default();
+    *state.room_warning_task_running.lock() = false;
+    *state.autoplay.lock() = crate::app_state::AutoPlayState::default();
+}
+
 pub(crate) async fn handle_connection_closed(state: &Arc<AppState>) {
-    let connection = state.connection.lock().take();
+    handle_connection_closed_for_session(state, None).await;
+}
+
+async fn handle_connection_closed_for_session(
+    state: &Arc<AppState>,
+    expected_connection: Option<Arc<Connection>>,
+) {
+    let connection = {
+        let mut guard = state.connection.lock();
+        if let Some(expected) = expected_connection.as_ref() {
+            match guard.as_ref() {
+                Some(current) if Arc::ptr_eq(current, expected) => guard.take(),
+                _ => return,
+            }
+        } else {
+            guard.take()
+        }
+    };
     if connection.is_none() {
         return;
     }
     let manual_disconnect = *state.manual_disconnect.lock();
     if manual_disconnect {
+        tracing::info!(
+            "connection_lifecycle: manual disconnect closed connection; stopping player"
+        );
         *state.manual_disconnect.lock() = false;
+        if let Err(e) = stop_player(state).await {
+            tracing::warn!("Failed to stop player after manual disconnect: {}", e);
+        }
         return;
     }
 
@@ -1515,7 +1711,7 @@ pub(crate) async fn handle_connection_closed(state: &Arc<AppState>) {
     );
     state.emit_event(
         "tls-status-changed",
-        serde_json::json!({ "status": "unknown" }),
+        serde_json::json!({ "status": "closed" }),
     );
 
     if state.reconnect_state.lock().enabled {
@@ -1932,40 +2128,87 @@ async fn handle_tls_message(state: &Arc<AppState>, tls: TLSMessage) {
     let connection = state.connection.lock().clone();
     let Some(connection) = connection else { return };
 
-    if answer == "true" {
-        tracing::info!("Server accepted TLS, upgrading connection");
-        let tls_info = match connection.upgrade_tls().await {
-            Ok(info) => info,
-            Err(e) => {
-                tracing::error!("TLS upgrade failed: {}", e);
-                state.emit_event(
-                    "tls-status-changed",
-                    serde_json::json!({ "status": "unsupported" }),
-                );
-                send_hello(state);
-                return;
+    match answer {
+        "true" | "accepted" => {
+            tracing::info!(
+                timeout_seconds = TLS_NEGOTIATION_TIMEOUT.as_secs(),
+                "tls_lifecycle: server accepted TLS; upgrading connection"
+            );
+            state.emit_event(
+                "tls-status-changed",
+                serde_json::json!({ "status": "accepted" }),
+            );
+            match connection
+                .upgrade_tls_with_timeout(TLS_NEGOTIATION_TIMEOUT)
+                .await
+            {
+                Ok(tls_info) => {
+                    state.emit_event(
+                        "tls-status-changed",
+                        serde_json::json!({ "status": "enabled" }),
+                    );
+                    let protocol = tls_info.protocol.unwrap_or_else(|| "TLS".to_string());
+                    tracing::info!(protocol = %protocol, "tls_lifecycle: TLS enabled");
+                    emit_system_message(
+                        state,
+                        &format!("Secure connection established ({})", protocol),
+                    );
+                    send_hello(state);
+                }
+                Err(e) => {
+                    tracing::error!("TLS upgrade failed: {}", e);
+                    let message = e.to_string();
+                    let timed_out = message.contains("timed out");
+                    state.emit_event(
+                        "tls-status-changed",
+                        serde_json::json!({ "status": if timed_out { "closed" } else { "certificate-invalid" } }),
+                    );
+                    emit_error_message(state, &format!("TLS upgrade failed: {}", e));
+                    connection.disconnect();
+                }
             }
-        };
-        state.emit_event(
-            "tls-status-changed",
-            serde_json::json!({ "status": "enabled" }),
-        );
-        let protocol = tls_info.protocol.unwrap_or_else(|| "TLS".to_string());
-        emit_system_message(
-            state,
-            &format!("Secure connection established ({})", protocol),
-        );
-        send_hello(state);
-    } else if answer == "false" {
-        tracing::info!("Server does not support TLS, sending Hello");
-        *state.server_supports_tls.lock() = false;
-        state.emit_event(
-            "tls-status-changed",
-            serde_json::json!({ "status": "unsupported" }),
-        );
-        send_hello(state);
-    } else {
-        tracing::debug!("Ignoring TLS message: {}", answer);
+        }
+        "false" | "rejected" => {
+            tracing::info!(
+                answer,
+                "tls_lifecycle: TLS rejected by server; continuing plaintext"
+            );
+            *state.server_supports_tls.lock() = false;
+            state.emit_event(
+                "tls-status-changed",
+                serde_json::json!({ "status": "rejected" }),
+            );
+            send_hello(state);
+        }
+        "unsupported" => {
+            tracing::info!("tls_lifecycle: server does not support TLS; sending Hello");
+            *state.server_supports_tls.lock() = false;
+            state.emit_event(
+                "tls-status-changed",
+                serde_json::json!({ "status": "unsupported" }),
+            );
+            send_hello(state);
+        }
+        "certificate-invalid" => {
+            tracing::error!("tls_lifecycle: TLS certificate invalid");
+            state.emit_event(
+                "tls-status-changed",
+                serde_json::json!({ "status": "certificate-invalid" }),
+            );
+            emit_error_message(state, "TLS certificate invalid");
+            connection.disconnect();
+        }
+        "closed" => {
+            tracing::info!("tls_lifecycle: TLS negotiation closed by server");
+            state.emit_event(
+                "tls-status-changed",
+                serde_json::json!({ "status": "closed" }),
+            );
+            connection.disconnect();
+        }
+        _ => {
+            tracing::debug!("Ignoring TLS message: {}", answer);
+        }
     }
 }
 
@@ -2671,7 +2914,11 @@ fn emit_playlist_update(state: &Arc<AppState>) {
 
 #[tauri::command]
 pub async fn disconnect_from_server(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    tracing::info!("Disconnecting from server");
+    disconnect_from_server_state(state.inner()).await
+}
+
+pub(crate) async fn disconnect_from_server_state(state: &Arc<AppState>) -> Result<(), String> {
+    tracing::info!("connection_lifecycle: manual disconnect requested");
 
     {
         let mut reconnect = state.reconnect_state.lock();
@@ -2685,6 +2932,8 @@ pub async fn disconnect_from_server(state: State<'_, Arc<AppState>>) -> Result<(
     if let Some(connection) = state.connection.lock().take() {
         connection.disconnect();
     }
+
+    stop_player(state).await?;
 
     state.client_state.clear_users();
     state.playlist.clear();
@@ -2735,4 +2984,763 @@ pub async fn disconnect_from_server(state: State<'_, Arc<AppState>>) -> Result<(
 #[tauri::command]
 pub async fn get_connection_status(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     Ok(state.is_connected())
+}
+
+#[cfg(test)]
+mod protocol_message_tests {
+    use crate::network::messages::*;
+
+    #[test]
+    fn hello_set_state_tls_list_and_error_roundtrip_examples() {
+        let hello_json = r#"{"Hello":{"username":"alice","password":"secret","room":{"name":"room","password":"roompw"},"version":"1.2.255","realversion":"1.7.5","features":{"sharedPlaylists":true,"chat":true,"readiness":true,"managedRooms":true,"persistentRooms":false,"featureList":true,"setOthersReadiness":true,"uiMode":"GUI"},"motd":"welcome"}}"#;
+        let tls_json = r#"{"TLS":{"startTLS":"accepted"}}"#;
+        let state_json = r#"{"State":{"playstate":{"position":12.5,"paused":false,"doSeek":true,"setBy":"alice"},"ping":{"latencyCalculation":0.25,"clientLatencyCalculation":1.5,"clientRtt":0.12,"serverRtt":0.08},"ignoringOnTheFly":{"server":1,"client":2}}}"#;
+        let ready_json = r#"{"Set":{"ready":{"username":"pc","isReady":true,"manuallyInitiated":false,"setBy":"host"}}}"#;
+        let user_json = r#"{"Set":{"user":{"pc":{"room":{"name":"default"},"file":{"name":"movie.mkv","size":12345,"duration":3600},"controller":true,"isReady":false,"features":{"managedRooms":true}}}}}"#;
+        let playlist_json = r#"{"Set":{"playlistChange":{"user":"host","files":["movie.mkv","bonus.mkv"]},"playlistIndex":{"user":"host","index":1}}}"#;
+        let list_json = r#"{"List":{"default":{"ghost":{"file":{"name":"movie.mkv","size":"12345","duration":3600},"controller":false,"isReady":true,"features":[]}}}}"#;
+        let error_json = r#"{"Error":{"message":"This server does not support TLS"}}"#;
+
+        let hello: ProtocolMessage = serde_json::from_str(hello_json).unwrap();
+        let tls: ProtocolMessage = serde_json::from_str(tls_json).unwrap();
+        let state: ProtocolMessage = serde_json::from_str(state_json).unwrap();
+        let ready: ProtocolMessage = serde_json::from_str(ready_json).unwrap();
+        let user: ProtocolMessage = serde_json::from_str(user_json).unwrap();
+        let playlist: ProtocolMessage = serde_json::from_str(playlist_json).unwrap();
+        let list: ProtocolMessage = serde_json::from_str(list_json).unwrap();
+        let error: ProtocolMessage = serde_json::from_str(error_json).unwrap();
+
+        let roundtrip = serde_json::to_value(&hello).unwrap();
+        assert_eq!(
+            roundtrip,
+            serde_json::from_str::<serde_json::Value>(hello_json).unwrap()
+        );
+        assert!(matches!(tls, ProtocolMessage::TLS { .. }));
+        assert!(matches!(state, ProtocolMessage::State { .. }));
+        assert!(matches!(ready, ProtocolMessage::Set { .. }));
+        assert!(matches!(user, ProtocolMessage::Set { .. }));
+        assert!(matches!(playlist, ProtocolMessage::Set { .. }));
+        assert!(matches!(list, ProtocolMessage::List { .. }));
+        assert!(matches!(error, ProtocolMessage::Error { .. }));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::network::fake_server::FakeSyncplayServer;
+    use crate::network::messages::{PingInfo, PlayState, StateMessage};
+    use crate::player::backend::{FakePlayerCommand, FakePlayerFactory};
+    use std::sync::Arc;
+    use tokio::time::{sleep, timeout, Duration};
+
+    async fn expect_client_tls_or_hello(server: &mut FakeSyncplayServer) {
+        match timeout(Duration::from_secs(3), server.next_received())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ProtocolMessage::TLS { .. } => {
+                server
+                    .send(FakeSyncplayServer::tls_response("unsupported"))
+                    .unwrap();
+                assert!(matches!(
+                    timeout(Duration::from_secs(2), server.next_received())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    ProtocolMessage::Hello { .. }
+                ));
+            }
+            ProtocolMessage::Hello { .. } => {}
+            other => panic!("expected TLS request or Hello, got {other:?}"),
+        }
+    }
+
+    async fn send_server_state_and_expect_client_state(
+        server: &mut FakeSyncplayServer,
+        position: f64,
+    ) -> StateMessage {
+        server
+            .send(ProtocolMessage::State {
+                State: StateMessage {
+                    playstate: Some(PlayState {
+                        position,
+                        paused: position == 0.0,
+                        do_seek: None,
+                        set_by: Some("server".to_string()),
+                    }),
+                    ping: Some(PingInfo {
+                        latency_calculation: Some(200.0 + position),
+                        client_latency_calculation: Some(
+                            crate::network::ping::PingService::new_timestamp(),
+                        ),
+                        client_rtt: Some(0.1),
+                        server_rtt: Some(0.02),
+                    }),
+                    ignoring_on_the_fly: None,
+                },
+            })
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(ProtocolMessage::State { State }) = server.next_received().await {
+                    break State;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn connect_fake_server_and_player(
+        state: &Arc<AppState>,
+        factory: &Arc<FakePlayerFactory>,
+    ) -> FakeSyncplayServer {
+        *state.fake_player_factory.lock() = Some(factory.clone());
+        let server = FakeSyncplayServer::start().await.unwrap();
+        connect_to_server_state::<tauri::test::MockRuntime>(
+            server.host(),
+            server.port(),
+            "alice".to_string(),
+            "room".to_string(),
+            None,
+            None,
+            state,
+        )
+        .await
+        .unwrap();
+
+        let previous_launch_count = factory.launch_count();
+        server
+            .send(FakeSyncplayServer::hello_response("alice", "room"))
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if factory.launch_count() > previous_launch_count {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server
+    }
+
+    #[tokio::test]
+    async fn disconnect_stops_fake_player_and_clears_backend_state() {
+        let state = AppState::new();
+        let factory = Arc::new(FakePlayerFactory::default());
+        let _server = connect_fake_server_and_player(&state, &factory).await;
+
+        let first_player = factory.players().first().cloned().unwrap();
+        *state.mpv_socket_path.lock() = Some("stale-ipc".to_string());
+        disconnect_from_server_state(&state).await.unwrap();
+
+        assert!(!state.is_connected());
+        assert!(state.connection.lock().is_none());
+        assert!(state.player.lock().is_none());
+        assert!(state.player_process.lock().is_none());
+        assert!(state.mpv_socket_path.lock().is_none());
+        assert!(state.mpv_runtime_dir.lock().is_none());
+        assert_eq!(first_player.shutdown_count(), 1);
+        assert!(first_player
+            .commands()
+            .contains(&FakePlayerCommand::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_disconnect_launches_fresh_fake_player() {
+        let state = AppState::new();
+        let factory = Arc::new(FakePlayerFactory::default());
+        let server1 = connect_fake_server_and_player(&state, &factory).await;
+        disconnect_from_server_state(&state).await.unwrap();
+        server1.close();
+
+        let _server = connect_fake_server_and_player(&state, &factory).await;
+        let players = factory.players();
+        assert_eq!(factory.launch_count(), 2);
+        assert_eq!(players.len(), 2);
+        assert_eq!(players[0].shutdown_count(), 1);
+        assert_eq!(players[1].shutdown_count(), 0);
+        assert_ne!(players[0].commands(), players[1].commands());
+        assert!(state.player.lock().is_some());
+    }
+
+    #[tokio::test]
+    async fn tls_runtime_branches_send_hello_or_drop_cleanly() {
+        for (answer, expect_hello) in [
+            ("unsupported", true),
+            ("rejected", true),
+            ("certificate-invalid", false),
+            ("closed", false),
+        ] {
+            let state = AppState::new();
+            let mut server = FakeSyncplayServer::start().await.unwrap();
+            connect_to_server_state::<tauri::test::MockRuntime>(
+                server.host(),
+                server.port(),
+                "alice".to_string(),
+                "room".to_string(),
+                None,
+                None,
+                &state,
+            )
+            .await
+            .unwrap();
+
+            assert!(matches!(
+                timeout(Duration::from_secs(2), server.next_received())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                ProtocolMessage::TLS { .. }
+            ));
+            server
+                .send(FakeSyncplayServer::tls_response(answer))
+                .unwrap();
+
+            if expect_hello {
+                assert!(matches!(
+                    timeout(Duration::from_secs(2), server.next_received())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    ProtocolMessage::Hello { .. }
+                ));
+                assert!(*state.hello_sent.lock(), "{answer} should send Hello");
+            } else {
+                timeout(Duration::from_secs(2), async {
+                    loop {
+                        let disconnected = state
+                            .connection
+                            .lock()
+                            .as_ref()
+                            .map(|connection| !connection.is_connected())
+                            .unwrap_or(true);
+                        if disconnected {
+                            break;
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!*state.hello_sent.lock(), "{answer} must not send Hello");
+            }
+            server.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn client_unsupported_tls_sends_plain_hello_without_tls_request() {
+        let state = AppState::new();
+        *state.client_supports_tls.lock() = false;
+        let mut server = FakeSyncplayServer::start().await.unwrap();
+        connect_to_server_state::<tauri::test::MockRuntime>(
+            server.host(),
+            server.port(),
+            "alice".to_string(),
+            "room".to_string(),
+            None,
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+
+        let first = timeout(Duration::from_secs(2), server.next_received())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, ProtocolMessage::Hello { .. }));
+        assert!(!*state.client_supports_tls.lock());
+        assert!(*state.hello_sent.lock());
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn automatic_remote_close_reconnect_resets_state_and_rejoins_cleanly() {
+        let state = AppState::new();
+        let factory = Arc::new(FakePlayerFactory::default());
+        *state.fake_player_factory.lock() = Some(factory.clone());
+
+        let mut server = FakeSyncplayServer::start().await.unwrap();
+        connect_to_server_state::<tauri::test::MockRuntime>(
+            server.host(),
+            server.port(),
+            "alice".to_string(),
+            "room".to_string(),
+            None,
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        expect_client_tls_or_hello(&mut server).await;
+        server
+            .send(FakeSyncplayServer::hello_response("alice", "room"))
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if factory.launch_count() == 1 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        state.client_state.add_user(crate::client::state::User {
+            username: "bob".to_string(),
+            room: "room".to_string(),
+            file: Some("other.mkv".to_string()),
+            file_size: None,
+            file_duration: None,
+            is_ready: Some(true),
+            is_controller: false,
+            features: None,
+        });
+        state.client_state.set_file(Some("local.mkv".to_string()));
+        state.client_state.set_ready_state(Some(true));
+        state
+            .playlist
+            .set_items(vec!["one.mkv".to_string(), "two.mkv".to_string()]);
+        *state.last_global_update.lock() = Some(std::time::Instant::now());
+        *state.last_state_message_sent.lock() = Some(std::time::Instant::now());
+        *state.last_protocol_activity.lock() = Some(std::time::Instant::now());
+        *state.had_first_playlist_index.lock() = true;
+
+        let reconnect_tx = server.take_command_sender();
+        reconnect_tx
+            .send(crate::network::fake_server::FakeServerCommand::AbortConnection)
+            .unwrap();
+        let reconnect_message = {
+            let reconnect_wait = server.wait_for_reconnect_message();
+            tokio::pin!(reconnect_wait);
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        message = &mut reconnect_wait => break message,
+                        _ = sleep(Duration::from_millis(10)) => {
+                            if state.reconnect_state.lock().running {
+                                assert_eq!(state.client_state.get_users().len(), 0);
+                                assert!(state.client_state.get_file().is_none());
+                                assert!(state.client_state.ready_state().is_none());
+                                assert!(state.playlist.is_empty());
+                                assert!(*state.playlist_may_need_restoring.lock());
+                                assert!(state.connection.lock().is_none() || state.connection.lock().as_ref().map(|connection| !matches!(connection.state(), crate::network::connection::ConnectionState::Authenticated)).unwrap_or(true));
+                                assert!(state.player.lock().is_some(), "remote close must not stop player");
+                                assert_eq!(factory.players()[0].shutdown_count(), 0);
+                                assert!(state.reconnect_snapshot.lock().is_some());
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        match reconnect_message {
+            ProtocolMessage::TLS { .. } => {
+                server
+                    .send(FakeSyncplayServer::tls_response("unsupported"))
+                    .unwrap();
+                assert!(matches!(
+                    timeout(Duration::from_secs(2), server.next_received())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    ProtocolMessage::Hello { .. }
+                ));
+            }
+            ProtocolMessage::Hello { .. } => {}
+            other => panic!("expected reconnected TLS or Hello, got {other:?}"),
+        }
+
+        assert_eq!(state.client_state.get_users().len(), 0);
+        assert!(state.client_state.get_file().is_none());
+        assert!(state.client_state.ready_state().is_none());
+        assert!(state.playlist.is_empty());
+        assert!(*state.playlist_may_need_restoring.lock());
+        assert!(
+            state.connection.lock().is_none()
+                || state
+                    .connection
+                    .lock()
+                    .as_ref()
+                    .map(|connection| !matches!(
+                        connection.state(),
+                        crate::network::connection::ConnectionState::Authenticated
+                    ))
+                    .unwrap_or(true)
+        );
+        assert_eq!(factory.players()[0].shutdown_count(), 0);
+        assert!(state.reconnect_snapshot.lock().is_some());
+
+        let duplicate_attempts = state.reconnect_state.lock().attempts;
+        start_reconnect_loop(state.clone());
+        sleep(Duration::from_millis(20)).await;
+        assert!(state.reconnect_state.lock().attempts <= duplicate_attempts + 1);
+
+        server
+            .send(FakeSyncplayServer::hello_response("alice", "room"))
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let authenticated = state
+                    .connection
+                    .lock()
+                    .as_ref()
+                    .map(|connection| {
+                        connection.state()
+                            == crate::network::connection::ConnectionState::Authenticated
+                    })
+                    .unwrap_or(false);
+                if authenticated {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.client_state.get_username(), "alice");
+        assert_eq!(state.client_state.get_room(), "room");
+        assert!(!state.reconnect_state.lock().running);
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn scripted_connect_player_launch_disconnect_player_closed_reconnect_player_relaunched() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let state = AppState::new();
+        let factory = Arc::new(FakePlayerFactory::default());
+        *state.fake_player_factory.lock() = Some(factory.clone());
+
+        let mut server1 = FakeSyncplayServer::start().await.unwrap();
+        connect_to_server_state::<tauri::test::MockRuntime>(
+            server1.host(),
+            server1.port(),
+            "alice".to_string(),
+            "room".to_string(),
+            None,
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        expect_client_tls_or_hello(&mut server1).await;
+        server1
+            .send(FakeSyncplayServer::hello_response("alice", "room"))
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if factory.launch_count() == 1 && state.is_player_connected() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("connect -> player launch evidence timed out");
+        assert_eq!(
+            factory.launch_count(),
+            1,
+            "connect launched first fake player"
+        );
+        assert_eq!(
+            factory.players()[0].shutdown_count(),
+            0,
+            "first fake player is running before disconnect"
+        );
+
+        disconnect_from_server_state(&state).await.unwrap();
+        assert!(
+            state.player.lock().is_none(),
+            "disconnect closed player state"
+        );
+        assert_eq!(
+            factory.players()[0].shutdown_count(),
+            1,
+            "manual disconnect shut down first fake player"
+        );
+        assert!(
+            !state.is_connected(),
+            "manual disconnect closed server connection"
+        );
+        server1.close();
+
+        let mut server2 = FakeSyncplayServer::start().await.unwrap();
+        connect_to_server_state::<tauri::test::MockRuntime>(
+            server2.host(),
+            server2.port(),
+            "alice".to_string(),
+            "room".to_string(),
+            None,
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        expect_client_tls_or_hello(&mut server2).await;
+        server2
+            .send(FakeSyncplayServer::hello_response("alice", "room"))
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if factory.launch_count() == 2 && state.is_player_connected() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reconnect -> player relaunch evidence timed out");
+        assert_eq!(
+            factory.launch_count(),
+            2,
+            "reconnect relaunched fresh fake player"
+        );
+        assert_eq!(
+            factory.players()[1].shutdown_count(),
+            0,
+            "second fake player remains running after reconnect"
+        );
+        assert_eq!(
+            factory.players()[0].shutdown_count(),
+            1,
+            "first fake player stayed closed after reconnect"
+        );
+        server2.close();
+    }
+    #[tokio::test]
+    async fn app_fake_server_hello_state_close_and_reconnect_integration() {
+        let state = AppState::new();
+        let factory = Arc::new(FakePlayerFactory::default());
+        *state.fake_player_factory.lock() = Some(factory.clone());
+
+        let mut server = FakeSyncplayServer::start().await.unwrap();
+        let host = server.host();
+        let port = server.port();
+        connect_to_server_state::<tauri::test::MockRuntime>(
+            host.clone(),
+            port,
+            "alice".to_string(),
+            "room".to_string(),
+            None,
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        expect_client_tls_or_hello(&mut server).await;
+        server
+            .send(FakeSyncplayServer::hello_response("alice", "room"))
+            .unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state
+                    .connection
+                    .lock()
+                    .as_ref()
+                    .map(|connection| {
+                        connection.state()
+                            == crate::network::connection::ConnectionState::Authenticated
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        for index in 0..3 {
+            if index > 0 {
+                sleep(STATE_MESSAGE_MIN_INTERVAL + Duration::from_millis(20)).await;
+            }
+            let response =
+                send_server_state_and_expect_client_state(&mut server, index as f64).await;
+            assert_eq!(
+                response.ping.unwrap().latency_calculation,
+                Some(200.0 + index as f64)
+            );
+        }
+
+        server.abort_connection();
+        expect_client_tls_or_hello(&mut server).await;
+        server
+            .send(FakeSyncplayServer::hello_response("alice", "room"))
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if !state.reconnect_state.lock().running
+                    && state
+                        .connection
+                        .lock()
+                        .as_ref()
+                        .map(|connection| connection.is_connected())
+                        .unwrap_or(false)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        sleep(STATE_MESSAGE_MIN_INTERVAL + Duration::from_millis(20)).await;
+        let final_response = send_server_state_and_expect_client_state(&mut server, 3.0).await;
+        assert!(final_response
+            .ping
+            .unwrap()
+            .client_latency_calculation
+            .is_some());
+        assert_eq!(state.client_state.get_room(), "room");
+        assert_eq!(state.client_state.get_username(), "alice");
+        assert!(factory.launch_count() >= 1);
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn first_state_response_then_subsequent_state_includes_client_rtt() {
+        let state = AppState::new();
+        let mut server = FakeSyncplayServer::start().await.unwrap();
+        connect_to_server_state::<tauri::test::MockRuntime>(
+            server.host(),
+            server.port(),
+            "alice".to_string(),
+            "room".to_string(),
+            None,
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(2), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::TLS { .. }
+        ));
+        server
+            .send(FakeSyncplayServer::tls_response("unsupported"))
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::Hello { .. }
+        ));
+        server
+            .send(FakeSyncplayServer::hello_response("alice", "room"))
+            .unwrap();
+        // Complete login before the first State so the local response is not lost while
+        // the connection is still marked only as Connected.
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state
+                    .connection
+                    .lock()
+                    .as_ref()
+                    .map(|connection| {
+                        connection.state()
+                            == crate::network::connection::ConnectionState::Authenticated
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        server
+            .send(ProtocolMessage::State {
+                State: StateMessage {
+                    playstate: Some(PlayState {
+                        position: 10.0,
+                        paused: true,
+                        do_seek: None,
+                        set_by: Some("bob".to_string()),
+                    }),
+                    ping: Some(PingInfo {
+                        latency_calculation: Some(100.0),
+                        client_latency_calculation: None,
+                        client_rtt: None,
+                        server_rtt: Some(0.05),
+                    }),
+                    ignoring_on_the_fly: None,
+                },
+            })
+            .unwrap();
+
+        let first_state = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(ProtocolMessage::State { State }) = server.next_received().await {
+                    break State;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let first_ping = first_state.ping.unwrap();
+        assert_eq!(first_ping.latency_calculation, Some(100.0));
+        assert!(first_ping.client_latency_calculation.is_none());
+        assert!(first_ping.client_rtt.is_none());
+
+        sleep(STATE_MESSAGE_MIN_INTERVAL + Duration::from_millis(20)).await;
+        server
+            .send(ProtocolMessage::State {
+                State: StateMessage {
+                    playstate: Some(PlayState {
+                        position: 11.0,
+                        paused: false,
+                        do_seek: None,
+                        set_by: Some("bob".to_string()),
+                    }),
+                    ping: Some(PingInfo {
+                        latency_calculation: Some(101.0),
+                        client_latency_calculation: Some(
+                            crate::network::ping::PingService::new_timestamp(),
+                        ),
+                        client_rtt: Some(0.2),
+                        server_rtt: Some(0.05),
+                    }),
+                    ignoring_on_the_fly: None,
+                },
+            })
+            .unwrap();
+        let second_state = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(ProtocolMessage::State { State }) = server.next_received().await {
+                    break State;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let second_ping = second_state.ping.unwrap();
+        assert_eq!(second_ping.latency_calculation, Some(101.0));
+        assert!(second_ping.client_latency_calculation.is_some());
+        assert!(second_ping.client_rtt.is_some());
+    }
 }

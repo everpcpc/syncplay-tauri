@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -11,12 +12,14 @@ use tracing::{debug, info, warn};
 use super::backend::PlayerBackend;
 use super::properties::PlayerState;
 
+const VLC_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const VLC_ARGS: &[&str] = &["--extraintf", "rc", "--rc-fake-tty", "--quiet"];
 
 pub struct VlcBackend {
-    stdin: Arc<TokioMutex<ChildStdin>>,
+    stdin: Arc<TokioMutex<Option<ChildStdin>>>,
     state: Arc<Mutex<PlayerState>>,
     last_loaded: Arc<Mutex<Option<String>>>,
+    connected: Arc<AtomicBool>,
 }
 
 impl VlcBackend {
@@ -50,6 +53,8 @@ impl VlcBackend {
         let last_loaded = Arc::new(Mutex::new(initial_file.map(|s| s.to_string())));
         let state_clone = state.clone();
         let last_loaded_clone = last_loaded.clone();
+        let connected = Arc::new(AtomicBool::new(true));
+        let connected_clone = connected.clone();
 
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -59,24 +64,58 @@ impl VlcBackend {
                 }
                 handle_line(&state_clone, &last_loaded_clone, &line);
             }
+            connected_clone.store(false, Ordering::SeqCst);
         });
 
         let backend = Self {
-            stdin: Arc::new(TokioMutex::new(stdin)),
+            stdin: Arc::new(TokioMutex::new(Some(stdin))),
             state,
             last_loaded,
+            connected,
         };
 
         Ok((backend, child))
     }
 
     async fn send_command(&self, command: &str) -> anyhow::Result<()> {
+        if !self.connected.load(Ordering::SeqCst) {
+            anyhow::bail!("VLC RC pipe is disconnected");
+        }
         let mut guard = self.stdin.lock().await;
-        guard
-            .write_all(format!("{}\n", command).as_bytes())
-            .await
-            .context("Failed to write to VLC")?;
-        guard.flush().await.context("Failed to flush VLC")?;
+        let Some(stdin) = guard.as_mut() else {
+            self.connected.store(false, Ordering::SeqCst);
+            anyhow::bail!("VLC RC pipe is disconnected");
+        };
+        match tokio::time::timeout(VLC_COMMAND_TIMEOUT, async {
+            stdin.write_all(format!("{}\n", command).as_bytes()).await?;
+            stdin.flush().await
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.connected.store(false, Ordering::SeqCst);
+                *guard = None;
+                Err(e.into())
+            }
+            Err(_) => {
+                self.connected.store(false, Ordering::SeqCst);
+                *guard = None;
+                anyhow::bail!("Timed out writing to VLC RC pipe")
+            }
+        }
+    }
+
+    async fn close(&self) -> anyhow::Result<()> {
+        self.connected.store(false, Ordering::SeqCst);
+        let mut guard = self.stdin.lock().await;
+        if let Some(mut stdin) = guard.take() {
+            let _ = tokio::time::timeout(VLC_COMMAND_TIMEOUT, async {
+                let _ = stdin.write_all(b"quit\n").await;
+                stdin.shutdown().await
+            })
+            .await;
+        }
         Ok(())
     }
 }
@@ -186,15 +225,21 @@ impl PlayerBackend for VlcBackend {
         let stdin = self.stdin.clone();
         tokio::spawn(async move {
             let mut guard = stdin.lock().await;
-            let _ = guard
-                .write_all(format!("display {}\n", message).as_bytes())
-                .await;
-            let _ = guard.flush().await;
+            if let Some(stdin) = guard.as_mut() {
+                let _ = stdin
+                    .write_all(format!("display {}\n", message).as_bytes())
+                    .await;
+                let _ = stdin.flush().await;
+            }
         });
         Ok(())
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
-        self.send_command("quit").await
+        self.close().await
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
     }
 }

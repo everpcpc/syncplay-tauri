@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{Certificate, ClientConfig, RootCertStore};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
@@ -11,11 +11,22 @@ pub struct TlsInfo {
 
 /// Create a TLS connector with system root certificates
 pub fn create_tls_connector() -> Result<TlsConnector> {
+    create_tls_connector_with_extra_roots(std::iter::empty::<Certificate>())
+}
+
+pub fn create_tls_connector_with_extra_roots<I>(extra_roots: I) -> Result<TlsConnector>
+where
+    I: IntoIterator<Item = Certificate>,
+{
     let mut root_store = RootCertStore::empty();
 
     // Add system root certificates
     for cert in rustls_native_certs::load_native_certs()? {
         root_store.add(&rustls::Certificate(cert.0))?;
+    }
+
+    for cert in extra_roots {
+        root_store.add(&cert)?;
     }
 
     let config = ClientConfig::builder()

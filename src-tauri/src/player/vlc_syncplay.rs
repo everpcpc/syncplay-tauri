@@ -5,6 +5,7 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use rand::Rng;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -20,6 +21,7 @@ const VLC_OPEN_MAX_WAIT_TIME: Duration = Duration::from_secs(20);
 const VLC_MIN_PORT: u16 = 10000;
 const VLC_MAX_PORT: u16 = 55000;
 const VLC_LATENCY_ERROR_THRESHOLD: f64 = 2.0;
+const VLC_COMMAND_TIMEOUT: Duration = Duration::from_millis(500);
 
 const VLC_ARGS: &[&str] = &[
     "--extraintf=luaintf",
@@ -32,15 +34,55 @@ const VLC_ARGS: &[&str] = &[
 
 #[derive(Clone)]
 struct Connection {
-    writer: Arc<TokioMutex<OwnedWriteHalf>>,
+    writer: Arc<TokioMutex<Option<OwnedWriteHalf>>>,
+    connected: Arc<AtomicBool>,
 }
 
 impl Connection {
     async fn send_line(&self, line: &str) -> anyhow::Result<()> {
+        if !self.connected.load(Ordering::SeqCst) {
+            anyhow::bail!("VLC syncplay interface is disconnected");
+        }
         let mut guard = self.writer.lock().await;
-        guard.write_all(format!("{}\n", line).as_bytes()).await?;
-        guard.flush().await?;
+        let Some(writer) = guard.as_mut() else {
+            self.connected.store(false, Ordering::SeqCst);
+            anyhow::bail!("VLC syncplay interface is disconnected");
+        };
+        match tokio::time::timeout(VLC_COMMAND_TIMEOUT, async {
+            writer.write_all(format!("{}\n", line).as_bytes()).await?;
+            writer.flush().await
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.connected.store(false, Ordering::SeqCst);
+                *guard = None;
+                Err(e.into())
+            }
+            Err(_) => {
+                self.connected.store(false, Ordering::SeqCst);
+                *guard = None;
+                anyhow::bail!("Timed out writing to VLC syncplay interface")
+            }
+        }
+    }
+
+    async fn close(&self) -> anyhow::Result<()> {
+        self.connected.store(false, Ordering::SeqCst);
+        let mut guard = self.writer.lock().await;
+        if let Some(mut writer) = guard.take() {
+            let _ = tokio::time::timeout(VLC_COMMAND_TIMEOUT, async {
+                let _ = writer.write_all(b"close-vlc\n").await;
+                writer.shutdown().await
+            })
+            .await;
+        }
         Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
     }
 }
 
@@ -111,7 +153,8 @@ impl VlcSyncplayBackend {
         let stream = connect_with_retry(port).await?;
         let (read_half, write_half) = stream.into_split();
         let connection = Connection {
-            writer: Arc::new(TokioMutex::new(write_half)),
+            writer: Arc::new(TokioMutex::new(Some(write_half))),
+            connected: Arc::new(AtomicBool::new(true)),
         };
 
         let state = Arc::new(Mutex::new(PlayerState::default()));
@@ -237,7 +280,11 @@ impl PlayerBackend for VlcSyncplayBackend {
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
-        self.connection.send_line("close-vlc").await
+        self.connection.close().await
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connection.is_connected()
     }
 }
 
@@ -267,6 +314,7 @@ fn spawn_reader(
             )
             .await;
         }
+        connection.connected.store(false, Ordering::SeqCst);
     });
 }
 
