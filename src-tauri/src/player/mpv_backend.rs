@@ -459,7 +459,8 @@ async fn handle_syncplayintf_line(
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     let before_refresh = ipc.get_state();
                     let before_duration = before_refresh.duration;
-                    let refresh_result = timeout(Duration::from_millis(1200), ipc.refresh_state()).await;
+                    let refresh_result =
+                        timeout(Duration::from_millis(1200), ipc.refresh_state()).await;
                     let mut stable = ipc.get_state();
                     match refresh_result {
                         Ok(Ok(())) => {}
