@@ -33,7 +33,6 @@ const DIFFERENT_DURATION_THRESHOLD: f64 = 2.5;
 const WARNING_OSD_INTERVAL_SECONDS: u64 = 1;
 const OSD_WARNING_MESSAGE_DURATION_SECONDS: u32 = 5;
 const OSD_MESSAGE_SEPARATOR: &str = "; ";
-const STATE_MESSAGE_MIN_INTERVAL: Duration = Duration::from_millis(200);
 const TLS_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(8);
 const PROTOCOL_TIMEOUT_SECONDS: f64 = 12.5;
 const PROTOCOL_TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -1130,34 +1129,13 @@ pub(crate) fn send_state_message(
     }
     drop(ignoring);
 
-    let include_client_timing = state.last_state_message_sent.lock().is_some() || state_change;
     let ping = PingInfo {
         latency_calculation,
-        client_latency_calculation: if include_client_timing {
-            Some(crate::network::ping::PingService::new_timestamp())
-        } else {
-            None
-        },
-        client_rtt: if include_client_timing {
-            Some(state.ping_service.lock().get_rtt())
-        } else {
-            None
-        },
+        client_latency_calculation: Some(crate::network::ping::PingService::new_timestamp()),
+        client_rtt: Some(state.ping_service.lock().get_rtt()),
         server_rtt: None,
     };
-    let now = std::time::Instant::now();
-    {
-        let mut last_sent = state.last_state_message_sent.lock();
-        if !state_change {
-            if let Some(last) = *last_sent {
-                if now.duration_since(last) < STATE_MESSAGE_MIN_INTERVAL {
-                    tracing::debug!("Suppressing non-changing State response to avoid flooding");
-                    return Ok(());
-                }
-            }
-        }
-        *last_sent = Some(now);
-    }
+    *state.last_state_message_sent.lock() = Some(std::time::Instant::now());
     let message = ProtocolMessage::State {
         State: StateMessage {
             playstate,
@@ -3568,9 +3546,6 @@ mod lifecycle_tests {
         .unwrap();
 
         for index in 0..3 {
-            if index > 0 {
-                sleep(STATE_MESSAGE_MIN_INTERVAL + Duration::from_millis(20)).await;
-            }
             let response =
                 send_server_state_and_expect_client_state(&mut server, index as f64).await;
             assert_eq!(
@@ -3602,7 +3577,6 @@ mod lifecycle_tests {
         .await
         .unwrap();
 
-        sleep(STATE_MESSAGE_MIN_INTERVAL + Duration::from_millis(20)).await;
         let final_response = send_server_state_and_expect_client_state(&mut server, 3.0).await;
         assert!(final_response
             .ping
@@ -3616,7 +3590,7 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn first_state_response_then_subsequent_state_includes_client_rtt() {
+    async fn every_state_response_includes_client_timing() {
         let state = AppState::new();
         let mut server = FakeSyncplayServer::start().await.unwrap();
         connect_to_server_state::<tauri::test::MockRuntime>(
@@ -3704,10 +3678,9 @@ mod lifecycle_tests {
         .unwrap();
         let first_ping = first_state.ping.unwrap();
         assert_eq!(first_ping.latency_calculation, Some(100.0));
-        assert!(first_ping.client_latency_calculation.is_none());
-        assert!(first_ping.client_rtt.is_none());
+        assert!(first_ping.client_latency_calculation.is_some());
+        assert!(first_ping.client_rtt.is_some());
 
-        sleep(STATE_MESSAGE_MIN_INTERVAL + Duration::from_millis(20)).await;
         server
             .send(ProtocolMessage::State {
                 State: StateMessage {
