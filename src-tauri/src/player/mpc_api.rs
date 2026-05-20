@@ -642,18 +642,16 @@ impl PlayerBackend for MpcApiBackend {
     async fn load_file(&self, path: &str) -> anyhow::Result<()> {
         self.listener
             .send_command(CMD_OPENFILE, Some(CommandPayload::Text(path.to_string())))
-            .map_err(|e| {
+            .inspect_err(|_e| {
                 self.mark_disconnected();
-                e
             })?;
         Ok(())
     }
 
     fn show_osd(&self, text: &str, duration_ms: Option<u64>) -> anyhow::Result<()> {
         let duration = duration_ms.unwrap_or(3000) as i32;
-        self.send_osd(text, duration).map_err(|e| {
+        self.send_osd(text, duration).inspect_err(|_e| {
             self.mark_disconnected();
-            e
         })
     }
 

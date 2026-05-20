@@ -924,8 +924,8 @@ mod tests {
             let outbound = timeout(Duration::from_secs(5), async {
                 loop {
                     if let Some(ProtocolMessage::Set { Set }) = server.next_received().await {
-                        if Set.file.is_some() {
-                            break Set.file.unwrap();
+                        if let Some(file) = Set.file {
+                            break file;
                         }
                     }
                 }
