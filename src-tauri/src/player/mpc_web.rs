@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -11,13 +12,14 @@ use super::backend::PlayerBackend;
 use super::properties::PlayerState;
 
 const DEFAULT_MPC_PORT: u16 = 13579;
+const MPC_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const MPC_CMD_CLOSEAPP: u32 = 0xA0004006;
 
 pub struct MpcWebBackend {
     kind: super::backend::PlayerKind,
     client: Client,
     state: Arc<Mutex<PlayerState>>,
-    port: u16,
+    connected: Arc<AtomicBool>,
 }
 
 impl MpcWebBackend {
@@ -43,18 +45,21 @@ impl MpcWebBackend {
         let child = cmd.spawn().ok();
         let backend = Self {
             kind,
-            client: Client::new(),
+            client: Client::builder().timeout(MPC_HTTP_TIMEOUT).build()?,
             state: Arc::new(Mutex::new(PlayerState::default())),
-            port: DEFAULT_MPC_PORT,
+            connected: Arc::new(AtomicBool::new(true)),
         };
         Ok((backend, child))
     }
 
     fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        format!("http://127.0.0.1:{}", DEFAULT_MPC_PORT)
     }
 
     async fn get_variables(&self) -> anyhow::Result<String> {
+        if !self.connected.load(Ordering::SeqCst) {
+            anyhow::bail!("MPC web interface is disconnected");
+        }
         let url = format!("{}/variables.html", self.base_url());
         let response = self
             .client
@@ -67,6 +72,9 @@ impl MpcWebBackend {
     }
 
     async fn send_command(&self, command: u32, value: Option<&str>) -> anyhow::Result<()> {
+        if !self.connected.load(Ordering::SeqCst) {
+            anyhow::bail!("MPC web interface is disconnected");
+        }
         let mut url = format!("{}/command.html?wm_command={}", self.base_url(), command);
         if let Some(value) = value {
             url.push_str("&p1=");
@@ -130,7 +138,10 @@ impl PlayerBackend for MpcWebBackend {
                 let new_state = self.parse_variables(&text);
                 *self.state.lock() = new_state;
             }
-            Err(e) => warn!("Failed to read MPC variables: {}", e),
+            Err(e) => {
+                self.connected.store(false, Ordering::SeqCst);
+                warn!("Failed to read MPC variables: {}", e);
+            }
         }
         Ok(())
     }
@@ -169,6 +180,14 @@ impl PlayerBackend for MpcWebBackend {
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
-        self.send_command(MPC_CMD_CLOSEAPP, None).await
+        if self.connected.load(Ordering::SeqCst) {
+            let _ = self.send_command(MPC_CMD_CLOSEAPP, None).await;
+            self.connected.store(false, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
     }
 }

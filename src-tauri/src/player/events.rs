@@ -7,6 +7,10 @@ pub enum MpvPlayerEvent {
     PlaybackRestart,
     /// Playback has ended
     EndFile { reason: EndFileReason },
+    /// MPV reported it is quitting
+    Quit,
+    /// MPV IPC socket/stdout reader reached EOF or disconnected
+    SocketDisconnected,
     /// Log message from MPV
     LogMessage(String),
     /// Seek operation completed
@@ -44,6 +48,7 @@ impl MpvPlayerEvent {
                     .unwrap_or(EndFileReason::Unknown("none".to_string()));
                 Self::EndFile { reason: end_reason }
             }
+            "shutdown" | "quit" => Self::Quit,
             "seek" => Self::SeekCompleted,
             "property-change" => Self::PropertyChange,
             _ => Self::Unknown(name.to_string()),

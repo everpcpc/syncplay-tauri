@@ -118,6 +118,17 @@ impl MpvCommand {
         }
     }
 
+    pub fn loadfile_no_reply(path: &str, mode: &str) -> Self {
+        Self {
+            command: vec![
+                Value::String("loadfile".to_string()),
+                Value::String(path.to_string()),
+                Value::String(mode.to_string()),
+            ],
+            request_id: None,
+        }
+    }
+
     /// Create a seek command
     pub fn seek(position: f64, mode: &str, request_id: u64) -> Self {
         Self {

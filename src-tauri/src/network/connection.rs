@@ -28,6 +28,12 @@ enum ConnectionCommand {
         domain: String,
         response: oneshot::Sender<Result<TlsInfo>>,
     },
+    #[cfg(test)]
+    UpgradeTlsWithExtraRoots {
+        domain: String,
+        extra_roots: Vec<rustls::Certificate>,
+        response: oneshot::Sender<Result<TlsInfo>>,
+    },
     Disconnect,
 }
 
@@ -55,6 +61,42 @@ impl Transport {
         }
     }
 
+    #[cfg(test)]
+    async fn upgrade_tls_with_extra_roots(
+        &mut self,
+        domain: &str,
+        extra_roots: Vec<rustls::Certificate>,
+    ) -> Result<TlsInfo> {
+        match std::mem::replace(self, Transport::Empty) {
+            Transport::Plain(framed) => {
+                let framed = *framed;
+                let stream = framed.into_inner();
+                let connector = super::tls::create_tls_connector_with_extra_roots(extra_roots)?;
+                let domain = match domain.parse::<std::net::IpAddr>() {
+                    Ok(ip) => rustls::ServerName::IpAddress(ip),
+                    Err(_) => rustls::ServerName::try_from(domain)?,
+                };
+                let tls_stream = connector.connect(domain, stream).await?;
+                let protocol =
+                    tls_stream
+                        .get_ref()
+                        .1
+                        .protocol_version()
+                        .map(|version| match version {
+                            rustls::ProtocolVersion::TLSv1_2 => "TLSv1.2".to_string(),
+                            rustls::ProtocolVersion::TLSv1_3 => "TLSv1.3".to_string(),
+                            other => format!("{:?}", other),
+                        });
+                *self = Transport::Tls(Box::new(Framed::new(tls_stream, SyncplayCodec::new())));
+                Ok(TlsInfo { protocol })
+            }
+            Transport::Tls(framed) => {
+                *self = Transport::Tls(framed);
+                Ok(TlsInfo { protocol: None })
+            }
+            Transport::Empty => anyhow::bail!("Transport not initialized"),
+        }
+    }
     async fn upgrade_tls(&mut self, domain: &str) -> Result<TlsInfo> {
         match std::mem::replace(self, Transport::Empty) {
             Transport::Plain(framed) => {
@@ -75,19 +117,19 @@ impl Transport {
 
 /// Connection manager for Syncplay protocol
 pub struct Connection {
-    state: Mutex<ConnectionState>,
+    state: std::sync::Arc<Mutex<ConnectionState>>,
     host: Mutex<String>,
     port: Mutex<u16>,
-    tx: Mutex<Option<mpsc::UnboundedSender<ConnectionCommand>>>,
+    tx: std::sync::Arc<Mutex<Option<mpsc::UnboundedSender<ConnectionCommand>>>>,
 }
 
 impl Connection {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(ConnectionState::Disconnected),
+            state: std::sync::Arc::new(Mutex::new(ConnectionState::Disconnected)),
             host: Mutex::new(String::new()),
             port: Mutex::new(0),
-            tx: Mutex::new(None),
+            tx: std::sync::Arc::new(Mutex::new(None)),
         }
     }
 
@@ -131,6 +173,8 @@ impl Connection {
 
         *self.tx.lock() = Some(cmd_tx);
 
+        let state_ref = self.state.clone();
+        let tx_ref = self.tx.clone();
         tokio::spawn(async move {
             info!("Connection loop started");
             let mut idle_tick = tokio::time::interval(Duration::from_secs(10));
@@ -147,6 +191,11 @@ impl Connection {
                             }
                             ConnectionCommand::UpgradeTls { domain, response } => {
                                 let result = transport.upgrade_tls(&domain).await;
+                                let _ = response.send(result);
+                            }
+                            #[cfg(test)]
+                            ConnectionCommand::UpgradeTlsWithExtraRoots { domain, extra_roots, response } => {
+                                let result = transport.upgrade_tls_with_extra_roots(&domain, extra_roots).await;
                                 let _ = response.send(result);
                             }
                             ConnectionCommand::Disconnect => {
@@ -181,6 +230,8 @@ impl Connection {
                     }
                 }
             }
+            *tx_ref.lock() = None;
+            *state_ref.lock() = ConnectionState::Disconnected;
         });
 
         Ok((msg_rx, peer_address))
@@ -215,6 +266,69 @@ impl Connection {
         rx.await.context("TLS upgrade response dropped")?
     }
 
+    pub async fn upgrade_tls_with_timeout(&self, timeout_duration: Duration) -> Result<TlsInfo> {
+        self.upgrade_tls_with_timeout_and_extra_roots(
+            timeout_duration,
+            std::iter::empty::<rustls::Certificate>(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn upgrade_tls_with_timeout_and_extra_roots<I>(
+        &self,
+        timeout_duration: Duration,
+        extra_roots: I,
+    ) -> Result<TlsInfo>
+    where
+        I: IntoIterator<Item = rustls::Certificate> + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        let domain = self.host.lock().clone();
+        if let Some(cmd_tx) = self.tx.lock().as_ref() {
+            cmd_tx
+                .send(ConnectionCommand::UpgradeTlsWithExtraRoots {
+                    domain,
+                    extra_roots: extra_roots.into_iter().collect(),
+                    response: tx,
+                })
+                .context("Failed to send upgrade TLS command")?;
+        } else {
+            anyhow::bail!("Not connected");
+        }
+
+        tokio::time::timeout(timeout_duration, rx)
+            .await
+            .context("TLS upgrade timed out")?
+            .context("TLS upgrade response dropped")?
+    }
+
+    #[cfg(not(test))]
+    async fn upgrade_tls_with_timeout_and_extra_roots<I>(
+        &self,
+        timeout_duration: Duration,
+        _extra_roots: I,
+    ) -> Result<TlsInfo>
+    where
+        I: IntoIterator<Item = rustls::Certificate> + Send + 'static,
+    {
+        tokio::time::timeout(timeout_duration, self.upgrade_tls())
+            .await
+            .context("TLS upgrade timed out")?
+    }
+
+    #[cfg(test)]
+    async fn test_timeout_tls_future<Fut>(
+        future: Fut,
+        timeout_duration: Duration,
+    ) -> Result<TlsInfo>
+    where
+        Fut: std::future::Future<Output = Result<TlsInfo>>,
+    {
+        tokio::time::timeout(timeout_duration, future)
+            .await
+            .context("TLS upgrade timed out")?
+    }
     /// Disconnect from the server
     pub fn disconnect(&self) {
         info!("Disconnecting from server");
@@ -239,8 +353,255 @@ impl Connection {
     }
 }
 
-impl Default for Connection {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+mod tests {
+    use super::Connection;
+    use crate::network::fake_server::tls_fixture::FakeTlsSyncplayServer;
+    use crate::network::fake_server::FakeSyncplayServer;
+    use crate::network::messages::{HelloMessage, ProtocolMessage, RoomInfo};
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn tls_upgrade_helper_times_out_instead_of_hanging() {
+        let result = Connection::test_timeout_tls_future(
+            async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(crate::network::tls::TlsInfo { protocol: None })
+            },
+            Duration::from_millis(25),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn tls_accepted_branch_upgrades_and_exchanges_hello() {
+        let mut server = FakeTlsSyncplayServer::start().await.unwrap();
+        let connection = Connection::new();
+        let (mut receiver, _) = connection
+            .connect(server.host(), server.port())
+            .await
+            .unwrap();
+
+        connection
+            .send(ProtocolMessage::TLS {
+                TLS: crate::network::messages::TLSMessage {
+                    start_tls: Some("send".to_string()),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::TLS { .. }
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::TLS { TLS } if TLS.start_tls.as_deref() == Some("accepted")
+        ));
+
+        connection
+            .upgrade_tls_with_timeout_and_extra_roots(
+                Duration::from_secs(2),
+                [server.trusted_root()],
+            )
+            .await
+            .unwrap();
+
+        connection
+            .send(ProtocolMessage::Hello {
+                Hello: HelloMessage {
+                    username: "tester".to_string(),
+                    password: None,
+                    room: Some(RoomInfo {
+                        name: "room".to_string(),
+                        password: None,
+                    }),
+                    version: "1.2.255".to_string(),
+                    realversion: "1.7.5".to_string(),
+                    features: None,
+                    motd: None,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::Hello { .. }
+        ));
+
+        server
+            .send(FakeSyncplayServer::hello_response("tester", "room"))
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::Hello { .. }
+        ));
+        connection.disconnect();
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn fake_server_no_tls_state_exchange_close_and_reconnect() {
+        use crate::network::messages::{PingInfo, PlayState, StateMessage};
+
+        async fn connect_once(
+            server: &mut FakeSyncplayServer,
+        ) -> (Connection, mpsc::UnboundedReceiver<ProtocolMessage>) {
+            let connection = Connection::new();
+            let (receiver, _) = connection
+                .connect(server.host(), server.port())
+                .await
+                .unwrap();
+            connection
+                .send(ProtocolMessage::TLS {
+                    TLS: crate::network::messages::TLSMessage {
+                        start_tls: Some("send".to_string()),
+                    },
+                })
+                .unwrap();
+            let tls_request = timeout(Duration::from_secs(2), server.next_received())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(tls_request, ProtocolMessage::TLS { .. }));
+            server
+                .send(FakeSyncplayServer::tls_response("unsupported"))
+                .unwrap();
+            (connection, receiver)
+        }
+
+        let mut server1 = FakeSyncplayServer::start().await.unwrap();
+        let (connection1, mut receiver1) = connect_once(&mut server1).await;
+        assert!(matches!(
+            timeout(Duration::from_secs(2), receiver1.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::TLS { .. }
+        ));
+
+        for index in 0..3 {
+            server1
+                .send(ProtocolMessage::State {
+                    State: StateMessage {
+                        playstate: Some(PlayState {
+                            position: index as f64,
+                            paused: index == 0,
+                            do_seek: None,
+                            set_by: Some("server".to_string()),
+                        }),
+                        ping: Some(PingInfo {
+                            latency_calculation: Some(index as f64 + 0.5),
+                            client_latency_calculation: None,
+                            client_rtt: None,
+                            server_rtt: Some(0.01),
+                        }),
+                        ignoring_on_the_fly: None,
+                    },
+                })
+                .unwrap();
+            assert!(matches!(
+                timeout(Duration::from_secs(2), receiver1.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                ProtocolMessage::State { .. }
+            ));
+        }
+
+        server1.close();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if receiver1.recv().await.is_none() {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        connection1.disconnect();
+
+        let mut server2 = FakeSyncplayServer::start().await.unwrap();
+        let (connection2, mut receiver2) = connect_once(&mut server2).await;
+        assert!(matches!(
+            timeout(Duration::from_secs(2), receiver2.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::TLS { .. }
+        ));
+        connection2.disconnect();
+    }
+    #[tokio::test]
+    async fn connection_exchanges_messages_with_fake_syncplay_server() {
+        let mut server = FakeSyncplayServer::start().await.unwrap();
+        let connection = Connection::new();
+        let (mut receiver, peer_address) = connection
+            .connect(server.host(), server.port())
+            .await
+            .unwrap();
+
+        assert_eq!(peer_address.as_deref(), Some("127.0.0.1"));
+        assert!(connection.is_connected());
+
+        let hello = ProtocolMessage::Hello {
+            Hello: HelloMessage {
+                username: "tester".to_string(),
+                password: None,
+                room: Some(RoomInfo {
+                    name: "room".to_string(),
+                    password: None,
+                }),
+                version: "1.2.255".to_string(),
+                realversion: "1.7.5".to_string(),
+                features: None,
+                motd: None,
+            },
+        };
+        connection.send(hello).unwrap();
+
+        let received = timeout(Duration::from_secs(2), server.next_received())
+            .await
+            .unwrap()
+            .unwrap();
+        match received {
+            ProtocolMessage::Hello { Hello } => {
+                assert_eq!(Hello.username, "tester");
+                assert_eq!(Hello.room.unwrap().name, "room");
+            }
+            other => panic!("expected Hello from client, got {other:?}"),
+        }
+
+        server
+            .send(FakeSyncplayServer::hello_response("tester", "room"))
+            .unwrap();
+        let response = timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match response {
+            ProtocolMessage::Hello { Hello } => {
+                assert_eq!(Hello.username, "tester");
+                assert_eq!(Hello.room.unwrap().name, "room");
+            }
+            other => panic!("expected Hello from fake server, got {other:?}"),
+        }
+
+        connection.disconnect();
+        assert!(!connection.is_connected());
     }
 }

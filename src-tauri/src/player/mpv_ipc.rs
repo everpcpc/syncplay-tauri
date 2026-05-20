@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 #[cfg(windows)]
@@ -20,6 +21,7 @@ use super::properties::{PlayerState, PropertyId};
 
 const MPV_SENDMESSAGE_COOLDOWN_TIME: Duration = Duration::from_millis(50);
 const MPV_MAX_NEWFILE_COOLDOWN_TIME: Duration = Duration::from_secs(3);
+const MPV_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_millis(750);
 
 enum QueueMessage {
     Command(MpvCommand),
@@ -86,6 +88,7 @@ impl MpvIpc {
         let pending_requests = Arc::clone(&self.pending_requests);
         let last_position_update = Arc::clone(&self.last_position_update);
 
+        let write_event_tx = event_tx.clone();
         // Spawn write task
         tokio::spawn(async move {
             let mut write_half = write_half;
@@ -107,6 +110,7 @@ impl MpvIpc {
                     break;
                 }
             }
+            let _ = write_event_tx.send(MpvPlayerEvent::SocketDisconnected);
             debug!("MPV write task terminated");
         });
 
@@ -152,6 +156,7 @@ impl MpvIpc {
             }
         });
 
+        let read_event_tx = event_tx.clone();
         // Spawn read task
         tokio::spawn(async move {
             let mut lines = reader.lines();
@@ -209,6 +214,8 @@ impl MpvIpc {
                     }
                 }
             }
+            pending_requests.lock().clear();
+            let _ = read_event_tx.send(MpvPlayerEvent::SocketDisconnected);
             debug!("MPV read task terminated");
         });
 
@@ -266,7 +273,20 @@ impl MpvIpc {
 
         for prop in properties {
             let cmd = MpvCommand::get_property(prop.property_name(), 0);
-            let response = self.send_command_async(cmd).await?;
+            let response = match self.send_command_async(cmd).await {
+                Ok(response) => response,
+                Err(err) => {
+                    warn!(
+                        "Failed to refresh mpv property {}: {}",
+                        prop.property_name(),
+                        err
+                    );
+                    if prop == PropertyId::Duration {
+                        duration_missing = true;
+                    }
+                    continue;
+                }
+            };
             if let Some(data) = response.data {
                 if prop == PropertyId::Duration && data.is_null() {
                     duration_missing = true;
@@ -320,8 +340,11 @@ impl MpvIpc {
         }
     }
 
-    /// Send a command and wait for response
-    pub async fn send_command_async(&self, mut cmd: MpvCommand) -> Result<MpvResponse> {
+    async fn send_command_async_with_timeout(
+        &self,
+        mut cmd: MpvCommand,
+        timeout_duration: Duration,
+    ) -> Result<MpvResponse> {
         let request_id = {
             let mut id = self.next_request_id.lock();
             let current = *id;
@@ -334,9 +357,28 @@ impl MpvIpc {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_requests.lock().insert(request_id, tx);
 
-        self.send_command(cmd)?;
+        if let Err(err) = self.send_command(cmd) {
+            self.pending_requests.lock().remove(&request_id);
+            return Err(err);
+        }
 
-        rx.await.context("Failed to receive response from MPV")
+        match timeout(timeout_duration, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(err)) => {
+                self.pending_requests.lock().remove(&request_id);
+                Err(err).context("Failed to receive response from MPV")
+            }
+            Err(_) => {
+                self.pending_requests.lock().remove(&request_id);
+                anyhow::bail!("Timed out waiting for MPV response")
+            }
+        }
+    }
+
+    /// Send a command and wait for response
+    pub async fn send_command_async(&self, cmd: MpvCommand) -> Result<MpvResponse> {
+        self.send_command_async_with_timeout(cmd, MPV_COMMAND_RESPONSE_TIMEOUT)
+            .await
     }
 
     /// Get current player state
@@ -399,8 +441,8 @@ impl MpvIpc {
 
     /// Load a file
     pub async fn load_file(&self, path: &str) -> Result<()> {
-        let cmd = MpvCommand::loadfile(path, "replace", 0);
-        self.send_command_async(cmd).await?;
+        let cmd = MpvCommand::loadfile_no_reply(path, "replace");
+        self.send_command(cmd)?;
         Ok(())
     }
 

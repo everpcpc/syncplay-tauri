@@ -155,6 +155,10 @@ mod win {
             self.mpc_handle.store(hwnd.0 as isize, Ordering::SeqCst);
         }
 
+        pub fn clear_mpc_handle(&self) {
+            self.mpc_handle.store(0, Ordering::SeqCst);
+        }
+
         pub fn mpc_handle_raw(&self) -> Option<isize> {
             let raw = self.mpc_handle.load(Ordering::SeqCst);
             if raw == 0 {
@@ -368,7 +372,7 @@ mod win {
 #[cfg(not(windows))]
 mod win {
     use super::*;
-    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::mpsc::{self, Receiver};
 
     #[derive(Debug)]
     pub enum MpcEvent {}
@@ -417,7 +421,7 @@ pub struct MpcApiBackend {
     kind: PlayerKind,
     state: Arc<Mutex<PlayerState>>,
     listener: MpcListener,
-    file_ready: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     switch_pause_calls: Arc<AtomicBool>,
     version: Arc<Mutex<Option<String>>>,
     position_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -453,7 +457,7 @@ impl MpcApiBackend {
         let child = cmd.spawn().ok();
 
         let state = Arc::new(Mutex::new(PlayerState::default()));
-        let file_ready = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(AtomicBool::new(false));
         let switch_pause_calls = Arc::new(AtomicBool::new(false));
         let version = Arc::new(Mutex::new(None));
         let position_waiter = Arc::new(Mutex::new(None));
@@ -463,7 +467,7 @@ impl MpcApiBackend {
             event_rx,
             listener_hwnd: listener.hwnd_raw(),
             state: state.clone(),
-            file_ready: file_ready.clone(),
+            connected: connected.clone(),
             switch_pause_calls: switch_pause_calls.clone(),
             version: version.clone(),
             position_waiter: position_waiter.clone(),
@@ -474,7 +478,7 @@ impl MpcApiBackend {
             kind,
             state,
             listener,
-            file_ready,
+            connected,
             switch_pause_calls,
             version,
             position_waiter,
@@ -532,7 +536,16 @@ impl MpcApiBackend {
     }
 
     fn file_ready(&self) -> bool {
-        self.file_ready.load(Ordering::SeqCst)
+        self.connected()
+    }
+
+    fn connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    fn mark_disconnected(&self) {
+        self.connected.store(false, Ordering::SeqCst);
+        self.listener.clear_mpc_handle();
     }
 
     fn send_osd(&self, message: &str, duration_ms: i32) -> anyhow::Result<()> {
@@ -548,8 +561,14 @@ impl MpcApiBackend {
 
     fn send_command_retry(&self, cmd: u32, payload: Option<CommandPayload>) -> anyhow::Result<()> {
         for _ in 0..MPC_MAX_RETRIES {
-            if self.file_ready() && self.listener.send_command(cmd, payload.clone()).is_ok() {
-                return Ok(());
+            if self.file_ready() {
+                match self.listener.send_command(cmd, payload.clone()) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        self.mark_disconnected();
+                        return Err(e);
+                    }
+                }
             }
             std::thread::sleep(MPC_RETRY_WAIT_TIME);
         }
@@ -622,18 +641,30 @@ impl PlayerBackend for MpcApiBackend {
 
     async fn load_file(&self, path: &str) -> anyhow::Result<()> {
         self.listener
-            .send_command(CMD_OPENFILE, Some(CommandPayload::Text(path.to_string())))?;
+            .send_command(CMD_OPENFILE, Some(CommandPayload::Text(path.to_string())))
+            .map_err(|e| {
+                self.mark_disconnected();
+                e
+            })?;
         Ok(())
     }
 
     fn show_osd(&self, text: &str, duration_ms: Option<u64>) -> anyhow::Result<()> {
         let duration = duration_ms.unwrap_or(3000) as i32;
-        self.send_osd(text, duration)
+        self.send_osd(text, duration).map_err(|e| {
+            self.mark_disconnected();
+            e
+        })
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
         let _ = self.listener.send_command(CMD_CLOSEAPP, None);
+        self.mark_disconnected();
         Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected()
     }
 }
 
@@ -642,7 +673,7 @@ struct EventLoopArgs {
     event_rx: std::sync::mpsc::Receiver<MpcEvent>,
     listener_hwnd: isize,
     state: Arc<Mutex<PlayerState>>,
-    file_ready: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     switch_pause_calls: Arc<AtomicBool>,
     version: Arc<Mutex<Option<String>>>,
     position_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -655,7 +686,7 @@ fn spawn_event_loop(args: EventLoopArgs) {
         event_rx,
         listener_hwnd,
         state,
-        file_ready,
+        connected,
         switch_pause_calls,
         version,
         position_waiter,
@@ -665,11 +696,12 @@ fn spawn_event_loop(args: EventLoopArgs) {
         for event in event_rx {
             match event {
                 MpcEvent::Connected(hwnd) => {
+                    connected.store(true, Ordering::SeqCst);
                     debug!("MPC connected: {} (listener {})", hwnd, listener_hwnd);
                 }
                 MpcEvent::LoadState(state_code) => {
                     let ready = !matches!(state_code, 0 | 1 | 3);
-                    file_ready.store(ready, Ordering::SeqCst);
+                    connected.store(ready, Ordering::SeqCst);
                     if !ready {
                         let mut guard = state.lock();
                         guard.paused = None;
@@ -711,7 +743,7 @@ fn spawn_event_loop(args: EventLoopArgs) {
                 }
                 MpcEvent::Disconnected => {
                     warn!("MPC disconnected");
-                    file_ready.store(false, Ordering::SeqCst);
+                    connected.store(false, Ordering::SeqCst);
                 }
             }
         }
@@ -839,8 +871,11 @@ impl PlayerBackend for MpcApiBackend {
     fn show_osd(&self, _text: &str, _duration_ms: Option<u64>) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("MPC backend is only supported on Windows"))
     }
-}
 
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::{mpc_filename_from_path, split_mpc_fields};

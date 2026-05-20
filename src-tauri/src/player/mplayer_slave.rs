@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -11,6 +12,7 @@ use tracing::{debug, info, warn};
 use super::backend::{PlayerBackend, PlayerKind};
 use super::properties::PlayerState;
 
+const MPLAYER_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 const MPLAYER_ARGS: &[&str] = &[
     "-slave",
     "--hr-seek=always",
@@ -33,8 +35,9 @@ enum ResponseKey {
 
 pub struct MplayerBackend {
     kind: PlayerKind,
-    stdin: Arc<TokioMutex<ChildStdin>>,
+    stdin: Arc<TokioMutex<Option<ChildStdin>>>,
     state: Arc<Mutex<PlayerState>>,
+    connected: Arc<AtomicBool>,
 }
 
 impl MplayerBackend {
@@ -81,7 +84,9 @@ impl MplayerBackend {
             .context("Failed to capture MPlayer stdout")?;
 
         let state = Arc::new(Mutex::new(PlayerState::default()));
+        let connected = Arc::new(AtomicBool::new(true));
         let state_clone = state.clone();
+        let connected_clone = connected.clone();
 
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -91,12 +96,14 @@ impl MplayerBackend {
                 }
                 handle_line(&state_clone, &line);
             }
+            connected_clone.store(false, Ordering::SeqCst);
         });
 
         let backend = Self {
             kind: PlayerKind::Mplayer,
-            stdin: Arc::new(TokioMutex::new(stdin)),
+            stdin: Arc::new(TokioMutex::new(Some(stdin))),
             state,
+            connected,
         };
 
         if let Some(path) = delayed_file {
@@ -107,12 +114,44 @@ impl MplayerBackend {
     }
 
     async fn send_command(&self, command: &str) -> anyhow::Result<()> {
+        if !self.connected.load(Ordering::SeqCst) {
+            anyhow::bail!("MPlayer slave pipe is disconnected");
+        }
         let mut guard = self.stdin.lock().await;
-        guard
-            .write_all(format!("{}\n", command).as_bytes())
-            .await
-            .context("Failed to write to MPlayer")?;
-        guard.flush().await.context("Failed to flush MPlayer")?;
+        let Some(stdin) = guard.as_mut() else {
+            self.connected.store(false, Ordering::SeqCst);
+            anyhow::bail!("MPlayer slave pipe is disconnected");
+        };
+        match tokio::time::timeout(MPLAYER_COMMAND_TIMEOUT, async {
+            stdin.write_all(format!("{}\n", command).as_bytes()).await?;
+            stdin.flush().await
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.connected.store(false, Ordering::SeqCst);
+                *guard = None;
+                Err(e.into())
+            }
+            Err(_) => {
+                self.connected.store(false, Ordering::SeqCst);
+                *guard = None;
+                anyhow::bail!("Timed out writing to MPlayer slave pipe")
+            }
+        }
+    }
+
+    async fn close(&self) -> anyhow::Result<()> {
+        self.connected.store(false, Ordering::SeqCst);
+        let mut guard = self.stdin.lock().await;
+        if let Some(mut stdin) = guard.take() {
+            let _ = tokio::time::timeout(MPLAYER_COMMAND_TIMEOUT, async {
+                let _ = stdin.write_all(b"quit\n").await;
+                stdin.shutdown().await
+            })
+            .await;
+        }
         Ok(())
     }
 }
@@ -235,14 +274,20 @@ impl PlayerBackend for MplayerBackend {
         let stdin = self.stdin.clone();
         tokio::spawn(async move {
             let mut guard = stdin.lock().await;
-            let _ = guard.write_all(format!("{}\n", cmd).as_bytes()).await;
-            let _ = guard.flush().await;
+            if let Some(stdin) = guard.as_mut() {
+                let _ = stdin.write_all(format!("{}\n", cmd).as_bytes()).await;
+                let _ = stdin.flush().await;
+            }
         });
         Ok(())
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
-        self.send_command("quit").await
+        self.close().await
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
     }
 }
 

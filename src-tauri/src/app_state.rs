@@ -54,6 +54,8 @@ pub struct AppState {
     pub last_state_message_sent: Arc<Mutex<Option<Instant>>>,
     /// Last time we established a connection
     pub last_connect_time: Arc<Mutex<Option<Instant>>>,
+    /// Last time any protocol message was received
+    pub last_protocol_activity: Arc<Mutex<Option<Instant>>>,
     /// Latest local playback state
     pub local_playback_state: Arc<Mutex<LocalPlaybackState>>,
     /// Ignoring-on-the-fly counters
@@ -96,6 +98,9 @@ pub struct AppState {
     pub mpv_runtime_dir: Arc<Mutex<Option<TempDir>>>,
     /// Cached MPV IPC socket path
     pub mpv_socket_path: Arc<Mutex<Option<String>>>,
+    /// Test-only fake player launcher used by lifecycle regression tests.
+    #[cfg(test)]
+    pub fake_player_factory: Arc<Mutex<Option<Arc<crate::player::backend::FakePlayerFactory>>>>,
     /// Cached detected players
     pub detected_players: Arc<Mutex<Vec<crate::player::detection::DetectedPlayer>>>,
     /// Timestamp (ms) when players were detected
@@ -168,6 +173,7 @@ impl AppState {
             last_global_update: Arc::new(Mutex::new(None)),
             last_state_message_sent: Arc::new(Mutex::new(None)),
             last_connect_time: Arc::new(Mutex::new(None)),
+            last_protocol_activity: Arc::new(Mutex::new(None)),
             local_playback_state: Arc::new(Mutex::new(LocalPlaybackState::new())),
             ignoring_on_the_fly: Arc::new(Mutex::new(IgnoringOnTheFlyState::default())),
             server_features: Arc::new(Mutex::new(ServerFeatures::default())),
@@ -189,6 +195,8 @@ impl AppState {
             mpv_runtime_dir: Arc::new(Mutex::new(None)),
             mpv_socket_path: Arc::new(Mutex::new(None)),
             player_connecting: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
+            fake_player_factory: Arc::new(Mutex::new(None)),
             detected_players: Arc::new(Mutex::new(Vec::new())),
             detected_players_updated_at: Arc::new(Mutex::new(None)),
             controlled_room_passwords: Arc::new(Mutex::new(HashMap::new())),
@@ -224,7 +232,11 @@ impl AppState {
 
     /// Check if player is connected
     pub fn is_player_connected(&self) -> bool {
-        self.player.lock().is_some()
+        self.player
+            .lock()
+            .as_ref()
+            .map(|player| player.is_connected())
+            .unwrap_or(false)
     }
 }
 
@@ -249,6 +261,7 @@ impl Default for AppState {
             last_global_update: Arc::new(Mutex::new(None)),
             last_state_message_sent: Arc::new(Mutex::new(None)),
             last_connect_time: Arc::new(Mutex::new(None)),
+            last_protocol_activity: Arc::new(Mutex::new(None)),
             local_playback_state: Arc::new(Mutex::new(LocalPlaybackState::new())),
             ignoring_on_the_fly: Arc::new(Mutex::new(IgnoringOnTheFlyState::default())),
             server_features: Arc::new(Mutex::new(ServerFeatures::default())),
@@ -270,6 +283,8 @@ impl Default for AppState {
             mpv_runtime_dir: Arc::new(Mutex::new(None)),
             mpv_socket_path: Arc::new(Mutex::new(None)),
             player_connecting: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
+            fake_player_factory: Arc::new(Mutex::new(None)),
             detected_players: Arc::new(Mutex::new(Vec::new())),
             detected_players_updated_at: Arc::new(Mutex::new(None)),
             controlled_room_passwords: Arc::new(Mutex::new(HashMap::new())),
