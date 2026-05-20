@@ -458,13 +458,23 @@ async fn handle_syncplayintf_line(
                 for delay in [50_u64, 150, 300] {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     let before_refresh = ipc.get_state();
-                    let refresh_result = ipc.refresh_state().await;
+                    let before_duration = before_refresh.duration;
+                    let refresh_result = timeout(Duration::from_millis(1200), ipc.refresh_state()).await;
                     let mut stable = ipc.get_state();
-                    if refresh_result.is_err() {
-                        stable = before_refresh;
-                    } else if let Some(duration) = before_refresh.duration {
-                        if stable.duration == Some(0.0) {
-                            stable.duration = Some(duration);
+                    match refresh_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            warn!("Failed to refresh mpv properties: {}", err);
+                            stable = before_refresh;
+                        }
+                        Err(err) => {
+                            warn!("Timed out refreshing mpv properties: {}", err);
+                            stable = before_refresh;
+                        }
+                    }
+                    if stable.duration == Some(0.0) {
+                        stable.duration = before_duration;
+                        if let Some(duration) = stable.duration {
                             ipc.update_from_term_playing_message("duration", &duration.to_string());
                         }
                     }
@@ -910,7 +920,7 @@ mod tests {
             )
             .await;
 
-            let outbound = timeout(Duration::from_secs(2), async {
+            let outbound = timeout(Duration::from_secs(5), async {
                 loop {
                     if let Some(ProtocolMessage::Set { Set }) = server.next_received().await {
                         if Set.file.is_some() {
