@@ -947,7 +947,7 @@ mod tests {
             assert_eq!(outbound.name.as_deref(), Some("**Hidden filename**"));
             assert!(matches!(outbound.size, Some(FileSizeInfo::Number(0))));
             assert_eq!(outbound.duration, Some(123.5));
-            assert_eq!(app_state.client_state.get_global_state().paused, true);
+            assert!(app_state.client_state.get_global_state().paused);
         });
     }
 
