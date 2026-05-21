@@ -12,7 +12,7 @@ mod utils;
 use app_state::AppState;
 #[cfg(target_os = "macos")]
 use tauri::utils::TitleBarStyle;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use tauri::Manager;
 #[cfg(windows)]
 use tauri_plugin_frame::FramePluginBuilder;
