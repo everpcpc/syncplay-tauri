@@ -22,7 +22,7 @@
       {
         "label": "main",
         "fullscreen": false,
-        "decorations": false,
+        "decorations": true,
         "resizable": true,
         "title": "Syncplay",
         "width": 1200,
