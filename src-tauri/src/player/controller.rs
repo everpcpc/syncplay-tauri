@@ -227,14 +227,7 @@ pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String
         }
         PlayerKind::MpcHc | PlayerKind::MpcBe => {
             let (backend, child) = if should_spawn {
-                let mut mpc_args = args.clone();
-                if !mpc_args.iter().any(|arg| arg.eq_ignore_ascii_case("/open")) {
-                    mpc_args.push("/open".to_string());
-                }
-                if !mpc_args.iter().any(|arg| arg.eq_ignore_ascii_case("/new")) {
-                    mpc_args.push("/new".to_string());
-                }
-                MpcApiBackend::start(kind, &player_path, &mpc_args, None)
+                MpcApiBackend::start(kind, &player_path, &args, None)
                     .await
                     .map_err(|e| e.to_string())?
             } else {

@@ -4,7 +4,6 @@ import {
   LuChevronRight,
   LuFolder,
   LuListMusic,
-  LuPause,
   LuPlay,
   LuPlus,
   LuRefreshCw,
@@ -212,18 +211,6 @@ export function PlaylistPanel() {
     if (!value) return "";
     const base = value.split(/[/\\\\]/).pop() || value;
     return base.trim().toLowerCase();
-  };
-
-  const formatTime = (seconds: number | null) => {
-    if (seconds === null) return "--:--";
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${mins}:${secs.toString().padStart(2, "0")}`;
-  };
-
-  const formatSpeed = (speed: number | null) => {
-    if (speed === null || speed === 1.0) return "";
-    return `${speed.toFixed(2)}x`;
   };
 
   const formatLastScan = (timestamp: number) => {
@@ -645,31 +632,6 @@ export function PlaylistPanel() {
                 <LuFolder className="app-icon" />
               </button>
             </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-3 text-sm">
-            <button
-              type="button"
-              disabled
-              className="btn-neutral app-icon-button disabled:opacity-100 disabled:cursor-default"
-              aria-label={player.paused ? "Paused" : "Playing"}
-            >
-              {player.paused ? (
-                <LuPause className="app-icon app-text-warning" />
-              ) : (
-                <LuPlay className="app-icon" />
-              )}
-            </button>
-            {player.position !== null && player.duration !== null && (
-              <span className="font-mono text-xs">
-                {formatTime(player.position)}/{formatTime(player.duration)}
-              </span>
-            )}
-            <span className="font-medium truncate max-w-xs">
-              {player.filename || "No file loaded"}
-            </span>
-            {formatSpeed(player.speed) && (
-              <span className="app-text-warning">{formatSpeed(player.speed)}</span>
-            )}
           </div>
         </div>
       </div>

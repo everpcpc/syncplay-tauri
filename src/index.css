@@ -739,7 +739,7 @@ body {
 /* Platform-specific: Windows */
 [data-platform="windows"] {
   /* Tauri does not always expose the overlay control width on Windows.
-     Reserve the native minimize/maximize/close area so header buttons stay clickable. */
+     Reserve the minimize/maximize/close area so header buttons stay clickable. */
   --tauri-frame-controls-width: 138px;
 }
 
