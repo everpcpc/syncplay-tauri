@@ -128,41 +128,6 @@ function AppHeader({
       data-tauri-drag-region
       onMouseDown={onMouseDown}
     >
-      {(appVersion || updateVersion) && (
-        <div
-          className="absolute top-2 z-10 flex items-center gap-2 app-header-actions"
-          data-tauri-drag-region="false"
-          style={{ right: "calc(16px + var(--tauri-frame-controls-width, 0px))" }}
-        >
-          {appVersion && (
-            <div
-              className="text-xs app-tag-muted px-2.5 py-1 rounded-full"
-              aria-label={`Version ${appVersion}`}
-              title={`Version ${appVersion}`}
-            >
-              v{appVersion}
-            </div>
-          )}
-          {updateVersion && (
-            <button
-              onClick={onInstallUpdate}
-              disabled={isInstallingUpdate}
-              className="btn-primary px-3 py-1.5 text-xs"
-              data-tauri-drag-region="false"
-              aria-label={`Update available: ${updateVersion}`}
-              title={
-                isInstallingUpdate && updateProgress
-                  ? `Installing ${updateVersion}: ${formatBytes(updateProgress.downloaded)}${
-                      updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""
-                    }`
-                  : `Install update ${updateVersion}`
-              }
-            >
-              {isInstallingUpdate ? "Installing..." : "Update"}
-            </button>
-          )}
-        </div>
-      )}
       <div className="app-header-row">
         <PlayerStatus />
         <div className="app-header-actions w-full" data-tauri-drag-region="false">
@@ -220,7 +185,7 @@ function AppHeader({
           <div className="flex items-center gap-2 ml-auto">
             {connected && rttLabel && (
               <div
-                className="flex items-center gap-2 app-panel-muted px-2.5 py-1 rounded-full text-xs"
+                className="flex items-center gap-2 app-panel-muted px-2 py-1 rounded-full text-xs"
                 aria-label={`RTT ${rttLabel}`}
                 title={`RTT ${rttLabel}`}
               >
@@ -230,11 +195,38 @@ function AppHeader({
             )}
             {showTls && (
               <div
-                className="flex items-center justify-center px-2 py-1 rounded text-xs app-panel-muted app-tooltip"
+                className="inline-flex items-center justify-center px-2 py-1 rounded-lg text-xs app-panel-muted app-tooltip shrink-0"
                 aria-label="TLS enabled"
               >
                 <LuLock className="app-icon" />
               </div>
+            )}
+            {appVersion && (
+              <div
+                className="inline-flex items-center justify-center px-2 py-1 rounded-lg text-xs app-panel-muted shrink-0"
+                aria-label={`Version ${appVersion}`}
+                title={`Version ${appVersion}`}
+              >
+                v{appVersion}
+              </div>
+            )}
+            {updateVersion && (
+              <button
+                onClick={onInstallUpdate}
+                disabled={isInstallingUpdate}
+                className="inline-flex items-center px-2 py-1 rounded-lg text-xs app-panel-muted shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
+                data-tauri-drag-region="false"
+                aria-label={`Update available: ${updateVersion}`}
+                title={
+                  isInstallingUpdate && updateProgress
+                    ? `Installing ${updateVersion}: ${formatBytes(updateProgress.downloaded)}${
+                        updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""
+                      }`
+                    : `Install update ${updateVersion}`
+                }
+              >
+                {isInstallingUpdate ? "Installing..." : "Update"}
+              </button>
             )}
             <button
               onClick={onOpenConnection}
