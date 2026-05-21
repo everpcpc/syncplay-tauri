@@ -1,3 +1,4 @@
+import { LuPause, LuPlay } from "react-icons/lu";
 import { useSyncplayStore } from "../../store";
 
 const formatTime = (seconds: number | null) => {
@@ -11,8 +12,13 @@ const formatTime = (seconds: number | null) => {
 };
 
 const displayFilename = (filename: string | null) => {
-  if (!filename) return "No file";
+  if (!filename) return "No file loaded";
   return filename.split(/[/\\]/).pop() || filename;
+};
+
+const formatSpeed = (speed: number | null) => {
+  if (speed === null || speed === 1.0) return "";
+  return `${speed.toFixed(2)}x`;
 };
 
 export function PlayerStatus() {
@@ -27,20 +33,32 @@ export function PlayerStatus() {
     );
   }
 
-  const speedLabel = player.speed && player.speed !== 1 ? `${player.speed.toFixed(2)}x` : null;
+  const speedLabel = formatSpeed(player.speed);
 
   return (
-    <div className="flex items-center gap-3 min-w-0 text-sm">
-      <span className="app-text-accent shrink-0">{player.paused ? "Paused" : "Playing"}</span>
-      <span className="truncate max-w-[28vw]" title={player.filename ?? undefined}>
+    <div className="flex flex-wrap items-center gap-3 text-sm min-w-0">
+      <button
+        type="button"
+        disabled
+        className="btn-neutral app-icon-button disabled:opacity-100 disabled:cursor-default shrink-0"
+        aria-label={player.paused ? "Paused" : "Playing"}
+        title={player.paused ? "Paused" : "Playing"}
+      >
+        {player.paused ? (
+          <LuPause className="app-icon app-text-warning" />
+        ) : (
+          <LuPlay className="app-icon" />
+        )}
+      </button>
+      {player.position !== null && player.duration !== null && (
+        <span className="font-mono text-xs shrink-0">
+          {formatTime(player.position)}/{formatTime(player.duration)}
+        </span>
+      )}
+      <span className="font-medium truncate max-w-[28vw]" title={player.filename ?? undefined}>
         {displayFilename(player.filename)}
       </span>
-      <span className="app-text-muted font-mono shrink-0">
-        {formatTime(player.position)} / {formatTime(player.duration)}
-      </span>
-      {speedLabel && (
-        <span className="app-tag-muted px-2 py-0.5 rounded shrink-0">{speedLabel}</span>
-      )}
+      {speedLabel && <span className="app-text-warning shrink-0">{speedLabel}</span>}
       {connection.server && (
         <span className="app-text-muted truncate max-w-[18vw]" title={connection.server}>
           {connection.server}
