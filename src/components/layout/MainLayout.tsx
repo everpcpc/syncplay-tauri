@@ -185,7 +185,7 @@ function AppHeader({
           <div className="flex items-center gap-2 ml-auto">
             {connected && rttLabel && (
               <div
-                className="flex items-center gap-2 app-panel-muted px-2.5 py-1.5 rounded-full text-xs"
+                className="flex items-center gap-2 app-panel-muted px-2 py-1 rounded-full text-xs"
                 aria-label={`RTT ${rttLabel}`}
                 title={`RTT ${rttLabel}`}
               >
@@ -195,7 +195,7 @@ function AppHeader({
             )}
             {showTls && (
               <div
-                className="inline-flex items-center justify-center px-2.5 py-1.5 rounded-md text-xs app-panel-muted app-tooltip shrink-0"
+                className="inline-flex items-center justify-center px-2 py-1 rounded-lg text-xs app-panel-muted app-tooltip shrink-0"
                 aria-label="TLS enabled"
               >
                 <LuLock className="app-icon" />
@@ -203,7 +203,7 @@ function AppHeader({
             )}
             {appVersion && (
               <div
-                className="inline-flex items-center justify-center px-2.5 py-1.5 rounded-md text-xs app-panel-muted shrink-0"
+                className="inline-flex items-center justify-center px-2 py-1 rounded-lg text-xs app-panel-muted shrink-0"
                 aria-label={`Version ${appVersion}`}
                 title={`Version ${appVersion}`}
               >
@@ -214,7 +214,7 @@ function AppHeader({
               <button
                 onClick={onInstallUpdate}
                 disabled={isInstallingUpdate}
-                className="inline-flex items-center px-3 py-1.5 rounded-md text-xs app-panel-muted shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
+                className="inline-flex items-center px-2 py-1 rounded-lg text-xs app-panel-muted shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
                 data-tauri-drag-region="false"
                 aria-label={`Update available: ${updateVersion}`}
                 title={
