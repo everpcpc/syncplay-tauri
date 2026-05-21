@@ -59,7 +59,10 @@ fn main() {
             {
                 if let Some(window) = app.get_webview_window("main") {
                     if let Err(err) = window.set_decorations(false) {
-                        tracing::warn!("Failed to disable window decorations on Windows: {}", err);
+                        tracing::warn!(
+                            "Failed to disable native window decorations on Windows: {}",
+                            err
+                        );
                     }
                 }
             }

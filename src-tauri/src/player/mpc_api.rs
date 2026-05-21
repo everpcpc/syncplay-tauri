@@ -422,6 +422,7 @@ pub struct MpcApiBackend {
     state: Arc<Mutex<PlayerState>>,
     listener: MpcListener,
     connected: Arc<AtomicBool>,
+    file_ready: Arc<AtomicBool>,
     switch_pause_calls: Arc<AtomicBool>,
     version: Arc<Mutex<Option<String>>>,
     position_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -443,14 +444,8 @@ impl MpcApiBackend {
         let (listener, event_rx) = start_listener()?;
 
         let mut cmd = Command::new(player_path);
-        let mut full_args = Vec::new();
-        full_args.extend(args.iter().cloned());
-        full_args.push("/slave".to_string());
-        full_args.push(listener.hwnd_raw().to_string());
+        let full_args = mpc_startup_arguments(args, listener.hwnd_raw());
         cmd.args(&full_args);
-        if let Some(path) = initial_file {
-            cmd.arg(path);
-        }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -458,6 +453,7 @@ impl MpcApiBackend {
 
         let state = Arc::new(Mutex::new(PlayerState::default()));
         let connected = Arc::new(AtomicBool::new(false));
+        let file_ready = Arc::new(AtomicBool::new(false));
         let switch_pause_calls = Arc::new(AtomicBool::new(false));
         let version = Arc::new(Mutex::new(None));
         let position_waiter = Arc::new(Mutex::new(None));
@@ -468,6 +464,7 @@ impl MpcApiBackend {
             listener_hwnd: listener.hwnd_raw(),
             state: state.clone(),
             connected: connected.clone(),
+            file_ready: file_ready.clone(),
             switch_pause_calls: switch_pause_calls.clone(),
             version: version.clone(),
             position_waiter: position_waiter.clone(),
@@ -479,6 +476,7 @@ impl MpcApiBackend {
             state,
             listener,
             connected,
+            file_ready,
             switch_pause_calls,
             version,
             position_waiter,
@@ -487,8 +485,16 @@ impl MpcApiBackend {
 
         backend.wait_for_connect().await?;
         backend.check_version().await?;
+        if let Some(path) = initial_file {
+            backend.load_initial_file(path)?;
+        }
 
         Ok((backend, child))
+    }
+
+    fn load_initial_file(&self, path: &str) -> anyhow::Result<()> {
+        self.listener
+            .send_command(CMD_OPENFILE, Some(CommandPayload::Text(path.to_string())))
     }
 
     async fn wait_for_connect(&self) -> anyhow::Result<()> {
@@ -536,7 +542,7 @@ impl MpcApiBackend {
     }
 
     fn file_ready(&self) -> bool {
-        self.connected()
+        self.file_ready.load(Ordering::SeqCst)
     }
 
     fn connected(&self) -> bool {
@@ -545,6 +551,7 @@ impl MpcApiBackend {
 
     fn mark_disconnected(&self) {
         self.connected.store(false, Ordering::SeqCst);
+        self.file_ready.store(false, Ordering::SeqCst);
         self.listener.clear_mpc_handle();
     }
 
@@ -663,6 +670,7 @@ struct EventLoopArgs {
     listener_hwnd: isize,
     state: Arc<Mutex<PlayerState>>,
     connected: Arc<AtomicBool>,
+    file_ready: Arc<AtomicBool>,
     switch_pause_calls: Arc<AtomicBool>,
     version: Arc<Mutex<Option<String>>>,
     position_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -676,6 +684,7 @@ fn spawn_event_loop(args: EventLoopArgs) {
         listener_hwnd,
         state,
         connected,
+        file_ready,
         switch_pause_calls,
         version,
         position_waiter,
@@ -689,12 +698,7 @@ fn spawn_event_loop(args: EventLoopArgs) {
                     debug!("MPC connected: {} (listener {})", hwnd, listener_hwnd);
                 }
                 MpcEvent::LoadState(state_code) => {
-                    let ready = !matches!(state_code, 0 | 1 | 3);
-                    connected.store(ready, Ordering::SeqCst);
-                    if !ready {
-                        let mut guard = state.lock();
-                        guard.paused = None;
-                    }
+                    apply_mpc_load_state(&state, &file_ready, state_code);
                 }
                 MpcEvent::PlayState(play_state) => {
                     let paused = play_state != 0;
@@ -733,10 +737,43 @@ fn spawn_event_loop(args: EventLoopArgs) {
                 MpcEvent::Disconnected => {
                     warn!("MPC disconnected");
                     connected.store(false, Ordering::SeqCst);
+                    file_ready.store(false, Ordering::SeqCst);
                 }
             }
         }
     });
+}
+
+fn mpc_startup_arguments(args: &[String], listener_hwnd: isize) -> Vec<String> {
+    let mut full_args = args.to_vec();
+    if !full_args
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case("/open"))
+    {
+        full_args.push("/open".to_string());
+    }
+    if !full_args.iter().any(|arg| arg.eq_ignore_ascii_case("/new")) {
+        full_args.push("/new".to_string());
+    }
+    full_args.push("/slave".to_string());
+    full_args.push(listener_hwnd.to_string());
+    full_args
+}
+
+fn mpc_load_state_ready(state_code: i32) -> bool {
+    !matches!(state_code, 0 | 1 | 3)
+}
+
+fn apply_mpc_load_state(
+    state: &Arc<Mutex<PlayerState>>,
+    file_ready: &Arc<AtomicBool>,
+    state_code: i32,
+) {
+    let ready = mpc_load_state_ready(state_code);
+    file_ready.store(ready, Ordering::SeqCst);
+    if !ready {
+        state.lock().paused = None;
+    }
 }
 
 fn split_mpc_fields(input: &str) -> Vec<String> {
@@ -867,7 +904,14 @@ impl PlayerBackend for MpcApiBackend {
 }
 #[cfg(test)]
 mod tests {
-    use super::{mpc_filename_from_path, split_mpc_fields};
+    use super::{
+        apply_mpc_load_state, mpc_filename_from_path, mpc_load_state_ready, mpc_startup_arguments,
+        split_mpc_fields,
+    };
+    use crate::player::properties::PlayerState;
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn split_mpc_fields_keeps_windows_path_separators() {
@@ -909,6 +953,40 @@ mod tests {
                 "".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn mpc_startup_arguments_match_original_slave_launch() {
+        let args = mpc_startup_arguments(&[], 42);
+        assert_eq!(args, vec!["/open", "/new", "/slave", "42"]);
+    }
+
+    #[test]
+    fn mpc_startup_arguments_do_not_duplicate_original_flags() {
+        let args = mpc_startup_arguments(&["/new".to_string(), "/open".to_string()], 42);
+        assert_eq!(args, vec!["/new", "/open", "/slave", "42"]);
+    }
+
+    #[test]
+    fn mpc_load_state_ready_matches_original_not_ready_states() {
+        assert!(!mpc_load_state_ready(0));
+        assert!(!mpc_load_state_ready(1));
+        assert!(!mpc_load_state_ready(3));
+        assert!(mpc_load_state_ready(2));
+    }
+
+    #[test]
+    fn mpc_load_state_not_ready_clears_file_ready_only() {
+        let state = Arc::new(Mutex::new(PlayerState {
+            paused: Some(false),
+            ..PlayerState::default()
+        }));
+        let file_ready = Arc::new(AtomicBool::new(true));
+
+        apply_mpc_load_state(&state, &file_ready, 3);
+
+        assert!(!file_ready.load(Ordering::SeqCst));
+        assert_eq!(state.lock().paused, None);
     }
 
     #[test]
