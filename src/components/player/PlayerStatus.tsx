@@ -59,11 +59,6 @@ export function PlayerStatus() {
         {displayFilename(player.filename)}
       </span>
       {speedLabel && <span className="app-text-warning shrink-0">{speedLabel}</span>}
-      {connection.server && (
-        <span className="app-text-muted truncate max-w-[18vw]" title={connection.server}>
-          {connection.server}
-        </span>
-      )}
     </div>
   );
 }
