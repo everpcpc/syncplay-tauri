@@ -70,6 +70,195 @@ const normalizeSidePanelLayout = (layout: unknown): SidePanelLayout => {
   return "left-chat";
 };
 
+interface AppHeaderProps {
+  appVersion: string | null;
+  updateVersion: string | null;
+  isInstallingUpdate: boolean;
+  updateProgress: UpdateProgress | null;
+  showPlaylist: boolean;
+  sideLayout: SidePanelLayout;
+  theme: ThemePreference;
+  transparencyMode: TransparencyPreference;
+  connected: boolean;
+  showTls: boolean;
+  rttLabel: string;
+  onMouseDown: (event: React.MouseEvent) => void;
+  onInstallUpdate: () => void;
+  onTogglePlaylist: () => void;
+  onToggleLayout: () => void;
+  onToggleTheme: () => void;
+  onToggleTransparency: () => void;
+  onOpenConnection: () => void;
+  onOpenSettings: () => void;
+}
+
+function AppHeader({
+  appVersion,
+  updateVersion,
+  isInstallingUpdate,
+  updateProgress,
+  showPlaylist,
+  sideLayout,
+  theme,
+  transparencyMode,
+  connected,
+  showTls,
+  rttLabel,
+  onMouseDown,
+  onInstallUpdate,
+  onTogglePlaylist,
+  onToggleLayout,
+  onToggleTheme,
+  onToggleTransparency,
+  onOpenConnection,
+  onOpenSettings,
+}: AppHeaderProps) {
+  const layoutLabel = sideLayout === "three-rows" ? "Layout: three rows" : "Layout: left chat";
+  const layoutIcon =
+    sideLayout === "three-rows" ? (
+      <LuRows3 className="app-icon" />
+    ) : (
+      <LuPanelLeft className="app-icon" />
+    );
+
+  return (
+    <header
+      className="app-header relative"
+      id="toolbar-drag"
+      data-tauri-drag-region
+      onMouseDown={onMouseDown}
+    >
+      {(appVersion || updateVersion) && (
+        <div
+          className="absolute top-2 z-10 flex items-center gap-2 app-header-actions"
+          data-tauri-drag-region="false"
+          style={{ right: "calc(16px + var(--tauri-frame-controls-width, 0px))" }}
+        >
+          {appVersion && (
+            <div
+              className="text-xs app-tag-muted px-2.5 py-1 rounded-full"
+              aria-label={`Version ${appVersion}`}
+              title={`Version ${appVersion}`}
+            >
+              v{appVersion}
+            </div>
+          )}
+          {updateVersion && (
+            <button
+              onClick={onInstallUpdate}
+              disabled={isInstallingUpdate}
+              className="btn-primary px-3 py-1.5 text-xs"
+              data-tauri-drag-region="false"
+              aria-label={`Update available: ${updateVersion}`}
+              title={
+                isInstallingUpdate && updateProgress
+                  ? `Installing ${updateVersion}: ${formatBytes(updateProgress.downloaded)}${
+                      updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""
+                    }`
+                  : `Install update ${updateVersion}`
+              }
+            >
+              {isInstallingUpdate ? "Installing..." : "Update"}
+            </button>
+          )}
+        </div>
+      )}
+      <div className="app-header-row">
+        <PlayerStatus />
+        <div className="app-header-actions w-full" data-tauri-drag-region="false">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onTogglePlaylist}
+              className="btn-neutral app-icon-button"
+              data-tauri-drag-region="false"
+              aria-label={showPlaylist ? "Playlist shown" : "Playlist hidden"}
+            >
+              {showPlaylist ? (
+                <LuListMusic className="app-icon" />
+              ) : (
+                <LuListMinus className="app-icon" />
+              )}
+            </button>
+            <button
+              onClick={onToggleLayout}
+              className="btn-neutral app-icon-button"
+              data-tauri-drag-region="false"
+              aria-label={layoutLabel}
+              title={layoutLabel}
+            >
+              {layoutIcon}
+            </button>
+            <button
+              onClick={onToggleTheme}
+              className="btn-neutral app-icon-button"
+              data-tauri-drag-region="false"
+              aria-label={theme === "light" ? "Theme light" : "Theme dark"}
+            >
+              {theme === "light" ? <LuSun className="app-icon" /> : <LuMoon className="app-icon" />}
+            </button>
+            <button
+              onClick={onToggleTransparency}
+              className="btn-neutral app-icon-button"
+              data-tauri-drag-region="false"
+              aria-label={
+                transparencyMode === "off"
+                  ? "Transparency off"
+                  : transparencyMode === "low"
+                    ? "Transparency low"
+                    : "Transparency high"
+              }
+            >
+              {transparencyMode === "off" ? (
+                <LuContrast className="app-icon" />
+              ) : transparencyMode === "low" ? (
+                <LuDroplet className="app-icon" />
+              ) : (
+                <LuDroplets className="app-icon" />
+              )}
+            </button>
+          </div>
+          <div className="flex items-center gap-2 ml-auto">
+            {connected && rttLabel && (
+              <div
+                className="flex items-center gap-2 app-panel-muted px-2.5 py-1 rounded-full text-xs"
+                aria-label={`RTT ${rttLabel}`}
+                title={`RTT ${rttLabel}`}
+              >
+                <LuZap className="app-icon" />
+                <span className="font-mono">{rttLabel}</span>
+              </div>
+            )}
+            {showTls && (
+              <div
+                className="flex items-center justify-center px-2 py-1 rounded text-xs app-panel-muted app-tooltip"
+                aria-label="TLS enabled"
+              >
+                <LuLock className="app-icon" />
+              </div>
+            )}
+            <button
+              onClick={onOpenConnection}
+              className={`app-icon-button btn-neutral ${connected ? "app-tag-accent" : ""}`}
+              data-tauri-drag-region="false"
+              aria-label="Connect"
+            >
+              <LuLink2 className="app-icon" />
+            </button>
+            <button
+              onClick={onOpenSettings}
+              className="btn-neutral app-icon-button app-tooltip-right"
+              data-tauri-drag-region="false"
+              aria-label="Settings"
+            >
+              <LuSettings className="app-icon" />
+            </button>
+          </div>
+        </div>
+      </div>
+    </header>
+  );
+}
+
 export function MainLayout() {
   const appWindow = isTauri() ? getCurrentWindow() : null;
   const layoutRef = useRef<HTMLDivElement | null>(null);
@@ -772,15 +961,6 @@ export function MainLayout() {
     });
   };
 
-  const layoutLabel = sideLayout === "three-rows" ? "Layout: three rows" : "Layout: left chat";
-
-  const layoutIcon =
-    sideLayout === "three-rows" ? (
-      <LuRows3 className="app-icon" />
-    ) : (
-      <LuPanelLeft className="app-icon" />
-    );
-
   const chatPanel = (
     <section className="app-main-column" data-panel="chat">
       <main className="app-main-panel">
@@ -802,142 +982,27 @@ export function MainLayout() {
   ) : null;
 
   const header = (
-    <header
-      className="app-header relative"
-      id="toolbar-drag"
-      data-tauri-drag-region
+    <AppHeader
+      appVersion={appVersion}
+      updateVersion={updateVersion}
+      isInstallingUpdate={isInstallingUpdate}
+      updateProgress={updateProgress}
+      showPlaylist={showPlaylist}
+      sideLayout={sideLayout}
+      theme={theme}
+      transparencyMode={transparencyMode}
+      connected={connection.connected}
+      showTls={showTls}
+      rttLabel={rttLabel}
       onMouseDown={handleHeaderMouseDown}
-    >
-      {(appVersion || updateVersion) && (
-        <div
-          className="absolute top-2 z-10 flex items-center gap-2 app-header-actions"
-          data-tauri-drag-region="false"
-          style={{
-            right: "calc(16px + var(--tauri-frame-controls-width, 0px))",
-          }}
-        >
-          {appVersion && (
-            <div
-              className="text-xs app-tag-muted px-2.5 py-1 rounded-full"
-              aria-label={`Version ${appVersion}`}
-              title={`Version ${appVersion}`}
-            >
-              v{appVersion}
-            </div>
-          )}
-          {updateVersion && (
-            <button
-              onClick={handleInstallHeaderUpdate}
-              disabled={isInstallingUpdate}
-              className="btn-primary px-3 py-1.5 text-xs"
-              data-tauri-drag-region="false"
-              aria-label={`Update available: ${updateVersion}`}
-              title={
-                isInstallingUpdate && updateProgress
-                  ? `Installing ${updateVersion}: ${formatBytes(updateProgress.downloaded)}${
-                      updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""
-                    }`
-                  : `Install update ${updateVersion}`
-              }
-            >
-              {isInstallingUpdate ? "Installing..." : "Update"}
-            </button>
-          )}
-        </div>
-      )}
-      <div className="app-header-row">
-        <PlayerStatus />
-        <div className="app-header-actions w-full" data-tauri-drag-region="false">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleTogglePlaylist}
-              className="btn-neutral app-icon-button"
-              data-tauri-drag-region="false"
-              aria-label={showPlaylist ? "Playlist shown" : "Playlist hidden"}
-            >
-              {showPlaylist ? (
-                <LuListMusic className="app-icon" />
-              ) : (
-                <LuListMinus className="app-icon" />
-              )}
-            </button>
-            <button
-              onClick={handleToggleLayout}
-              className="btn-neutral app-icon-button"
-              data-tauri-drag-region="false"
-              aria-label={layoutLabel}
-              title={layoutLabel}
-            >
-              {layoutIcon}
-            </button>
-            <button
-              onClick={handleToggleTheme}
-              className="btn-neutral app-icon-button"
-              data-tauri-drag-region="false"
-              aria-label={theme === "light" ? "Theme light" : "Theme dark"}
-            >
-              {theme === "light" ? <LuSun className="app-icon" /> : <LuMoon className="app-icon" />}
-            </button>
-            <button
-              onClick={handleToggleTransparency}
-              className="btn-neutral app-icon-button"
-              data-tauri-drag-region="false"
-              aria-label={
-                transparencyMode === "off"
-                  ? "Transparency off"
-                  : transparencyMode === "low"
-                    ? "Transparency low"
-                    : "Transparency high"
-              }
-            >
-              {transparencyMode === "off" ? (
-                <LuContrast className="app-icon" />
-              ) : transparencyMode === "low" ? (
-                <LuDroplet className="app-icon" />
-              ) : (
-                <LuDroplets className="app-icon" />
-              )}
-            </button>
-          </div>
-          <div className="flex items-center gap-2 ml-auto">
-            {connection.connected && rttLabel && (
-              <div
-                className="flex items-center gap-2 app-panel-muted px-2.5 py-1 rounded-full text-xs"
-                aria-label={`RTT ${rttLabel}`}
-                title={`RTT ${rttLabel}`}
-              >
-                <LuZap className="app-icon" />
-                <span className="font-mono">{rttLabel}</span>
-              </div>
-            )}
-            {showTls && (
-              <div
-                className="flex items-center justify-center px-2 py-1 rounded text-xs app-panel-muted app-tooltip"
-                aria-label="TLS enabled"
-              >
-                <LuLock className="app-icon" />
-              </div>
-            )}
-            <button
-              onClick={() => setShowConnectionDialog(true)}
-              className={`app-icon-button btn-neutral ${connection.connected ? "app-tag-accent" : ""}`}
-              data-tauri-drag-region="false"
-              aria-label="Connect"
-            >
-              <LuLink2 className="app-icon" />
-            </button>
-            <button
-              onClick={() => handleOpenSettings()}
-              className="btn-neutral app-icon-button app-tooltip-right"
-              data-tauri-drag-region="false"
-              aria-label="Settings"
-            >
-              <LuSettings className="app-icon" />
-            </button>
-          </div>
-        </div>
-      </div>
-    </header>
+      onInstallUpdate={handleInstallHeaderUpdate}
+      onTogglePlaylist={handleTogglePlaylist}
+      onToggleLayout={handleToggleLayout}
+      onToggleTheme={handleToggleTheme}
+      onToggleTransparency={handleToggleTransparency}
+      onOpenConnection={() => setShowConnectionDialog(true)}
+      onOpenSettings={() => handleOpenSettings()}
+    />
   );
 
   const sideResizer =

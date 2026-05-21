@@ -1,4 +1,3 @@
-use anyhow::Result;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -367,11 +366,13 @@ pub struct ConnectionStatusEvent {
     pub server: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UserListEvent {
     pub users: Vec<UserInfo>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UserInfo {
     pub username: String,
@@ -381,6 +382,7 @@ pub struct UserInfo {
     pub is_controller: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatMessageEvent {
     pub timestamp: String,

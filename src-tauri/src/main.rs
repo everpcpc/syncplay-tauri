@@ -1,14 +1,19 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-#![allow(dead_code)]
-#![allow(unused_imports)]
 
+#[allow(dead_code, unused_imports)]
 mod app_state;
+#[allow(dead_code, unused_imports)]
 mod client;
+#[allow(dead_code, unused_imports)]
 mod commands;
+#[allow(dead_code, unused_imports)]
 mod config;
+#[allow(dead_code, unused_imports)]
 mod network;
+#[allow(dead_code, unused_imports)]
 mod player;
+#[allow(dead_code, unused_imports)]
 mod utils;
 
 use app_state::AppState;

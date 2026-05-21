@@ -236,6 +236,7 @@ pub fn same_filesize(a: Option<&FileSizeInfo>, b: Option<&FileSizeInfo>) -> bool
     a_hash == b_hash
 }
 
+#[allow(dead_code)]
 pub fn parse_player_arguments(value: &str) -> Vec<String> {
     if value.trim().is_empty() {
         return Vec::new();

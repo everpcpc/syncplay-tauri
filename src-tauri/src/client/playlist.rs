@@ -1,7 +1,7 @@
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Playlist item
 #[derive(Debug, Clone, PartialEq)]
