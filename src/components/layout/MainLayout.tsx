@@ -203,7 +203,7 @@ function AppHeader({
             )}
             {appVersion && (
               <div
-                className="text-xs app-tag-muted px-2.5 py-1 rounded-full shrink-0"
+                className="flex items-center px-2.5 py-1 rounded-full text-xs app-panel-muted shrink-0"
                 aria-label={`Version ${appVersion}`}
                 title={`Version ${appVersion}`}
               >
@@ -214,7 +214,7 @@ function AppHeader({
               <button
                 onClick={onInstallUpdate}
                 disabled={isInstallingUpdate}
-                className="btn-primary px-3 py-1.5 text-xs shrink-0"
+                className="btn-neutral px-2.5 py-1 rounded-full text-xs shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
                 data-tauri-drag-region="false"
                 aria-label={`Update available: ${updateVersion}`}
                 title={
