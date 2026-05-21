@@ -195,7 +195,7 @@ function AppHeader({
             )}
             {showTls && (
               <div
-                className="flex items-center justify-center px-2 py-1 rounded text-xs app-panel-muted app-tooltip"
+                className="inline-flex items-center justify-center px-2.5 py-1 rounded-md text-xs app-panel-muted app-tooltip shrink-0"
                 aria-label="TLS enabled"
               >
                 <LuLock className="app-icon" />
@@ -203,7 +203,7 @@ function AppHeader({
             )}
             {appVersion && (
               <div
-                className="inline-flex items-center h-8 px-3 rounded-lg text-xs app-panel-muted shrink-0"
+                className="inline-flex items-center justify-center px-2 py-1 rounded-md text-xs leading-none app-panel-muted shrink-0"
                 aria-label={`Version ${appVersion}`}
                 title={`Version ${appVersion}`}
               >
@@ -214,7 +214,7 @@ function AppHeader({
               <button
                 onClick={onInstallUpdate}
                 disabled={isInstallingUpdate}
-                className="inline-flex items-center h-8 px-3 rounded-lg text-xs app-panel-muted shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
+                className="inline-flex items-center px-3 py-1 rounded-md text-xs app-panel-muted shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
                 data-tauri-drag-region="false"
                 aria-label={`Update available: ${updateVersion}`}
                 title={
