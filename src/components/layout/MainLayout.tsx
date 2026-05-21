@@ -128,41 +128,6 @@ function AppHeader({
       data-tauri-drag-region
       onMouseDown={onMouseDown}
     >
-      {(appVersion || updateVersion) && (
-        <div
-          className="absolute top-2 z-10 flex items-center gap-2 app-header-actions"
-          data-tauri-drag-region="false"
-          style={{ right: "calc(16px + var(--tauri-frame-controls-width, 0px))" }}
-        >
-          {appVersion && (
-            <div
-              className="text-xs app-tag-muted px-2.5 py-1 rounded-full"
-              aria-label={`Version ${appVersion}`}
-              title={`Version ${appVersion}`}
-            >
-              v{appVersion}
-            </div>
-          )}
-          {updateVersion && (
-            <button
-              onClick={onInstallUpdate}
-              disabled={isInstallingUpdate}
-              className="btn-primary px-3 py-1.5 text-xs"
-              data-tauri-drag-region="false"
-              aria-label={`Update available: ${updateVersion}`}
-              title={
-                isInstallingUpdate && updateProgress
-                  ? `Installing ${updateVersion}: ${formatBytes(updateProgress.downloaded)}${
-                      updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""
-                    }`
-                  : `Install update ${updateVersion}`
-              }
-            >
-              {isInstallingUpdate ? "Installing..." : "Update"}
-            </button>
-          )}
-        </div>
-      )}
       <div className="app-header-row">
         <PlayerStatus />
         <div className="app-header-actions w-full" data-tauri-drag-region="false">
@@ -235,6 +200,33 @@ function AppHeader({
               >
                 <LuLock className="app-icon" />
               </div>
+            )}
+            {appVersion && (
+              <div
+                className="text-xs app-tag-muted px-2.5 py-1 rounded-full shrink-0"
+                aria-label={`Version ${appVersion}`}
+                title={`Version ${appVersion}`}
+              >
+                v{appVersion}
+              </div>
+            )}
+            {updateVersion && (
+              <button
+                onClick={onInstallUpdate}
+                disabled={isInstallingUpdate}
+                className="btn-primary px-3 py-1.5 text-xs shrink-0"
+                data-tauri-drag-region="false"
+                aria-label={`Update available: ${updateVersion}`}
+                title={
+                  isInstallingUpdate && updateProgress
+                    ? `Installing ${updateVersion}: ${formatBytes(updateProgress.downloaded)}${
+                        updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""
+                      }`
+                    : `Install update ${updateVersion}`
+                }
+              >
+                {isInstallingUpdate ? "Installing..." : "Update"}
+              </button>
             )}
             <button
               onClick={onOpenConnection}
