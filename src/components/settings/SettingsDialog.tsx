@@ -16,6 +16,17 @@ interface SettingsDialogProps {
 }
 
 type SettingsTab = "sync" | "ready" | "privacy" | "chat" | "osd" | "misc";
+type SaveStatus = "idle" | "saving" | "saved" | "failed";
+
+const parseNumberInput = (value: string, fallback: number) => {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const parseIntegerInput = (value: string, fallback: number) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
 
 const privacyOptions: Array<{ label: string; value: PrivacyMode }> = [
   { label: "Send raw", value: "send_raw" },
@@ -45,6 +56,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
   const [config, setConfig] = useState<SyncplayConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab ?? "sync");
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skipAutoSaveRef = useRef(true);
@@ -56,6 +68,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
         saveTimeoutRef.current = null;
       }
       skipAutoSaveRef.current = true;
+      setSaveStatus("idle");
       return;
     }
     loadConfig();
@@ -72,6 +85,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
     try {
       const loadedConfig = await invoke<SyncplayConfig>("get_config");
       setConfig(loadedConfig);
+      setSaveStatus("idle");
       skipAutoSaveRef.current = true;
     } catch (err) {
       setError(err as string);
@@ -91,6 +105,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
       clearTimeout(saveTimeoutRef.current);
     }
 
+    setSaveStatus("saving");
     saveTimeoutRef.current = setTimeout(async () => {
       try {
         await invoke("update_config", {
@@ -100,8 +115,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
           },
         });
         setError(null);
+        setSaveStatus("saved");
       } catch (err) {
         setError(err as string);
+        setSaveStatus("failed");
       }
     }, 500);
 
@@ -127,7 +144,11 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
           <div>
             <h2 className="text-xl font-bold">Settings</h2>
-            <p className="text-xs app-text-muted">Changes are saved automatically.</p>
+            <p className="text-xs app-text-muted">
+              Changes are saved automatically. {saveStatus === "saving" && "Saving..."}
+              {saveStatus === "saved" && "Saved."}
+              {saveStatus === "failed" && "Save failed."}
+            </p>
           </div>
           <div className="flex items-center gap-3">
             <button onClick={onClose} className="btn-neutral px-3 py-2 rounded-md text-sm">
@@ -176,7 +197,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         ...config,
                         user: {
                           ...config.user,
-                          seek_threshold_rewind: parseFloat(e.target.value),
+                          seek_threshold_rewind: parseNumberInput(
+                            e.target.value,
+                            config.user.seek_threshold_rewind
+                          ),
                         },
                       })
                     }
@@ -197,7 +221,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         ...config,
                         user: {
                           ...config.user,
-                          seek_threshold_fastforward: parseFloat(e.target.value),
+                          seek_threshold_fastforward: parseNumberInput(
+                            e.target.value,
+                            config.user.seek_threshold_fastforward
+                          ),
                         },
                       })
                     }
@@ -218,7 +245,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         ...config,
                         user: {
                           ...config.user,
-                          slowdown_threshold: parseFloat(e.target.value),
+                          slowdown_threshold: parseNumberInput(
+                            e.target.value,
+                            config.user.slowdown_threshold
+                          ),
                         },
                       })
                     }
@@ -239,7 +269,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         ...config,
                         user: {
                           ...config.user,
-                          slowdown_reset_threshold: parseFloat(e.target.value),
+                          slowdown_reset_threshold: parseNumberInput(
+                            e.target.value,
+                            config.user.slowdown_reset_threshold
+                          ),
                         },
                       })
                     }
@@ -260,7 +293,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         ...config,
                         user: {
                           ...config.user,
-                          slowdown_rate: parseFloat(e.target.value),
+                          slowdown_rate: parseNumberInput(
+                            e.target.value,
+                            config.user.slowdown_rate
+                          ),
                         },
                       })
                     }
@@ -426,7 +462,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         ...config,
                         user: {
                           ...config.user,
-                          autoplay_min_users: parseInt(e.target.value, 10),
+                          autoplay_min_users: parseIntegerInput(
+                            e.target.value,
+                            config.user.autoplay_min_users
+                          ),
                         },
                       })
                     }
@@ -568,7 +607,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           ...config,
                           user: {
                             ...config.user,
-                            chat_input_relative_font_size: parseInt(e.target.value, 10),
+                            chat_input_relative_font_size: parseIntegerInput(
+                              e.target.value,
+                              config.user.chat_input_relative_font_size
+                            ),
                           },
                         })
                       }
@@ -585,7 +627,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           ...config,
                           user: {
                             ...config.user,
-                            chat_input_font_weight: parseInt(e.target.value, 10),
+                            chat_input_font_weight: parseIntegerInput(
+                              e.target.value,
+                              config.user.chat_input_font_weight
+                            ),
                           },
                         })
                       }
@@ -688,7 +733,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           ...config,
                           user: {
                             ...config.user,
-                            chat_output_relative_font_size: parseInt(e.target.value, 10),
+                            chat_output_relative_font_size: parseIntegerInput(
+                              e.target.value,
+                              config.user.chat_output_relative_font_size
+                            ),
                           },
                         })
                       }
@@ -705,7 +753,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           ...config,
                           user: {
                             ...config.user,
-                            chat_output_font_weight: parseInt(e.target.value, 10),
+                            chat_output_font_weight: parseIntegerInput(
+                              e.target.value,
+                              config.user.chat_output_font_weight
+                            ),
                           },
                         })
                       }
@@ -720,7 +771,13 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                       onChange={(e) =>
                         setConfig({
                           ...config,
-                          user: { ...config.user, chat_max_lines: parseInt(e.target.value, 10) },
+                          user: {
+                            ...config.user,
+                            chat_max_lines: parseIntegerInput(
+                              e.target.value,
+                              config.user.chat_max_lines
+                            ),
+                          },
                         })
                       }
                       className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
@@ -752,7 +809,13 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                       onChange={(e) =>
                         setConfig({
                           ...config,
-                          user: { ...config.user, chat_top_margin: parseInt(e.target.value, 10) },
+                          user: {
+                            ...config.user,
+                            chat_top_margin: parseIntegerInput(
+                              e.target.value,
+                              config.user.chat_top_margin
+                            ),
+                          },
                         })
                       }
                       className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
@@ -766,7 +829,13 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                       onChange={(e) =>
                         setConfig({
                           ...config,
-                          user: { ...config.user, chat_left_margin: parseInt(e.target.value, 10) },
+                          user: {
+                            ...config.user,
+                            chat_left_margin: parseIntegerInput(
+                              e.target.value,
+                              config.user.chat_left_margin
+                            ),
+                          },
                         })
                       }
                       className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
@@ -782,7 +851,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           ...config,
                           user: {
                             ...config.user,
-                            chat_bottom_margin: parseInt(e.target.value, 10),
+                            chat_bottom_margin: parseIntegerInput(
+                              e.target.value,
+                              config.user.chat_bottom_margin
+                            ),
                           },
                         })
                       }
@@ -816,7 +888,13 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                     onChange={(e) =>
                       setConfig({
                         ...config,
-                        user: { ...config.user, chat_osd_margin: parseInt(e.target.value, 10) },
+                        user: {
+                          ...config.user,
+                          chat_osd_margin: parseIntegerInput(
+                            e.target.value,
+                            config.user.chat_osd_margin
+                          ),
+                        },
                       })
                     }
                     className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
@@ -834,7 +912,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           ...config,
                           user: {
                             ...config.user,
-                            notification_timeout: parseInt(e.target.value, 10),
+                            notification_timeout: parseIntegerInput(
+                              e.target.value,
+                              config.user.notification_timeout
+                            ),
                           },
                         })
                       }
@@ -849,7 +930,13 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                       onChange={(e) =>
                         setConfig({
                           ...config,
-                          user: { ...config.user, alert_timeout: parseInt(e.target.value, 10) },
+                          user: {
+                            ...config.user,
+                            alert_timeout: parseIntegerInput(
+                              e.target.value,
+                              config.user.alert_timeout
+                            ),
+                          },
                         })
                       }
                       className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
@@ -863,7 +950,13 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                       onChange={(e) =>
                         setConfig({
                           ...config,
-                          user: { ...config.user, chat_timeout: parseInt(e.target.value, 10) },
+                          user: {
+                            ...config.user,
+                            chat_timeout: parseIntegerInput(
+                              e.target.value,
+                              config.user.chat_timeout
+                            ),
+                          },
                         })
                       }
                       className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
@@ -883,7 +976,10 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                     onChange={(e) =>
                       setConfig({
                         ...config,
-                        user: { ...config.user, osd_duration: parseInt(e.target.value, 10) },
+                        user: {
+                          ...config.user,
+                          osd_duration: parseIntegerInput(e.target.value, config.user.osd_duration),
+                        },
                       })
                     }
                     className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"

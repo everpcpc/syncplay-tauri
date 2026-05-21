@@ -292,6 +292,7 @@ pub(crate) fn resolve_similar_in_directory(directory: &Path, filename: &str) -> 
     None
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 enum ScanError {
     NoDirectories,

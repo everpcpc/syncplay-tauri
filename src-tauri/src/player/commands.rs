@@ -21,6 +21,7 @@ pub struct MpvResponse {
 }
 
 /// MPV event
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MpvEvent {
     pub event: String,
@@ -48,6 +49,7 @@ pub enum MpvMessage {
     Event(MpvEvent),
 }
 
+#[allow(dead_code)]
 impl MpvCommand {
     /// Create a get_property command
     pub fn get_property(property: &str, request_id: u64) -> Self {

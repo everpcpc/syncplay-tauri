@@ -80,6 +80,10 @@ interface SyncplayStore {
 
 let listenersInitialized = false;
 
+const MAX_CHAT_MESSAGES = 1000;
+const appendChatMessage = (messages: ChatMessage[], message: ChatMessage) =>
+  [...messages, message].slice(-MAX_CHAT_MESSAGES);
+
 export const useSyncplayStore = create<SyncplayStore>((set) => ({
   // Initial state
   connection: {
@@ -123,7 +127,7 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
 
   addMessage: (message) =>
     set((state) => ({
-      messages: [...state.messages, message],
+      messages: appendChatMessage(state.messages, message),
     })),
 
   setPlaylist: (playlist) =>
@@ -193,7 +197,7 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
     // Chat messages
     listenSafe<ChatMessage>("chat-message-received", (event) => {
       set((state) => ({
-        messages: [...state.messages, event.payload],
+        messages: appendChatMessage(state.messages, event.payload),
       }));
     });
 

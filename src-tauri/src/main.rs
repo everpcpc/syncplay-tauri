@@ -1,7 +1,5 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-#![allow(dead_code)]
-#![allow(unused_imports)]
 
 mod app_state;
 mod client;
@@ -14,6 +12,7 @@ mod utils;
 use app_state::AppState;
 #[cfg(target_os = "macos")]
 use tauri::utils::TitleBarStyle;
+#[cfg(any(target_os = "macos", windows))]
 use tauri::Manager;
 #[cfg(windows)]
 use tauri_plugin_frame::FramePluginBuilder;

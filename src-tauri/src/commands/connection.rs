@@ -16,7 +16,7 @@ use crate::network::messages::{
 };
 use crate::network::tls::create_tls_connector;
 use crate::player::backend::PlayerBackend;
-use crate::player::controller::{ensure_player_connected, load_media_by_name, stop_player};
+use crate::player::controller::{ensure_player_connected, stop_player};
 use crate::player::properties::PlayerState;
 use crate::utils::{
     is_controlled_room, parse_controlled_room_input, same_filename, strip_control_password,

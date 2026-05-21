@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
-use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

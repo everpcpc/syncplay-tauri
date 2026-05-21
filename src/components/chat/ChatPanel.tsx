@@ -7,12 +7,37 @@ export function ChatPanel() {
   const connection = useSyncplayStore((state) => state.connection);
   const config = useSyncplayStore((state) => state.config);
   const [inputValue, setInputValue] = useState("");
+  const [hasUnreadMessages, setHasUnreadMessages] = useState(false);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const shouldStickToBottomRef = useRef(true);
   const chatInputEnabled = config?.user.chat_input_enabled ?? true;
 
-  // Auto-scroll to bottom when new messages arrive
+  const isNearBottom = () => {
+    const element = messagesContainerRef.current;
+    if (!element) return true;
+    return element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+  };
+
+  const scrollToBottom = (behavior: ScrollBehavior = "smooth") => {
+    messagesEndRef.current?.scrollIntoView({ behavior });
+    setHasUnreadMessages(false);
+  };
+
+  const handleMessagesScroll = () => {
+    const atBottom = isNearBottom();
+    shouldStickToBottomRef.current = atBottom;
+    if (atBottom) {
+      setHasUnreadMessages(false);
+    }
+  };
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (shouldStickToBottomRef.current) {
+      scrollToBottom("smooth");
+    } else if (messages.length > 0) {
+      setHasUnreadMessages(true);
+    }
   }, [messages]);
 
   const handleSendMessage = async () => {
@@ -26,10 +51,10 @@ export function ChatPanel() {
     }
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSendMessage();
+  const handleKeyDown = (event: React.KeyboardEvent) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void handleSendMessage();
     }
   };
 
@@ -57,7 +82,11 @@ export function ChatPanel() {
   return (
     <div className="flex flex-col h-full">
       {/* Messages area */}
-      <div className="flex-1 p-5 pt-7 overflow-auto space-y-0.5">
+      <div
+        ref={messagesContainerRef}
+        onScroll={handleMessagesScroll}
+        className="relative flex-1 p-5 pt-7 overflow-auto space-y-0.5"
+      >
         {messages.length === 0 ? (
           <p className="app-text-muted">
             {connection.connected
@@ -70,7 +99,10 @@ export function ChatPanel() {
             const displayMessage = msg.message.trim();
 
             return (
-              <div key={index} className="text-sm app-message">
+              <div
+                key={`${msg.timestamp}-${msg.username ?? "system"}-${msg.messageType}-${index}`}
+                className="text-sm app-message"
+              >
                 <span className="app-text-muted text-xs">{formatTimestamp(msg.timestamp)}</span>
                 {msg.username && (
                   <span className="app-text-accent font-medium ml-2">{msg.username}:</span>
@@ -81,6 +113,15 @@ export function ChatPanel() {
           })
         )}
         <div ref={messagesEndRef} />
+        {hasUnreadMessages && (
+          <button
+            type="button"
+            onClick={() => scrollToBottom()}
+            className="sticky bottom-2 left-1/2 -translate-x-1/2 btn-primary px-3 py-1.5 rounded-full text-xs shadow-lg"
+          >
+            New messages
+          </button>
+        )}
       </div>
 
       {/* Input area */}
@@ -89,7 +130,7 @@ export function ChatPanel() {
           type="text"
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
-          onKeyPress={handleKeyPress}
+          onKeyDown={handleKeyDown}
           placeholder={
             !connection.connected
               ? "Not connected"

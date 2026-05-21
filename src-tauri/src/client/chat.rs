@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Chat message type
 #[derive(Debug, Clone, PartialEq)]
