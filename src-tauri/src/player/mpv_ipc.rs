@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -116,7 +116,7 @@ impl MpvIpc {
 
         // Spawn queue task
         tokio::spawn(async move {
-            let mut pending: Vec<MpvCommand> = Vec::new();
+            let mut pending: VecDeque<MpvCommand> = VecDeque::new();
             let mut ready = true;
             let mut last_send: Option<Instant> = None;
             let mut last_not_ready: Option<Instant> = None;
@@ -517,7 +517,7 @@ fn queue_key(cmd: &MpvCommand) -> Option<QueueKey> {
     }
 }
 
-fn drop_replaced_pending_requests(pending: &mut Vec<MpvCommand>, key: QueueKey) {
+fn drop_replaced_pending_requests(pending: &mut VecDeque<MpvCommand>, key: QueueKey) {
     pending.retain(|cmd| {
         let replaced = queue_key(cmd) == Some(key);
         if replaced {
@@ -532,7 +532,7 @@ fn drop_replaced_pending_requests(pending: &mut Vec<MpvCommand>, key: QueueKey) 
 
 async fn handle_command_queue(
     cmd: MpvCommand,
-    pending: &mut Vec<MpvCommand>,
+    pending: &mut VecDeque<MpvCommand>,
     ready: bool,
     last_send: &mut Option<Instant>,
     cmd_tx: &mpsc::UnboundedSender<MpvCommand>,
@@ -557,16 +557,16 @@ async fn handle_command_queue(
     if ready {
         send_with_throttle(cmd, last_send, cmd_tx).await;
     } else {
-        pending.push(cmd);
+        pending.push_back(cmd);
     }
 }
 
 async fn flush_queue(
-    pending: &mut Vec<MpvCommand>,
+    pending: &mut VecDeque<MpvCommand>,
     last_send: &mut Option<Instant>,
     cmd_tx: &mpsc::UnboundedSender<MpvCommand>,
 ) {
-    while let Some(cmd) = pending.pop() {
+    while let Some(cmd) = pending.pop_front() {
         send_with_throttle(cmd, last_send, cmd_tx).await;
     }
 }
@@ -645,17 +645,41 @@ mod tests {
 
     #[test]
     fn newer_pending_seek_replaces_older_pending_seek() {
-        let mut pending = vec![
+        let mut pending = VecDeque::from([
             MpvCommand::set_property_no_reply(
                 "time-pos",
                 serde_json::Value::Number(serde_json::Number::from_f64(10.0).unwrap()),
             ),
             MpvCommand::show_text("keep", Some(1000)),
-        ];
+        ]);
 
         drop_replaced_pending_requests(&mut pending, QueueKey::SetTimePos);
 
         assert_eq!(pending.len(), 1);
         assert_ne!(queue_key(&pending[0]), Some(QueueKey::SetTimePos));
+    }
+
+    #[tokio::test]
+    async fn queued_pause_commands_flush_in_original_order() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut pending = VecDeque::from([
+            MpvCommand::set_property_no_reply("pause", serde_json::Value::Bool(true)),
+            MpvCommand::set_property_no_reply("pause", serde_json::Value::Bool(false)),
+        ]);
+        let mut last_send = None;
+
+        flush_queue(&mut pending, &mut last_send, &cmd_tx).await;
+
+        let first = cmd_rx.recv().await.expect("first command missing");
+        let second = cmd_rx.recv().await.expect("second command missing");
+        assert_eq!(
+            first.command.get(2).and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            second.command.get(2).and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert!(pending.is_empty());
     }
 }
