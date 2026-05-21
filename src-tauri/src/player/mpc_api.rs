@@ -600,9 +600,6 @@ impl PlayerBackend for MpcApiBackend {
     }
 
     async fn set_position(&self, position: f64) -> anyhow::Result<()> {
-        if !self.file_ready() {
-            return Err(anyhow::anyhow!("MPC file not ready"));
-        }
         self.send_command_retry(
             CMD_SETPOSITION,
             Some(CommandPayload::Text(position.to_string())),
@@ -611,9 +608,6 @@ impl PlayerBackend for MpcApiBackend {
     }
 
     async fn set_paused(&self, paused: bool) -> anyhow::Result<()> {
-        if !self.file_ready() {
-            return Err(anyhow::anyhow!("MPC file not ready"));
-        }
         let mut value = paused;
         if self.switch_pause_calls.load(Ordering::SeqCst) {
             value = !value;
@@ -632,9 +626,6 @@ impl PlayerBackend for MpcApiBackend {
     }
 
     async fn set_speed(&self, speed: f64) -> anyhow::Result<()> {
-        if !self.file_ready() {
-            return Err(anyhow::anyhow!("MPC file not ready"));
-        }
         self.send_command_retry(CMD_SETSPEED, Some(CommandPayload::Text(speed.to_string())))?;
         Ok(())
     }
