@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SyncplayConfig } from "../../types/config";
 import { useNotificationStore } from "../../store/notifications";
+import { AppDialogPortal } from "../common/AppDialogPortal";
 
 interface TrustedDomainsDialogProps {
   isOpen: boolean;
@@ -101,7 +102,7 @@ export function TrustedDomainsDialog({ isOpen, onClose }: TrustedDomainsDialogPr
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 app-overlay flex items-center justify-center z-50">
+    <AppDialogPortal className="fixed inset-0 app-overlay app-dialog-overlay flex items-center justify-center">
       <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl max-h-[80vh] overflow-auto shadow-xl">
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
           <div>
@@ -178,6 +179,6 @@ export function TrustedDomainsDialog({ isOpen, onClose }: TrustedDomainsDialogPr
           </div>
         ) : null}
       </div>
-    </div>
+    </AppDialogPortal>
   );
 }

@@ -635,6 +635,10 @@
   background-color: var(--app-overlay);
 }
 
+.app-dialog-overlay {
+  z-index: 10000;
+}
+
 .app-message {
   padding: 2px 0;
 }

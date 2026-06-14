@@ -4,6 +4,7 @@ import { useSyncplayStore } from "../../store";
 import { useNotificationStore } from "../../store/notifications";
 import { invoke } from "@tauri-apps/api/core";
 import { PublicServer, SyncplayConfig } from "../../types/config";
+import { AppDialogPortal } from "../common/AppDialogPortal";
 
 interface ConnectionDialogProps {
   isOpen: boolean;
@@ -452,8 +453,8 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
   };
 
   return (
-    <div
-      className="fixed inset-0 app-overlay flex items-center justify-center z-50"
+    <AppDialogPortal
+      className="fixed inset-0 app-overlay app-dialog-overlay flex items-center justify-center"
       data-tauri-drag-region="false"
     >
       <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl shadow-xl">
@@ -736,6 +737,6 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
           </form>
         )}
       </div>
-    </div>
+    </AppDialogPortal>
   );
 }

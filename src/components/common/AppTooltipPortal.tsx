@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { APP_DIALOG_PORTAL_CHANGE_EVENT } from "./AppDialogPortal";
 
 type TooltipPlacement = "top" | "right" | "left";
 
@@ -13,6 +14,11 @@ interface TooltipState {
 const TOOLTIP_SELECTOR = ".app-icon-button[aria-label], .app-tooltip[aria-label]";
 const VIEWPORT_MARGIN = 8;
 const TARGET_GAP = 8;
+
+const allowsTooltipForTarget = (target: HTMLElement | null) => {
+  const dialogOverlay = document.querySelector(".app-dialog-overlay");
+  return !dialogOverlay || Boolean(target?.closest(".app-dialog-overlay"));
+};
 
 const getPlacement = (element: HTMLElement): TooltipPlacement => {
   if (element.classList.contains("app-tooltip-side-right")) return "right";
@@ -46,30 +52,38 @@ export function AppTooltipPortal() {
     setPosition(null);
   }, []);
 
-  const showTooltip = useCallback((target: HTMLElement) => {
-    const text = target.getAttribute("aria-label")?.trim();
-    if (!text) return;
+  const showTooltip = useCallback(
+    (target: HTMLElement) => {
+      if (!allowsTooltipForTarget(target)) {
+        hideTooltip();
+        return;
+      }
 
-    activeTargetRef.current = target;
-    if (showFrameRef.current !== null) {
-      window.cancelAnimationFrame(showFrameRef.current);
-    }
+      const text = target.getAttribute("aria-label")?.trim();
+      if (!text) return;
 
-    setTooltip({
-      text,
-      rect: target.getBoundingClientRect(),
-      placement: getPlacement(target),
-      visible: false,
-    });
-    setPosition(null);
+      activeTargetRef.current = target;
+      if (showFrameRef.current !== null) {
+        window.cancelAnimationFrame(showFrameRef.current);
+      }
 
-    showFrameRef.current = window.requestAnimationFrame(() => {
-      showFrameRef.current = null;
-      setTooltip((current) =>
-        current && activeTargetRef.current === target ? { ...current, visible: true } : current
-      );
-    });
-  }, []);
+      setTooltip({
+        text,
+        rect: target.getBoundingClientRect(),
+        placement: getPlacement(target),
+        visible: false,
+      });
+      setPosition(null);
+
+      showFrameRef.current = window.requestAnimationFrame(() => {
+        showFrameRef.current = null;
+        setTooltip((current) =>
+          current && activeTargetRef.current === target ? { ...current, visible: true } : current
+        );
+      });
+    },
+    [hideTooltip]
+  );
 
   useEffect(() => {
     const handlePointerOver = (event: PointerEvent) => {
@@ -120,11 +134,18 @@ export function AppTooltipPortal() {
       );
     };
 
+    const handleDialogPortalChange = () => {
+      if (!allowsTooltipForTarget(activeTargetRef.current)) {
+        hideTooltip();
+      }
+    };
+
     document.addEventListener("pointerover", handlePointerOver);
     document.addEventListener("pointerout", handlePointerOut);
     document.addEventListener("focusin", handleFocusIn);
     document.addEventListener("focusout", handleFocusOut);
     document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener(APP_DIALOG_PORTAL_CHANGE_EVENT, handleDialogPortalChange);
     window.addEventListener("resize", handleViewportChange);
     window.addEventListener("scroll", handleViewportChange, true);
 
@@ -134,6 +155,7 @@ export function AppTooltipPortal() {
       document.removeEventListener("focusin", handleFocusIn);
       document.removeEventListener("focusout", handleFocusOut);
       document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener(APP_DIALOG_PORTAL_CHANGE_EVENT, handleDialogPortalChange);
       window.removeEventListener("resize", handleViewportChange);
       window.removeEventListener("scroll", handleViewportChange, true);
       if (showFrameRef.current !== null) {
