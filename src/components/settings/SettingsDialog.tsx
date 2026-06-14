@@ -8,6 +8,7 @@ import {
   SyncplayConfig,
   UnpauseAction,
 } from "../../types/config";
+import { AppDialogPortal } from "../common/AppDialogPortal";
 
 interface SettingsDialogProps {
   isOpen: boolean;
@@ -133,8 +134,8 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
   if (!isOpen) return null;
 
   return (
-    <div
-      className="fixed inset-0 app-overlay flex items-center justify-center z-50"
+    <AppDialogPortal
+      className="fixed inset-0 app-overlay app-dialog-overlay flex items-center justify-center"
       data-tauri-drag-region="false"
     >
       <div
@@ -1146,6 +1147,6 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
           </div>
         )}
       </div>
-    </div>
+    </AppDialogPortal>
   );
 }
