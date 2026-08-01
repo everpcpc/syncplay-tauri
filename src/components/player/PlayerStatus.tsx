@@ -43,17 +43,13 @@ export function PlayerStatus() {
   }
 
   const speedLabel = formatSpeed(player.speed);
-  const progress =
-    player.position !== null && player.duration !== null && player.duration > 0
-      ? Math.min(100, Math.max(0, (player.position / player.duration) * 100))
-      : null;
   const playbackStateLabel = player.paused ? "Paused" : "Playing";
   const showSyncOffset = player.filename !== null && syncOffsetSeconds !== null;
   const inSync =
     showSyncOffset && Math.abs(syncOffsetSeconds) < SYNC_THRESHOLD_SECONDS;
 
   return (
-    <div className="flex flex-wrap items-center gap-3 text-sm min-w-0">
+    <div className="flex flex-nowrap items-center gap-3 text-sm min-w-0 overflow-hidden">
       {/* Playback happens in the external player, so this is a read-only
           status indicator rather than a clickable button. */}
       <div
@@ -72,23 +68,10 @@ export function PlayerStatus() {
           {formatTime(player.position)}/{formatTime(player.duration)}
         </span>
       )}
-      {progress !== null && (
-        <div
-          className="h-1 w-24 rounded-full shrink-0 overflow-hidden"
-          style={{ background: "var(--app-panel-2)" }}
-          role="progressbar"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={Math.round(progress)}
-          aria-label="Playback progress"
-        >
-          <div
-            className="h-full rounded-full"
-            style={{ width: `${progress}%`, background: "var(--app-accent)" }}
-          />
-        </div>
-      )}
-      <span className="font-medium truncate max-w-[28vw]" title={player.filename ?? undefined}>
+      <span
+        className="font-medium truncate min-w-0 max-w-[28vw]"
+        title={player.filename ?? undefined}
+      >
         {displayFilename(player.filename)}
       </span>
       {showSyncOffset && (

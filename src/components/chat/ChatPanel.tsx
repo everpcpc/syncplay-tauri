@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { useSyncplayStore } from "../../store";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type ChatFilter = "all" | "chat" | "events";
 
@@ -80,6 +81,15 @@ export function ChatPanel() {
   const handleFilterChange = (next: ChatFilter) => {
     setFilter(next);
     window.localStorage.setItem(CHAT_FILTER_STORAGE_KEY, next);
+  };
+
+  // The tab row sits in the window's top drag strip; keep it draggable
+  // from its padding while letting the tab buttons receive clicks.
+  const handleTabRowMouseDown = (event: React.MouseEvent) => {
+    if (event.button !== 0) return;
+    if ((event.target as HTMLElement).closest("button")) return;
+    if (!isTauri()) return;
+    void getCurrentWindow().startDragging();
   };
 
   const isNearBottom = () => {
@@ -165,8 +175,14 @@ export function ChatPanel() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Filter tabs */}
-      <div className="flex items-center gap-4 px-5 pt-2 border-b app-divider app-surface">
+      {/* Filter tabs. Sits in the top drag-strip area, so it needs z-index
+          to stay clickable; macOS-only top padding (see .app-chat-tabs in
+          index.css) clears the overlay titlebar traffic lights. */}
+      <div
+        className="app-chat-tabs relative z-[3] flex items-center gap-4 px-5 pt-2 border-b app-divider app-surface"
+        data-tauri-drag-region
+        onMouseDown={handleTabRowMouseDown}
+      >
         {FILTER_TABS.map((tab) => (
           <button
             key={tab.value}
