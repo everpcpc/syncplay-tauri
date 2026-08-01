@@ -747,6 +747,12 @@ body {
   --tauri-frame-controls-width: 138px;
 }
 
+[data-platform="windows"] .app-header {
+  /* Keep the header action buttons clear of the native min/max/close
+     controls that overlay the top-right corner. */
+  padding-right: calc(16px + var(--tauri-frame-controls-width));
+}
+
 [data-platform="windows"] .app-shell {
   border-radius: 8px;
 }
@@ -769,4 +775,9 @@ body {
     -apple-system,
     "Helvetica Neue",
     sans-serif;
+}
+
+[data-platform="macos"] .app-chat-tabs {
+  /* Clear the overlay titlebar traffic lights floating over the top-left. */
+  padding-top: 2rem;
 }
