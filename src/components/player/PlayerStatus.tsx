@@ -43,10 +43,6 @@ export function PlayerStatus() {
   }
 
   const speedLabel = formatSpeed(player.speed);
-  const progress =
-    player.position !== null && player.duration !== null && player.duration > 0
-      ? Math.min(100, Math.max(0, (player.position / player.duration) * 100))
-      : null;
   const playbackStateLabel = player.paused ? "Paused" : "Playing";
   const showSyncOffset = player.filename !== null && syncOffsetSeconds !== null;
   const inSync =
@@ -71,22 +67,6 @@ export function PlayerStatus() {
         <span className="font-mono text-xs shrink-0">
           {formatTime(player.position)}/{formatTime(player.duration)}
         </span>
-      )}
-      {progress !== null && (
-        <div
-          className="h-1 w-24 min-w-8 rounded-full overflow-hidden"
-          style={{ background: "var(--app-panel-2)" }}
-          role="progressbar"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={Math.round(progress)}
-          aria-label="Playback progress"
-        >
-          <div
-            className="h-full rounded-full"
-            style={{ width: `${progress}%`, background: "var(--app-accent)" }}
-          />
-        </div>
       )}
       <span
         className="font-medium truncate min-w-0 max-w-[28vw]"
