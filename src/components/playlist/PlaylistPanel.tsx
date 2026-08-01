@@ -648,7 +648,13 @@ export function PlaylistPanel() {
         }}
       >
         {playlist.items.length === 0 ? (
-          <p className="app-text-muted text-sm">No items in playlist</p>
+          <div className="flex h-full flex-col items-center justify-center gap-1.5 text-center px-4">
+            <LuListMusic className="app-icon app-text-muted" />
+            <p className="app-text-muted text-sm">No items in playlist</p>
+            <p className="app-text-muted text-xs">
+              Drag files here or click + to add. Double-click an item to play it.
+            </p>
+          </div>
         ) : (
           <div className="space-y-2">
             {playlist.items.map((item, index) =>
@@ -714,7 +720,7 @@ export function PlaylistPanel() {
                         <LuPlay className="app-icon" />
                       </button>
                       <span
-                        className={`truncate flex-1 ${
+                        className={`app-tooltip-text truncate flex-1 ${
                           available
                             ? isCurrent
                               ? "app-text-accent font-semibold"

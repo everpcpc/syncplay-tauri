@@ -11,7 +11,10 @@ interface TooltipState {
   visible: boolean;
 }
 
-const TOOLTIP_SELECTOR = ".app-icon-button[aria-label], .app-tooltip[aria-label]";
+// `.app-tooltip` sets `overflow: visible`, which would break `truncate` on
+// text labels; plain text tooltip targets use the style-free `.app-tooltip-text`.
+const TOOLTIP_SELECTOR =
+  ".app-icon-button[aria-label], .app-tooltip[aria-label], .app-tooltip-text[aria-label]";
 const VIEWPORT_MARGIN = 8;
 const TARGET_GAP = 8;
 
