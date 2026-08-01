@@ -21,9 +21,18 @@ const formatSpeed = (speed: number | null) => {
   return `${speed.toFixed(2)}x`;
 };
 
+const SYNC_THRESHOLD_SECONDS = 1;
+
+const formatSyncOffset = (offsetSeconds: number) => {
+  const absolute = Math.abs(offsetSeconds);
+  const label = absolute >= 10 ? absolute.toFixed(0) : absolute.toFixed(1);
+  return offsetSeconds < 0 ? `behind ${label}s` : `ahead ${label}s`;
+};
+
 export function PlayerStatus() {
   const connection = useSyncplayStore((state) => state.connection);
   const player = useSyncplayStore((state) => state.player);
+  const syncOffsetSeconds = useSyncplayStore((state) => state.syncOffsetSeconds);
 
   if (!connection.connected) {
     return (
@@ -34,30 +43,68 @@ export function PlayerStatus() {
   }
 
   const speedLabel = formatSpeed(player.speed);
+  const progress =
+    player.position !== null && player.duration !== null && player.duration > 0
+      ? Math.min(100, Math.max(0, (player.position / player.duration) * 100))
+      : null;
+  const playbackStateLabel = player.paused ? "Paused" : "Playing";
+  const showSyncOffset = player.filename !== null && syncOffsetSeconds !== null;
+  const inSync =
+    showSyncOffset && Math.abs(syncOffsetSeconds) < SYNC_THRESHOLD_SECONDS;
 
   return (
     <div className="flex flex-wrap items-center gap-3 text-sm min-w-0">
-      <button
-        type="button"
-        disabled
-        className="btn-neutral app-icon-button disabled:opacity-100 disabled:cursor-default shrink-0"
-        aria-label={player.paused ? "Paused" : "Playing"}
-        title={player.paused ? "Paused" : "Playing"}
+      {/* Playback happens in the external player, so this is a read-only
+          status indicator rather than a clickable button. */}
+      <div
+        className="app-tooltip flex items-center justify-center w-8 h-8 shrink-0"
+        role="status"
+        aria-label={`${playbackStateLabel} (controlled in the external player)`}
       >
         {player.paused ? (
           <LuPause className="app-icon app-text-warning" />
         ) : (
-          <LuPlay className="app-icon" />
+          <LuPlay className="app-icon app-text-accent" />
         )}
-      </button>
+      </div>
       {player.position !== null && player.duration !== null && (
         <span className="font-mono text-xs shrink-0">
           {formatTime(player.position)}/{formatTime(player.duration)}
         </span>
       )}
+      {progress !== null && (
+        <div
+          className="h-1 w-24 rounded-full shrink-0 overflow-hidden"
+          style={{ background: "var(--app-panel-2)" }}
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(progress)}
+          aria-label="Playback progress"
+        >
+          <div
+            className="h-full rounded-full"
+            style={{ width: `${progress}%`, background: "var(--app-accent)" }}
+          />
+        </div>
+      )}
       <span className="font-medium truncate max-w-[28vw]" title={player.filename ?? undefined}>
         {displayFilename(player.filename)}
       </span>
+      {showSyncOffset && (
+        <span
+          className={`app-tooltip-text text-[10px] px-2 py-0 rounded-full shrink-0 ${
+            inSync ? "app-tag-success" : "app-tag-muted app-text-warning"
+          }`}
+          aria-label={
+            inSync
+              ? "In sync with the room"
+              : `Your playback is ${formatSyncOffset(syncOffsetSeconds)} relative to the room`
+          }
+        >
+          {inSync ? "in sync" : formatSyncOffset(syncOffsetSeconds)}
+        </span>
+      )}
       {speedLabel && <span className="app-text-warning shrink-0">{speedLabel}</span>}
     </div>
   );

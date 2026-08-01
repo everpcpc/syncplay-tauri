@@ -58,6 +58,7 @@ interface SyncplayStore {
   playlist: PlaylistState;
   player: PlayerState;
   rttMs: number | null;
+  syncOffsetSeconds: number | null;
   config: SyncplayConfig | null;
   mediaIndexVersion: number;
   mediaIndexRefreshing: boolean;
@@ -70,6 +71,7 @@ interface SyncplayStore {
   setPlaylist: (playlist: PlaylistState) => void;
   setPlayerState: (state: PlayerState) => void;
   setRttMs: (rttMs: number | null) => void;
+  setSyncOffset: (offsetSeconds: number | null) => void;
   setConfig: (config: SyncplayConfig) => void;
   setMediaIndexVersion: (version: number) => void;
   setMediaIndexRefreshing: (refreshing: boolean) => void;
@@ -105,6 +107,7 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
     speed: 1.0,
   },
   rttMs: null,
+  syncOffsetSeconds: null,
   config: null,
   mediaIndexVersion: 0,
   mediaIndexRefreshing: false,
@@ -145,6 +148,11 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
       rttMs,
     })),
 
+  setSyncOffset: (offsetSeconds) =>
+    set(() => ({
+      syncOffsetSeconds: offsetSeconds,
+    })),
+
   setConfig: (config) =>
     set(() => ({
       config,
@@ -178,6 +186,7 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
       set(() => ({
         connection: event.payload,
         rttMs: null,
+        syncOffsetSeconds: null,
       }));
     });
 
@@ -212,6 +221,15 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
     listenSafe<PlayerState>("player-state-changed", (event) => {
       set((state) => ({
         player: { ...state.player, ...event.payload },
+        // No file loaded (e.g. player disconnected) → offset is meaningless
+        syncOffsetSeconds: event.payload.filename === null ? null : state.syncOffsetSeconds,
+      }));
+    });
+
+    // Own offset from the room-global playback position
+    listenSafe<{ offsetSeconds: number }>("sync-offset-updated", (event) => {
+      set(() => ({
+        syncOffsetSeconds: event.payload.offsetSeconds,
       }));
     });
 

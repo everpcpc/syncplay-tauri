@@ -1051,6 +1051,17 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         }
     }
 
+    // Report the viewer's own offset from the room-global position so the UI
+    // can show an "in sync / behind / ahead" indicator. Read the freshest
+    // player state so corrections applied above are reflected immediately.
+    let final_local_position = player.get_state().position;
+    if let Some(final_local_position) = final_local_position {
+        state.emit_event(
+            "sync-offset-updated",
+            serde_json::json!({ "offsetSeconds": final_local_position - adjusted_global_position }),
+        );
+    }
+
     update_room_warnings(state, false);
 }
 
