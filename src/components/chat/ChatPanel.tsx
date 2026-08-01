@@ -165,8 +165,9 @@ export function ChatPanel() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Filter tabs */}
-      <div className="flex items-center gap-4 px-5 pt-2 border-b app-divider app-surface">
+      {/* Filter tabs — extra top padding clears the macOS traffic lights
+          that float over the overlay titlebar area. */}
+      <div className="flex items-center gap-4 px-5 pt-8 pb-0 border-b app-divider app-surface">
         {FILTER_TABS.map((tab) => (
           <button
             key={tab.value}

@@ -53,7 +53,7 @@ export function PlayerStatus() {
     showSyncOffset && Math.abs(syncOffsetSeconds) < SYNC_THRESHOLD_SECONDS;
 
   return (
-    <div className="flex flex-wrap items-center gap-3 text-sm min-w-0">
+    <div className="flex flex-nowrap items-center gap-3 text-sm min-w-0 overflow-hidden">
       {/* Playback happens in the external player, so this is a read-only
           status indicator rather than a clickable button. */}
       <div
@@ -74,7 +74,7 @@ export function PlayerStatus() {
       )}
       {progress !== null && (
         <div
-          className="h-1 w-24 rounded-full shrink-0 overflow-hidden"
+          className="h-1 w-24 min-w-8 rounded-full overflow-hidden"
           style={{ background: "var(--app-panel-2)" }}
           role="progressbar"
           aria-valuemin={0}
@@ -88,7 +88,10 @@ export function PlayerStatus() {
           />
         </div>
       )}
-      <span className="font-medium truncate max-w-[28vw]" title={player.filename ?? undefined}>
+      <span
+        className="font-medium truncate min-w-0 max-w-[28vw]"
+        title={player.filename ?? undefined}
+      >
         {displayFilename(player.filename)}
       </span>
       {showSyncOffset && (
