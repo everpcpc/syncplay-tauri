@@ -5,6 +5,7 @@ pub mod commands;
 pub mod controller;
 pub mod detection;
 pub mod events;
+pub mod media_update;
 #[allow(dead_code, unused_imports)]
 pub mod mpc_api;
 #[allow(dead_code)]

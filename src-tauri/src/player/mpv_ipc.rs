@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,8 +14,9 @@ use tokio::net::windows::named_pipe::ClientOptions;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-use super::commands::{MpvCommand, MpvMessage, MpvResponse};
+use super::commands::{LoadfileOptionsSyntax, MpvCommand, MpvMessage, MpvResponse};
 use super::events::MpvPlayerEvent;
+use super::media_update::MediaSnapshot;
 use super::properties::{PlayerState, PropertyId};
 
 const MPV_SENDMESSAGE_COOLDOWN_TIME: Duration = Duration::from_millis(50);
@@ -24,6 +26,7 @@ const MPV_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_millis(750);
 enum QueueMessage {
     Command(MpvCommand),
     SetReady(bool),
+    CancelLoad(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +34,75 @@ enum QueueKey {
     SetTimePos,
     LoadFile,
     CyclePause,
+}
+
+#[derive(Debug, Default)]
+struct UntaggedLoadTracker {
+    written: VecDeque<u64>,
+    started: VecDeque<StartedUntaggedLoad>,
+}
+
+#[derive(Debug)]
+struct StartedUntaggedLoad {
+    load_id: u64,
+    playlist_entry_id: Option<i64>,
+    marker_seen: bool,
+}
+
+impl UntaggedLoadTracker {
+    fn record_written(&mut self, load_id: u64) {
+        self.written.push_back(load_id);
+    }
+
+    fn start_file(&mut self, playlist_entry_id: Option<i64>) -> Option<u64> {
+        let load_id = self.written.pop_front()?;
+        self.started.push_back(StartedUntaggedLoad {
+            load_id,
+            playlist_entry_id,
+            marker_seen: false,
+        });
+        Some(load_id)
+    }
+
+    fn begin_marker(&mut self) -> Option<u64> {
+        if let Some(load) = self.started.iter_mut().find(|load| !load.marker_seen) {
+            load.marker_seen = true;
+            return Some(load.load_id);
+        }
+
+        let load_id = self.written.pop_front()?;
+        self.started.push_back(StartedUntaggedLoad {
+            load_id,
+            playlist_entry_id: None,
+            marker_seen: true,
+        });
+        Some(load_id)
+    }
+
+    fn end_file(
+        &mut self,
+        playlist_entry_id: Option<i64>,
+        redirected: bool,
+    ) -> Option<(u64, bool)> {
+        let position = match playlist_entry_id {
+            Some(entry_id) => self
+                .started
+                .iter()
+                .position(|load| load.playlist_entry_id == Some(entry_id))
+                .or_else(|| {
+                    self.started
+                        .iter()
+                        .position(|load| load.playlist_entry_id.is_none())
+                }),
+            None => (!self.started.is_empty()).then_some(0),
+        }?;
+        let load = self.started.remove(position)?;
+        if redirected && !load.marker_seen {
+            self.written.push_front(load.load_id);
+            return None;
+        }
+        Some((load.load_id, load.marker_seen))
+    }
 }
 
 /// MPV IPC client
@@ -41,6 +113,8 @@ pub struct MpvIpc {
     next_request_id: Arc<Mutex<u64>>,
     pending_requests: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<MpvResponse>>>>,
     last_position_update: Arc<Mutex<Option<Instant>>>,
+    active_load_generation: Arc<AtomicU64>,
+    untagged_loads: Arc<Mutex<UntaggedLoadTracker>>,
 }
 
 impl MpvIpc {
@@ -52,6 +126,8 @@ impl MpvIpc {
             next_request_id: Arc::new(Mutex::new(1)),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             last_position_update: Arc::new(Mutex::new(None)),
+            active_load_generation: Arc::new(AtomicU64::new(0)),
+            untagged_loads: Arc::new(Mutex::new(UntaggedLoadTracker::default())),
         }
     }
 
@@ -85,12 +161,21 @@ impl MpvIpc {
         let state = Arc::clone(&self.state);
         let pending_requests = Arc::clone(&self.pending_requests);
         let last_position_update = Arc::clone(&self.last_position_update);
+        let active_load_generation = Arc::clone(&self.active_load_generation);
+        let untagged_loads = Arc::clone(&self.untagged_loads);
 
         let write_event_tx = event_tx.clone();
         // Spawn write task
         tokio::spawn(async move {
             let mut write_half = write_half;
             while let Some(cmd) = cmd_rx.recv().await {
+                if cmd
+                    .load_id
+                    .is_some_and(|load_id| active_load_generation.load(Ordering::SeqCst) != load_id)
+                {
+                    debug!(load_id = ?cmd.load_id, "Dropping cancelled mpv load command");
+                    continue;
+                }
                 let json = match serde_json::to_string(&cmd) {
                     Ok(j) => j,
                     Err(e) => {
@@ -98,6 +183,12 @@ impl MpvIpc {
                         continue;
                     }
                 };
+
+                if is_untagged_generation_load(&cmd) {
+                    untagged_loads
+                        .lock()
+                        .record_written(cmd.load_id.expect("generation load without id"));
+                }
 
                 if let Err(e) = write_half.write_all(json.as_bytes()).await {
                     error!("Failed to write to MPV socket: {}", e);
@@ -116,9 +207,9 @@ impl MpvIpc {
         tokio::spawn(async move {
             let mut pending: VecDeque<MpvCommand> = VecDeque::new();
             let mut ready = true;
-            let mut last_send: Option<Instant> = None;
+            let mut next_send_at: Option<Instant> = None;
             let mut last_not_ready: Option<Instant> = None;
-            let mut interval = tokio::time::interval(Duration::from_millis(200));
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -127,27 +218,42 @@ impl MpvIpc {
                                 if last.elapsed() >= MPV_MAX_NEWFILE_COOLDOWN_TIME {
                                     ready = true;
                                     last_not_ready = None;
-                                    flush_queue(&mut pending, &mut last_send, &cmd_tx).await;
                                 }
                             }
                         }
+                        send_next_queued_command(
+                            &mut pending,
+                            &mut ready,
+                            &mut last_not_ready,
+                            &mut next_send_at,
+                            &cmd_tx,
+                        );
                     }
                     Some(message) = queue_rx.recv() => {
                         match message {
                             QueueMessage::Command(cmd) => {
-                                handle_command_queue(cmd, &mut pending, ready, &mut last_send, &cmd_tx).await;
+                                enqueue_command(cmd, &mut pending, &mut next_send_at);
                             }
                             QueueMessage::SetReady(new_ready) => {
                                 if new_ready {
                                     ready = true;
                                     last_not_ready = None;
-                                    flush_queue(&mut pending, &mut last_send, &cmd_tx).await;
                                 } else {
                                     ready = false;
                                     last_not_ready = Some(Instant::now());
                                 }
                             }
+                            QueueMessage::CancelLoad(load_id) => {
+                                cancel_queued_load(&mut pending, load_id);
+                            }
                         }
+                        send_next_queued_command(
+                            &mut pending,
+                            &mut ready,
+                            &mut last_not_ready,
+                            &mut next_send_at,
+                            &cmd_tx,
+                        );
                     }
                     else => break,
                 }
@@ -203,6 +309,7 @@ impl MpvIpc {
                             let player_event = MpvPlayerEvent::from_event_name(
                                 &event.event,
                                 event.reason.as_deref(),
+                                event.playlist_entry_id,
                             );
                             if event_tx.send(player_event).is_err() {
                                 warn!("Failed to send player event");
@@ -228,14 +335,7 @@ impl MpvIpc {
 
     /// Observe all important properties
     async fn observe_properties(&self) -> Result<()> {
-        let properties = [
-            PropertyId::TimePos,
-            PropertyId::Pause,
-            PropertyId::Filename,
-            PropertyId::Duration,
-            PropertyId::Path,
-            PropertyId::Speed,
-        ];
+        let properties = [PropertyId::TimePos, PropertyId::Pause, PropertyId::Speed];
 
         for prop in properties {
             let cmd = MpvCommand::observe_property(prop.as_u64(), prop.property_name());
@@ -257,19 +357,12 @@ impl MpvIpc {
         Ok(())
     }
 
-    /// Refresh properties via direct queries
-    pub async fn refresh_state(&self) -> Result<()> {
-        let properties = [
-            PropertyId::TimePos,
-            PropertyId::Pause,
-            PropertyId::Filename,
-            PropertyId::Duration,
-            PropertyId::Path,
-            PropertyId::Speed,
-        ];
-        let mut duration_missing = false;
-
-        for prop in properties {
+    /// Refresh only continuously changing playback properties.
+    ///
+    /// File identity is committed atomically by the SyncplayUpdateFile marker
+    /// transaction and must never be reconstructed by this polling path.
+    pub async fn refresh_playback_state(&self) -> Result<()> {
+        for prop in [PropertyId::TimePos, PropertyId::Pause, PropertyId::Speed] {
             let cmd = MpvCommand::get_property(prop.property_name(), 0);
             let response = match self.send_command_async(cmd).await {
                 Ok(response) => response,
@@ -279,45 +372,16 @@ impl MpvIpc {
                         prop.property_name(),
                         err
                     );
-                    if prop == PropertyId::Duration {
-                        duration_missing = true;
-                    }
                     continue;
                 }
             };
             if let Some(data) = response.data {
-                if prop == PropertyId::Duration && data.is_null() {
-                    duration_missing = true;
-                    self.state.lock().update_property(prop, &data);
-                    continue;
-                }
                 if prop == PropertyId::TimePos && !data.is_null() {
                     *self.last_position_update.lock() = Some(Instant::now());
                 }
                 self.state.lock().update_property(prop, &data);
-            } else if prop == PropertyId::Duration {
-                duration_missing = true;
             }
         }
-
-        if duration_missing {
-            let cmd = MpvCommand::get_property("length", 0);
-            let mut updated = false;
-            if let Ok(response) = self.send_command_async(cmd).await {
-                if let Some(data) = response.data {
-                    if !data.is_null() {
-                        self.state
-                            .lock()
-                            .update_property(PropertyId::Duration, &data);
-                        updated = true;
-                    }
-                }
-            }
-            if !updated {
-                self.state.lock().duration = Some(0.0);
-            }
-        }
-
         Ok(())
     }
 
@@ -336,6 +400,45 @@ impl MpvIpc {
         if let Some(tx) = &self.queue_tx {
             let _ = tx.send(QueueMessage::SetReady(ready));
         }
+    }
+
+    pub fn prepare_load(&self, load_id: u64) {
+        self.active_load_generation.store(load_id, Ordering::SeqCst);
+    }
+
+    pub fn cancel_load(&self, load_id: u64) {
+        let _ = self.active_load_generation.compare_exchange(
+            load_id,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        if let Some(tx) = &self.queue_tx {
+            let _ = tx.send(QueueMessage::CancelLoad(load_id));
+        }
+    }
+
+    pub fn start_untagged_load(&self, playlist_entry_id: Option<i64>) -> Option<u64> {
+        self.untagged_loads.lock().start_file(playlist_entry_id)
+    }
+
+    pub fn begin_untagged_marker(&self) -> Option<u64> {
+        self.untagged_loads.lock().begin_marker()
+    }
+
+    pub fn end_untagged_load(
+        &self,
+        playlist_entry_id: Option<i64>,
+        redirected: bool,
+    ) -> Option<(u64, bool)> {
+        self.untagged_loads
+            .lock()
+            .end_file(playlist_entry_id, redirected)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_untagged_load_for_test(&self, load_id: u64) {
+        self.untagged_loads.lock().record_written(load_id);
     }
 
     async fn send_command_async_with_timeout(
@@ -382,6 +485,13 @@ impl MpvIpc {
     /// Get current player state
     pub fn get_state(&self) -> PlayerState {
         self.state.lock().clone()
+    }
+
+    pub fn commit_media_snapshot(&self, snapshot: &MediaSnapshot) {
+        let mut state = self.state.lock();
+        state.filename = snapshot.filename.clone();
+        state.path = snapshot.path.clone();
+        state.duration = snapshot.duration;
     }
 
     /// Set playback position
@@ -444,6 +554,31 @@ impl MpvIpc {
         Ok(())
     }
 
+    pub async fn load_file_for_generation(&self, path: &str, load_id: u64) -> Result<()> {
+        let mut cmd = MpvCommand::loadfile_no_reply(path, "replace");
+        cmd.load_id = Some(load_id);
+        self.send_command(cmd)?;
+        Ok(())
+    }
+
+    pub async fn load_file_generation(
+        &self,
+        path: &str,
+        load_id: u64,
+        syntax: LoadfileOptionsSyntax,
+    ) -> Result<()> {
+        let marker = format!(
+            "<SyncplayUpdateFile>\nANS_syncplay_load_id={}\nANS_filename=${{filename}}\nANS_length=${{=duration:${{=length:0}}}}\nANS_path=${{path}}\n</SyncplayUpdateFile>",
+            load_id
+        );
+        let mut options = serde_json::Map::new();
+        options.insert("term-playing-msg".to_string(), marker.into());
+        let mut cmd = MpvCommand::loadfile_with_options(path, "replace", options, syntax);
+        cmd.load_id = Some(load_id);
+        self.send_command(cmd)?;
+        Ok(())
+    }
+
     /// Show OSD message
     pub fn show_osd(&self, text: &str, duration_ms: Option<u64>) -> Result<()> {
         let cmd = MpvCommand::show_text(text, duration_ms);
@@ -454,22 +589,6 @@ impl MpvIpc {
     pub fn quit(&self) -> Result<()> {
         let cmd = MpvCommand::quit();
         self.send_command(cmd)
-    }
-
-    pub fn update_from_term_playing_message(&self, key: &str, value: &str) {
-        let mut state = self.state.lock();
-        match key {
-            "filename" => {
-                state.filename = Some(value.to_string());
-            }
-            "length" | "duration" => {
-                state.duration = value.parse::<f64>().ok();
-            }
-            "path" => {
-                state.path = Some(value.to_string());
-            }
-            _ => {}
-        }
     }
 
     pub fn update_pause_and_position(&self, paused: Option<bool>, position: Option<f64>) {
@@ -515,6 +634,23 @@ fn queue_key(cmd: &MpvCommand) -> Option<QueueKey> {
     }
 }
 
+fn load_has_generation_marker(cmd: &MpvCommand) -> bool {
+    queue_key(cmd) == Some(QueueKey::LoadFile)
+        && cmd.command.iter().skip(3).any(|value| {
+            value
+                .as_object()
+                .and_then(|options| options.get("term-playing-msg"))
+                .and_then(|marker| marker.as_str())
+                .is_some_and(|marker| marker.contains("ANS_syncplay_load_id="))
+        })
+}
+
+fn is_untagged_generation_load(cmd: &MpvCommand) -> bool {
+    cmd.load_id.is_some()
+        && queue_key(cmd) == Some(QueueKey::LoadFile)
+        && !load_has_generation_marker(cmd)
+}
+
 fn drop_replaced_pending_requests(pending: &mut VecDeque<MpvCommand>, key: QueueKey) {
     pending.retain(|cmd| {
         let replaced = queue_key(cmd) == Some(key);
@@ -528,14 +664,33 @@ fn drop_replaced_pending_requests(pending: &mut VecDeque<MpvCommand>, key: Queue
     });
 }
 
-async fn handle_command_queue(
+fn stale_across_load(cmd: &MpvCommand) -> bool {
+    let head = cmd.command.first().and_then(|value| value.as_str());
+    match head {
+        Some("loadfile" | "get_property" | "seek") => true,
+        Some("set_property") => matches!(
+            cmd.command.get(1).and_then(|value| value.as_str()),
+            Some("time-pos" | "pause" | "speed")
+        ),
+        Some("cycle") => cmd.command.get(1).and_then(|value| value.as_str()) == Some("pause"),
+        Some("script-message-to") => {
+            cmd.command.get(2).and_then(|value| value.as_str()) == Some("get_paused_and_position")
+        }
+        _ => false,
+    }
+}
+
+fn cancel_queued_load(pending: &mut VecDeque<MpvCommand>, load_id: u64) {
+    pending.retain(|command| command.load_id != Some(load_id));
+}
+
+fn enqueue_command(
     cmd: MpvCommand,
     pending: &mut VecDeque<MpvCommand>,
-    ready: bool,
-    last_send: &mut Option<Instant>,
-    cmd_tx: &mpsc::UnboundedSender<MpvCommand>,
+    next_send_at: &mut Option<Instant>,
 ) {
-    if let Some(key) = queue_key(&cmd) {
+    let key = queue_key(&cmd);
+    if let Some(key) = key {
         match key {
             QueueKey::CyclePause => {
                 if let Some(pos) = pending
@@ -552,36 +707,47 @@ async fn handle_command_queue(
         }
     }
 
-    if ready {
-        send_with_throttle(cmd, last_send, cmd_tx).await;
-    } else {
-        pending.push_back(cmd);
+    if key == Some(QueueKey::LoadFile) {
+        pending.retain(|queued| !stale_across_load(queued));
+        pending.push_front(cmd);
+        *next_send_at = Some(Instant::now() + MPV_SENDMESSAGE_COOLDOWN_TIME);
+        return;
     }
+
+    pending.push_back(cmd);
 }
 
-async fn flush_queue(
+fn send_next_queued_command(
     pending: &mut VecDeque<MpvCommand>,
-    last_send: &mut Option<Instant>,
+    ready: &mut bool,
+    last_not_ready: &mut Option<Instant>,
+    next_send_at: &mut Option<Instant>,
     cmd_tx: &mpsc::UnboundedSender<MpvCommand>,
-) {
-    while let Some(cmd) = pending.pop_front() {
-        send_with_throttle(cmd, last_send, cmd_tx).await;
+) -> bool {
+    if next_send_at.is_some_and(|deadline| Instant::now() < deadline) {
+        return false;
     }
-}
 
-async fn send_with_throttle(
-    cmd: MpvCommand,
-    last_send: &mut Option<Instant>,
-    cmd_tx: &mpsc::UnboundedSender<MpvCommand>,
-) {
-    if let Some(last) = last_send {
-        let elapsed = last.elapsed();
-        if elapsed < MPV_SENDMESSAGE_COOLDOWN_TIME {
-            tokio::time::sleep(MPV_SENDMESSAGE_COOLDOWN_TIME - elapsed).await;
-        }
-    }
+    let cmd = if *ready {
+        pending.pop_front()
+    } else {
+        let position = pending.iter().position(load_has_generation_marker);
+        position.and_then(|position| pending.remove(position))
+    };
+    let Some(cmd) = cmd else {
+        return false;
+    };
+
+    let starts_media_transition = queue_key(&cmd) == Some(QueueKey::LoadFile);
     if cmd_tx.send(cmd).is_ok() {
-        *last_send = Some(Instant::now());
+        if starts_media_transition {
+            *ready = false;
+            *last_not_ready = Some(Instant::now());
+        }
+        *next_send_at = Some(Instant::now() + MPV_SENDMESSAGE_COOLDOWN_TIME);
+        true
+    } else {
+        false
     }
 }
 
@@ -658,15 +824,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_pause_commands_flush_in_original_order() {
+    async fn queued_pause_commands_send_in_original_order() {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let mut pending = VecDeque::from([
             MpvCommand::set_property_no_reply("pause", serde_json::Value::Bool(true)),
             MpvCommand::set_property_no_reply("pause", serde_json::Value::Bool(false)),
         ]);
-        let mut last_send = None;
+        let mut ready = true;
+        let mut last_not_ready = None;
+        let mut next_send_at = None;
 
-        flush_queue(&mut pending, &mut last_send, &cmd_tx).await;
+        assert!(send_next_queued_command(
+            &mut pending,
+            &mut ready,
+            &mut last_not_ready,
+            &mut next_send_at,
+            &cmd_tx,
+        ));
+        next_send_at = None;
+        assert!(send_next_queued_command(
+            &mut pending,
+            &mut ready,
+            &mut last_not_ready,
+            &mut next_send_at,
+            &cmd_tx,
+        ));
 
         let first = cmd_rx.recv().await.expect("first command missing");
         let second = cmd_rx.recv().await.expect("second command missing");
@@ -678,6 +860,144 @@ mod tests {
             second.command.get(2).and_then(|value| value.as_bool()),
             Some(false)
         );
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tagged_load_bypasses_the_gate_and_discards_stale_commands() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut pending = VecDeque::from([
+            MpvCommand::set_property_no_reply("time-pos", serde_json::Value::Number(10.into())),
+            MpvCommand::show_text("keep", Some(1000)),
+        ]);
+        let mut options = serde_json::Map::new();
+        options.insert(
+            "term-playing-msg".to_string(),
+            "ANS_syncplay_load_id=7".into(),
+        );
+        let mut load = MpvCommand::loadfile_with_options(
+            "latest.mkv",
+            "replace",
+            options,
+            LoadfileOptionsSyntax::Legacy,
+        );
+        load.load_id = Some(7);
+        let mut ready = false;
+        let mut last_not_ready = Some(Instant::now());
+        let mut next_send_at = None;
+
+        enqueue_command(load, &mut pending, &mut next_send_at);
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[1].command.first().and_then(|value| value.as_str()),
+            Some("show_text")
+        );
+        next_send_at = None;
+        assert!(send_next_queued_command(
+            &mut pending,
+            &mut ready,
+            &mut last_not_ready,
+            &mut next_send_at,
+            &cmd_tx,
+        ));
+        assert_eq!(
+            queue_key(&cmd_rx.recv().await.expect("load command missing")),
+            Some(QueueKey::LoadFile)
+        );
+    }
+
+    #[tokio::test]
+    async fn rapid_loads_are_debounced_to_the_latest_target() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut pending = VecDeque::new();
+        let mut ready = false;
+        let mut last_not_ready = Some(Instant::now());
+        let mut next_send_at = None;
+
+        for target in ["a.mkv", "b.mkv", "c.mkv"] {
+            enqueue_command(
+                MpvCommand::loadfile_no_reply(target, "replace"),
+                &mut pending,
+                &mut next_send_at,
+            );
+        }
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].command.get(1).and_then(|value| value.as_str()),
+            Some("c.mkv")
+        );
+        assert!(!send_next_queued_command(
+            &mut pending,
+            &mut ready,
+            &mut last_not_ready,
+            &mut next_send_at,
+            &cmd_tx,
+        ));
+
+        next_send_at = None;
+        assert!(!send_next_queued_command(
+            &mut pending,
+            &mut ready,
+            &mut last_not_ready,
+            &mut next_send_at,
+            &cmd_tx,
+        ));
+
+        ready = true;
+        assert!(send_next_queued_command(
+            &mut pending,
+            &mut ready,
+            &mut last_not_ready,
+            &mut next_send_at,
+            &cmd_tx,
+        ));
+        let command = cmd_rx.recv().await.expect("latest load missing");
+        assert_eq!(
+            command.command.get(1).and_then(|value| value.as_str()),
+            Some("c.mkv")
+        );
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn untagged_marker_and_end_file_settle_the_same_generation() {
+        let ipc = MpvIpc::new("unused");
+        ipc.record_untagged_load_for_test(3);
+        assert_eq!(ipc.start_untagged_load(Some(30)), Some(3));
+        ipc.record_untagged_load_for_test(4);
+        assert_eq!(ipc.start_untagged_load(Some(40)), Some(4));
+
+        assert_eq!(ipc.begin_untagged_marker(), Some(3));
+        assert_eq!(ipc.end_untagged_load(Some(30), false), Some((3, true)));
+        assert_eq!(ipc.begin_untagged_marker(), Some(4));
+    }
+
+    #[test]
+    fn untagged_end_file_retires_a_markerless_generation() {
+        let ipc = MpvIpc::new("unused");
+        ipc.record_untagged_load_for_test(3);
+        assert_eq!(ipc.start_untagged_load(Some(30)), Some(3));
+        ipc.record_untagged_load_for_test(4);
+
+        assert_eq!(ipc.end_untagged_load(Some(30), false), Some((3, false)));
+        assert_eq!(ipc.start_untagged_load(Some(40)), Some(4));
+        assert_eq!(ipc.begin_untagged_marker(), Some(4));
+    }
+
+    #[test]
+    fn cancelled_generation_is_removed_before_socket_write() {
+        let ipc = MpvIpc::new("unused");
+        ipc.prepare_load(7);
+        let mut command = MpvCommand::loadfile_no_reply("a.mkv", "replace");
+        command.load_id = Some(7);
+        let mut pending = VecDeque::from([command]);
+
+        ipc.cancel_load(7);
+        cancel_queued_load(&mut pending, 7);
+
+        assert_eq!(ipc.active_load_generation.load(Ordering::SeqCst), 0);
         assert!(pending.is_empty());
     }
 }

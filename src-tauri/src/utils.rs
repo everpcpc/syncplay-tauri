@@ -1,6 +1,5 @@
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use url::Url;
 
 use crate::config::PrivacyMode;
@@ -25,20 +24,6 @@ pub fn truncate_text(value: &str, max_len: usize) -> String {
 pub fn is_music_file(filename: &str) -> bool {
     let lower = filename.to_ascii_lowercase();
     MUSIC_FORMATS.iter().any(|ext| lower.ends_with(ext))
-}
-
-pub fn playlist_filename_from_path(path: &str) -> Option<String> {
-    if is_url(path) {
-        return Some(path.to_string());
-    }
-    let candidate = Path::new(path);
-    if candidate.is_file() {
-        return candidate
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.to_string());
-    }
-    None
 }
 
 pub fn is_url(value: &str) -> bool {

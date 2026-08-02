@@ -7,6 +7,8 @@ pub struct MpvCommand {
     pub command: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<u64>,
+    #[serde(skip)]
+    pub load_id: Option<u64>,
 }
 
 /// MPV JSON IPC response
@@ -34,6 +36,8 @@ pub struct MpvEvent {
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
+    pub playlist_entry_id: Option<i64>,
+    #[serde(default)]
     pub level: Option<String>,
     #[serde(default)]
     pub prefix: Option<String>,
@@ -49,6 +53,12 @@ pub enum MpvMessage {
     Event(MpvEvent),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadfileOptionsSyntax {
+    Legacy,
+    Modern,
+}
+
 #[allow(dead_code)]
 impl MpvCommand {
     /// Create a get_property command
@@ -59,6 +69,7 @@ impl MpvCommand {
                 Value::String(property.to_string()),
             ],
             request_id: Some(request_id),
+            load_id: None,
         }
     }
 
@@ -71,6 +82,7 @@ impl MpvCommand {
                 value,
             ],
             request_id: Some(request_id),
+            load_id: None,
         }
     }
 
@@ -83,6 +95,7 @@ impl MpvCommand {
                 value,
             ],
             request_id: None,
+            load_id: None,
         }
     }
 
@@ -94,6 +107,7 @@ impl MpvCommand {
                 Value::String(property.to_string()),
             ],
             request_id: None,
+            load_id: None,
         }
     }
 
@@ -105,6 +119,7 @@ impl MpvCommand {
                 Value::Number(id.into()),
             ],
             request_id: None,
+            load_id: None,
         }
     }
 
@@ -117,6 +132,7 @@ impl MpvCommand {
                 Value::String(mode.to_string()),
             ],
             request_id: Some(request_id),
+            load_id: None,
         }
     }
 
@@ -128,6 +144,29 @@ impl MpvCommand {
                 Value::String(mode.to_string()),
             ],
             request_id: None,
+            load_id: None,
+        }
+    }
+
+    pub fn loadfile_with_options(
+        path: &str,
+        mode: &str,
+        options: serde_json::Map<String, Value>,
+        syntax: LoadfileOptionsSyntax,
+    ) -> Self {
+        let mut command = vec![
+            Value::String("loadfile".to_string()),
+            Value::String(path.to_string()),
+            Value::String(mode.to_string()),
+        ];
+        if syntax == LoadfileOptionsSyntax::Modern {
+            command.push(Value::Number((-1).into()));
+        }
+        command.push(Value::Object(options));
+        Self {
+            command,
+            request_id: None,
+            load_id: None,
         }
     }
 
@@ -140,6 +179,7 @@ impl MpvCommand {
                 Value::String(mode.to_string()),
             ],
             request_id: Some(request_id),
+            load_id: None,
         }
     }
 
@@ -155,6 +195,7 @@ impl MpvCommand {
         Self {
             command,
             request_id: None,
+            load_id: None,
         }
     }
 
@@ -166,6 +207,7 @@ impl MpvCommand {
                 Value::String(property.to_string()),
             ],
             request_id: Some(request_id),
+            load_id: None,
         }
     }
 
@@ -174,6 +216,7 @@ impl MpvCommand {
         Self {
             command: vec![Value::String("quit".to_string())],
             request_id: None,
+            load_id: None,
         }
     }
 
@@ -188,6 +231,7 @@ impl MpvCommand {
         Self {
             command,
             request_id: None,
+            load_id: None,
         }
     }
 
@@ -199,6 +243,48 @@ impl MpvCommand {
                 Value::String(level.to_string()),
             ],
             request_id: None,
+            load_id: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options() -> serde_json::Map<String, Value> {
+        serde_json::from_value(serde_json::json!({
+            "term-playing-msg": "marker"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_loadfile_places_options_after_mode() {
+        let command = MpvCommand::loadfile_with_options(
+            "movie.mkv",
+            "replace",
+            options(),
+            LoadfileOptionsSyntax::Legacy,
+        );
+
+        assert_eq!(command.command.len(), 4);
+        assert_eq!(command.command[3]["term-playing-msg"], "marker");
+        assert_eq!(command.request_id, None);
+    }
+
+    #[test]
+    fn modern_loadfile_places_insertion_index_before_options() {
+        let command = MpvCommand::loadfile_with_options(
+            "movie.mkv",
+            "replace",
+            options(),
+            LoadfileOptionsSyntax::Modern,
+        );
+
+        assert_eq!(command.command.len(), 5);
+        assert_eq!(command.command[3], serde_json::json!(-1));
+        assert_eq!(command.command[4]["term-playing-msg"], "marker");
+        assert_eq!(command.request_id, None);
     }
 }

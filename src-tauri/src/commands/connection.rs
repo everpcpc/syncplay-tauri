@@ -4,10 +4,10 @@ use crate::app_state::{
     AppState, ConnectionSnapshot, ConnectionStatusEvent, ServerFeatures, WarningTimerState,
     WarningTimers,
 };
+use crate::client::playback_runtime;
 use crate::client::sync::{
     FASTFORWARD_BEHIND_THRESHOLD, FASTFORWARD_EXTRA_TIME, FASTFORWARD_RESET_THRESHOLD,
 };
-use crate::commands::playlist::apply_playlist_index_from_server;
 use crate::config::{save_config, ServerConfig};
 use crate::network::connection::Connection;
 use crate::network::messages::{
@@ -241,7 +241,6 @@ fn start_connection_session(
     let config = state.config.lock().clone();
     state.client_state.set_username(snapshot.username.clone());
     state.client_state.set_room(snapshot.room.clone());
-    *state.had_first_playlist_index.lock() = false;
     if !state.reconnect_state.lock().running {
         *state.playlist_may_need_restoring.lock() = false;
     }
@@ -250,6 +249,7 @@ fn start_connection_session(
     *state.last_updated_file_time.lock() = None;
     *state.last_paused_on_leave_time.lock() = None;
     *state.last_global_update.lock() = None;
+    state.client_state.set_global_state(0.0, true, None);
     *state.last_protocol_activity.lock() = Some(std::time::Instant::now());
     state.sync_engine.lock().update_from_config(&config.user);
     update_autoplay_state(state, &config);
@@ -280,6 +280,17 @@ fn start_connection_session(
     let state_clone = state.clone();
     tokio::spawn(async move {
         while let Some(message) = receiver.recv().await {
+            let is_current_session = match (
+                session_connection.as_ref(),
+                state_clone.connection.lock().as_ref(),
+            ) {
+                (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
+                _ => false,
+            };
+            if !is_current_session {
+                tracing::debug!("Ignoring message from superseded connection session");
+                break;
+            }
             tracing::debug!("Received message: {:?}", message);
             handle_server_message(message, &state_clone).await;
         }
@@ -370,12 +381,9 @@ async fn complete_server_login(state: &Arc<AppState>, hello: HelloMessage) {
     if let Err(e) = ensure_player_connected(state).await {
         tracing::warn!("Failed to connect to player after login: {}", e);
     }
-    if let Some(player) = state.player.lock().clone() {
-        let player_state = player.get_state();
-        if (player_state.filename.is_some() || player_state.path.is_some())
-            && !crate::player::controller::is_placeholder_file(state, &player_state)
-        {
-            crate::player::controller::send_file_update(state, &player_state);
+    if let Some(media) = playback_runtime::confirmed_media(state) {
+        if let Err(error) = crate::player::controller::send_committed_file_update(state, &media) {
+            tracing::warn!("Failed to restore confirmed file after login: {}", error);
         }
     }
 
@@ -464,7 +472,7 @@ fn start_reconnect_loop(state: Arc<AppState>) {
             );
 
             if attempt == 1 {
-                reset_transient_connection_state(&state);
+                reset_transient_connection_state(&state).await;
                 *state.playlist_may_need_restoring.lock() = true;
                 state.emit_event(
                     "tls-status-changed",
@@ -1201,10 +1209,11 @@ pub(crate) fn emit_error_message(state: &Arc<AppState>, message: &str) {
     );
 }
 
-pub(crate) fn reset_room_sync_state(state: &Arc<AppState>) {
+pub(crate) async fn reset_room_sync_state(state: &Arc<AppState>) {
     *state.last_global_update.lock() = None;
-    *state.had_first_playlist_index.lock() = false;
+    state.client_state.set_global_state(0.0, true, None);
     *state.playlist_may_need_restoring.lock() = false;
+    playback_runtime::reconnect(state).await;
 }
 
 pub(crate) fn maybe_show_osd(
@@ -1422,9 +1431,10 @@ fn compute_room_warning_state(
         .collect();
     let alone = others_in_room.is_empty() && !recently_connected(state);
 
-    let current_file = state.client_state.get_file();
-    let current_size = state.client_state.get_file_size();
-    let current_duration = state.client_state.get_file_duration();
+    let current_media = state.client_state.get_file_info();
+    let current_file = current_media.name;
+    let current_size = current_media.size;
+    let current_duration = current_media.duration;
     let mut diff_name = false;
     let mut diff_size = false;
     let mut diff_duration = false;
@@ -1616,24 +1626,16 @@ fn send_controller_auth(state: &Arc<AppState>, room: &str, password: &str) -> Re
         .map_err(|e| format!("Failed to send controller auth: {}", e))
 }
 
-pub(crate) fn reset_transient_connection_state(state: &Arc<AppState>) {
+pub(crate) async fn reset_transient_connection_state(state: &Arc<AppState>) {
     state.client_state.clear_users();
-    state.client_state.set_file(None);
     state.client_state.set_ready_state(None);
     state.client_state.clear_server_version();
-    state.client_state.set_global_state(0.0, true, None);
     *state.local_playback_state.lock() = crate::client::local_state::LocalPlaybackState::new();
-    state.playlist.clear();
-    state.emit_event(
-        "playlist-updated",
-        crate::app_state::PlaylistEvent {
-            items: Vec::new(),
-            current_index: None,
-        },
-    );
+    playback_runtime::reconnect(state).await;
     *state.server_features.lock() = ServerFeatures::default();
     *state.ignoring_on_the_fly.lock() = crate::app_state::IgnoringOnTheFlyState::default();
     *state.last_global_update.lock() = None;
+    state.client_state.set_global_state(0.0, true, None);
     *state.last_latency_calculation.lock() = None;
     *state.last_protocol_activity.lock() = None;
     *state.last_rewind_time.lock() = None;
@@ -1642,7 +1644,6 @@ pub(crate) fn reset_transient_connection_state(state: &Arc<AppState>) {
     *state.last_updated_file_time.lock() = None;
     *state.last_paused_on_leave_time.lock() = None;
     *state.playlist_may_need_restoring.lock() = false;
-    *state.had_first_playlist_index.lock() = false;
     *state.room_warning_state.lock() = crate::app_state::RoomWarningState::default();
     *state.warning_timers.lock() = WarningTimers::default();
     *state.room_warning_task_running.lock() = false;
@@ -1711,10 +1712,9 @@ async fn handle_connection_closed_for_session(
 }
 
 async fn handle_set_message(state: &Arc<AppState>, set_msg: SetMessage) {
-    let has_index_update = set_msg.playlist_index.is_some();
     if let Some(room) = set_msg.room {
         state.client_state.set_room(room.name);
-        reset_room_sync_state(state);
+        reset_room_sync_state(state).await;
         reidentify_as_controller(state);
     }
 
@@ -1813,147 +1813,104 @@ async fn handle_set_message(state: &Arc<AppState>, set_msg: SetMessage) {
     }
 
     let config = state.config.lock().clone();
-    if shared_playlists_enabled(state, &config) {
-        let mut emit_playlist = false;
-        if let Some(change) = set_msg.playlist_change {
-            let room = state.client_state.get_room();
-            let mut should_restore = false;
-            {
-                let mut may_restore = state.playlist_may_need_restoring.lock();
-                if *may_restore {
-                    *may_restore = false;
-                    if change.files.is_empty()
-                        && change.user.is_none()
-                        && !state.playlist.get_item_filenames().is_empty()
-                        && !state.playlist.playlist_buffer_is_from_old_room(&room)
-                    {
-                        should_restore = true;
-                    }
-                }
-            }
+    let shared_playlists = shared_playlists_enabled(state, &config);
+    let room = state.client_state.get_room();
+    let mut playlist_items = None;
 
-            if should_restore {
-                let items = state.playlist.get_item_filenames();
-                let restore_message = ProtocolMessage::Set {
-                    Set: Box::new(SetMessage {
-                        room: None,
-                        file: None,
-                        user: None,
-                        ready: None,
-                        playlist_index: None,
-                        playlist_change: Some(crate::network::messages::PlaylistChange {
-                            user: None,
-                            files: items.clone(),
-                        }),
-                        controller_auth: None,
-                        new_controlled_room: None,
-                        features: None,
-                    }),
-                };
-                if let Some(connection) = state.connection.lock().clone() {
-                    if let Err(e) = connection.send(restore_message) {
-                        tracing::warn!("Failed to restore playlist: {}", e);
-                    }
-                    if let Some(index) = state.playlist.get_current_index() {
-                        let index_message = ProtocolMessage::Set {
-                            Set: Box::new(SetMessage {
-                                room: None,
-                                file: None,
-                                user: None,
-                                ready: None,
-                                playlist_index: Some(
-                                    crate::network::messages::PlaylistIndexUpdate {
-                                        user: None,
-                                        index: Some(index),
-                                    },
-                                ),
-                                playlist_change: None,
-                                controller_auth: None,
-                                new_controlled_room: None,
-                                features: None,
-                            }),
-                        };
-                        if let Err(e) = connection.send(index_message) {
-                            tracing::warn!("Failed to restore playlist index: {}", e);
-                        }
-                    }
-                }
-            } else {
-                state
-                    .playlist
-                    .update_previous_playlist(&change.files, &room);
-                let current_index = state.playlist.get_current_index();
-                let next_index = match current_index {
-                    Some(index) if index < change.files.len() => Some(index),
-                    _ if change.files.is_empty() => None,
-                    _ => Some(0),
-                };
-                state
-                    .playlist
-                    .set_items_with_index(change.files, next_index);
-                emit_playlist = true;
-                if let Some(user) = change.user {
-                    let message = format!("{} updated the playlist", user);
-                    emit_system_message(state, &message);
-                    maybe_show_osd(state, &config, &message, config.user.show_same_room_osd);
-                }
-                if !has_index_update && state.client_state.get_file().is_none() {
-                    if let Some(index) = state.playlist.get_current_index() {
-                        if let Err(e) = apply_playlist_index_from_server(state, index, false).await
-                        {
-                            tracing::warn!("Failed to load playlist after sync: {}", e);
-                        }
-                    }
-                }
-            }
+    if let Some(change) = set_msg.playlist_change {
+        let should_restore = {
+            let mut may_restore = state.playlist_may_need_restoring.lock();
+            let should_restore = shared_playlists
+                && *may_restore
+                && change.files.is_empty()
+                && change.user.is_none()
+                && !state.playlist.snapshot().0.is_empty()
+                && !state.playlist.playlist_buffer_is_from_old_room(&room);
+            *may_restore = false;
+            should_restore
+        };
+
+        if should_restore {
+            restore_playlist_after_reconnect(state);
+        } else {
+            playlist_items = Some(change.files);
         }
 
-        if let Some(index_update) = set_msg.playlist_index {
-            if let Some(index) = index_update.index {
-                let reset_position = {
-                    let mut had_first = state.had_first_playlist_index.lock();
-                    if !*had_first {
-                        *had_first = true;
-                        false
-                    } else {
-                        true
-                    }
-                };
-                let mut skipped_load = false;
-                let user = index_update.user.clone();
-                let items = state.playlist.get_item_filenames();
-                if let Some(filename) = items.get(index) {
-                    if same_filename(state.client_state.get_file().as_deref(), Some(filename)) {
-                        state.playlist.set_current_index(index);
-                        state
-                            .playlist
-                            .set_queued_index_filename(Some(filename.clone()));
-                        emit_playlist_update(state);
-                        skipped_load = true;
-                    }
-                }
-                if !skipped_load {
-                    if let Err(e) =
-                        apply_playlist_index_from_server(state, index, reset_position).await
-                    {
-                        tracing::warn!("Failed to apply playlist index: {}", e);
-                    }
-                }
-                if let Some(user) = user {
-                    let message = format!("{} changed the playlist selection", user);
-                    emit_system_message(state, &message);
-                    maybe_show_osd(state, &config, &message, config.user.show_same_room_osd);
-                }
-                emit_playlist = false;
+        if let Some(user) = change.user {
+            let message = format!("{} updated the playlist", user);
+            emit_system_message(state, &message);
+            maybe_show_osd(state, &config, &message, config.user.show_same_room_osd);
+        }
+    }
+
+    let mut playlist_index = None;
+    if let Some(index_update) = set_msg.playlist_index {
+        playlist_index = Some((index_update.index, true));
+        if index_update.index.is_some() {
+            if let Some(user) = index_update.user {
+                let message = format!("{} changed the playlist selection", user);
+                emit_system_message(state, &message);
+                maybe_show_osd(state, &config, &message, config.user.show_same_room_osd);
             }
         }
+    }
 
-        if emit_playlist {
-            emit_playlist_update(state);
+    if playlist_items.is_some() || playlist_index.is_some() {
+        if let Err(error) =
+            playback_runtime::server_playlist_and_index(state, playlist_items, playlist_index).await
+        {
+            tracing::warn!("Failed to apply server playlist state: {}", error);
         }
     }
 
     evaluate_autoplay(state);
+}
+
+fn restore_playlist_after_reconnect(state: &Arc<AppState>) {
+    let Some(connection) = state.connection.lock().clone() else {
+        return;
+    };
+    let (items, index) = state.playlist.snapshot();
+    let playlist_message = ProtocolMessage::Set {
+        Set: Box::new(SetMessage {
+            room: None,
+            file: None,
+            user: None,
+            ready: None,
+            playlist_index: None,
+            playlist_change: Some(crate::network::messages::PlaylistChange {
+                user: None,
+                files: items,
+            }),
+            controller_auth: None,
+            new_controlled_room: None,
+            features: None,
+        }),
+    };
+    if let Err(error) = connection.send(playlist_message) {
+        tracing::warn!("Failed to restore playlist: {}", error);
+        return;
+    }
+
+    let index_message = ProtocolMessage::Set {
+        Set: Box::new(SetMessage {
+            room: None,
+            file: None,
+            user: None,
+            ready: None,
+            playlist_index: Some(crate::network::messages::PlaylistIndexUpdate {
+                user: None,
+                index,
+            }),
+            playlist_change: None,
+            controller_auth: None,
+            new_controlled_room: None,
+            features: None,
+        }),
+    };
+    if let Err(error) = connection.send(index_message) {
+        tracing::warn!("Failed to restore playlist index: {}", error);
+    }
 }
 
 fn handle_controller_auth(state: &Arc<AppState>, auth: ControllerAuth) {
@@ -2008,7 +1965,7 @@ async fn handle_new_controlled_room(state: &Arc<AppState>, room: NewControlledRo
     emit_system_message(state, &message);
 
     state.client_state.set_room(room_name.clone());
-    reset_room_sync_state(state);
+    reset_room_sync_state(state).await;
     if let Some(connection) = state.connection.lock().clone() {
         let set_room = ProtocolMessage::Set {
             Set: Box::new(SetMessage {
@@ -2829,9 +2786,10 @@ fn file_differences(
     if user.room != state.client_state.get_room() {
         return None;
     }
-    let current_file = state.client_state.get_file();
-    let current_size = state.client_state.get_file_size();
-    let current_duration = state.client_state.get_file_duration();
+    let current_media = state.client_state.get_file_info();
+    let current_file = current_media.name;
+    let current_size = current_media.size;
+    let current_duration = current_media.duration;
     let (Some(current_file), Some(other_file)) = (current_file.as_ref(), user.file.as_ref()) else {
         return None;
     };
@@ -2885,22 +2843,6 @@ fn emit_user_list(state: &Arc<AppState>) {
     );
 }
 
-fn emit_playlist_update(state: &Arc<AppState>) {
-    let items: Vec<String> = state
-        .playlist
-        .get_items()
-        .iter()
-        .map(|item| item.filename.clone())
-        .collect();
-    state.emit_event(
-        "playlist-updated",
-        crate::app_state::PlaylistEvent {
-            items,
-            current_index: state.playlist.get_current_index(),
-        },
-    );
-}
-
 #[tauri::command]
 pub async fn disconnect_from_server(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     disconnect_from_server_state(state.inner()).await
@@ -2925,13 +2867,12 @@ pub(crate) async fn disconnect_from_server_state(state: &Arc<AppState>) -> Resul
     stop_player(state).await?;
 
     state.client_state.clear_users();
-    state.playlist.clear();
     state.client_state.set_file(None);
+    playback_runtime::reset(state).await;
     state.client_state.set_ready_state(None);
     state.client_state.clear_server_version();
     *state.server_features.lock() = ServerFeatures::default();
     *state.playlist_may_need_restoring.lock() = false;
-    *state.had_first_playlist_index.lock() = false;
     *state.last_connect_time.lock() = None;
     *state.last_rewind_time.lock() = None;
     *state.last_advance_time.lock() = None;
@@ -2946,13 +2887,6 @@ pub(crate) async fn disconnect_from_server_state(state: &Arc<AppState>) -> Resul
     *state.warning_timers.lock() = WarningTimers::default();
     *state.room_warning_task_running.lock() = false;
     state.emit_event("user-list-updated", serde_json::json!({ "users": [] }));
-    state.emit_event(
-        "playlist-updated",
-        crate::app_state::PlaylistEvent {
-            items: Vec::new(),
-            current_index: None,
-        },
-    );
 
     // Emit connection status event
     state.emit_event(
@@ -3022,6 +2956,23 @@ mod lifecycle_tests {
     use crate::player::backend::{FakePlayerCommand, FakePlayerFactory};
     use std::sync::Arc;
     use tokio::time::{sleep, timeout, Duration};
+
+    #[tokio::test]
+    async fn reconnect_clears_stale_global_playback_state() {
+        let state = AppState::new();
+        state
+            .client_state
+            .set_global_state(73.0, false, Some("old-peer".to_string()));
+        *state.last_global_update.lock() = Some(std::time::Instant::now());
+
+        reset_transient_connection_state(&state).await;
+
+        let global = state.client_state.get_global_state();
+        assert_eq!(global.position, 0.0);
+        assert!(global.paused);
+        assert!(global.set_by.is_none());
+        assert!(state.last_global_update.lock().is_none());
+    }
 
     async fn expect_client_tls_or_hello(server: &mut FakeSyncplayServer) {
         match timeout(Duration::from_secs(3), server.next_received())
@@ -3297,13 +3248,16 @@ mod lifecycle_tests {
         });
         state.client_state.set_file(Some("local.mkv".to_string()));
         state.client_state.set_ready_state(Some(true));
-        state
-            .playlist
-            .set_items(vec!["one.mkv".to_string(), "two.mkv".to_string()]);
+        playback_runtime::replace_playlist(
+            &state,
+            vec!["one.mkv".to_string(), "two.mkv".to_string()],
+            Some(1),
+        )
+        .await
+        .unwrap();
         *state.last_global_update.lock() = Some(std::time::Instant::now());
         *state.last_state_message_sent.lock() = Some(std::time::Instant::now());
         *state.last_protocol_activity.lock() = Some(std::time::Instant::now());
-        *state.had_first_playlist_index.lock() = true;
 
         let reconnect_tx = server.take_command_sender();
         reconnect_tx
@@ -3319,9 +3273,15 @@ mod lifecycle_tests {
                         _ = sleep(Duration::from_millis(10)) => {
                             if state.reconnect_state.lock().running {
                                 assert_eq!(state.client_state.get_users().len(), 0);
-                                assert!(state.client_state.get_file().is_none());
+                                assert_eq!(state.client_state.get_file().as_deref(), Some("local.mkv"));
                                 assert!(state.client_state.ready_state().is_none());
-                                assert!(state.playlist.is_empty());
+                                assert_eq!(
+                                    state.playlist.snapshot(),
+                                    (
+                                        vec!["one.mkv".to_string(), "two.mkv".to_string()],
+                                        Some(1)
+                                    )
+                                );
                                 assert!(*state.playlist_may_need_restoring.lock());
                                 assert!(state.connection.lock().is_none() || state.connection.lock().as_ref().map(|connection| !matches!(connection.state(), crate::network::connection::ConnectionState::Authenticated)).unwrap_or(true));
                                 assert!(state.player.lock().is_some(), "remote close must not stop player");
@@ -3354,9 +3314,12 @@ mod lifecycle_tests {
         }
 
         assert_eq!(state.client_state.get_users().len(), 0);
-        assert!(state.client_state.get_file().is_none());
+        assert_eq!(state.client_state.get_file().as_deref(), Some("local.mkv"));
         assert!(state.client_state.ready_state().is_none());
-        assert!(state.playlist.is_empty());
+        assert_eq!(
+            state.playlist.snapshot(),
+            (vec!["one.mkv".to_string(), "two.mkv".to_string()], Some(1))
+        );
         assert!(*state.playlist_may_need_restoring.lock());
         assert!(
             state.connection.lock().is_none()
