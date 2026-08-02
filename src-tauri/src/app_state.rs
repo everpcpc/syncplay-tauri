@@ -4,10 +4,12 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use tempfile::TempDir;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::client::{
     chat::ChatManager, local_state::LocalPlaybackState, media_index::MediaIndex,
-    playlist::Playlist, state::ClientState, sync::SyncEngine,
+    playback_runtime::PlaybackCoordinator, playlist::Playlist, state::ClientState,
+    sync::SyncEngine,
 };
 use crate::config::{SyncplayConfig, UnpauseAction};
 use crate::network::connection::Connection;
@@ -23,18 +25,20 @@ pub struct AppState {
     pub player: Arc<Mutex<Option<Arc<dyn PlayerBackend>>>>,
     /// Player process handle
     pub player_process: Arc<Mutex<Option<tokio::process::Child>>>,
+    /// Serializes player installation and teardown across asynchronous callbacks.
+    pub player_lifecycle: Arc<AsyncMutex<()>>,
     /// Client state (users, room, etc.)
     pub client_state: Arc<ClientState>,
     /// Playlist manager
     pub playlist: Arc<Playlist>,
+    /// Serialized playlist/file transition state.
+    pub playback: Arc<PlaybackCoordinator>,
     /// Chat manager
     pub chat: Arc<ChatManager>,
     /// Synchronization engine
     pub sync_engine: Arc<Mutex<SyncEngine>>,
     /// Cached configuration
     pub config: Arc<Mutex<SyncplayConfig>>,
-    /// Suppress next file update for server-driven loads
-    pub suppress_next_file_update: Arc<Mutex<bool>>,
     /// Last hello payload (for TLS re-handshake)
     pub last_hello: Arc<Mutex<Option<HelloMessage>>>,
     /// Whether hello has been sent for the current connection
@@ -85,8 +89,6 @@ pub struct AppState {
     pub manual_disconnect: Arc<Mutex<bool>>,
     /// Warning timers for OSD warnings
     pub warning_timers: Arc<Mutex<WarningTimers>>,
-    /// Whether the first playlist index has been received
-    pub had_first_playlist_index: Arc<Mutex<bool>>,
     /// Last time a player process was spawned
     pub last_player_spawn: Arc<Mutex<Option<Instant>>>,
     /// Kind of the last spawned player
@@ -157,12 +159,13 @@ impl AppState {
             connection: Arc::new(Mutex::new(None)),
             player: Arc::new(Mutex::new(None)),
             player_process: Arc::new(Mutex::new(None)),
+            player_lifecycle: Arc::new(AsyncMutex::new(())),
             client_state: ClientState::new(),
             playlist: Playlist::new(),
+            playback: Arc::new(PlaybackCoordinator::new()),
             chat: ChatManager::new(),
             sync_engine: Arc::new(Mutex::new(SyncEngine::new())),
             config: Arc::new(Mutex::new(SyncplayConfig::default())),
-            suppress_next_file_update: Arc::new(Mutex::new(false)),
             last_hello: Arc::new(Mutex::new(None)),
             hello_sent: Arc::new(Mutex::new(false)),
             app_handle: Arc::new(Mutex::new(None)),
@@ -188,7 +191,6 @@ impl AppState {
             reconnect_snapshot: Arc::new(Mutex::new(None)),
             manual_disconnect: Arc::new(Mutex::new(false)),
             warning_timers: Arc::new(Mutex::new(WarningTimers::default())),
-            had_first_playlist_index: Arc::new(Mutex::new(false)),
             last_player_spawn: Arc::new(Mutex::new(None)),
             last_player_kind: Arc::new(Mutex::new(None)),
             mpv_runtime_dir: Arc::new(Mutex::new(None)),
@@ -245,12 +247,13 @@ impl Default for AppState {
             connection: Arc::new(Mutex::new(None)),
             player: Arc::new(Mutex::new(None)),
             player_process: Arc::new(Mutex::new(None)),
+            player_lifecycle: Arc::new(AsyncMutex::new(())),
             client_state: ClientState::new(),
             playlist: Playlist::new(),
+            playback: Arc::new(PlaybackCoordinator::new()),
             chat: ChatManager::new(),
             sync_engine: Arc::new(Mutex::new(SyncEngine::new())),
             config: Arc::new(Mutex::new(SyncplayConfig::default())),
-            suppress_next_file_update: Arc::new(Mutex::new(false)),
             last_hello: Arc::new(Mutex::new(None)),
             hello_sent: Arc::new(Mutex::new(false)),
             app_handle: Arc::new(Mutex::new(None)),
@@ -276,7 +279,6 @@ impl Default for AppState {
             reconnect_snapshot: Arc::new(Mutex::new(None)),
             manual_disconnect: Arc::new(Mutex::new(false)),
             warning_timers: Arc::new(Mutex::new(WarningTimers::default())),
-            had_first_playlist_index: Arc::new(Mutex::new(false)),
             last_player_spawn: Arc::new(Mutex::new(None)),
             last_player_kind: Arc::new(Mutex::new(None)),
             mpv_runtime_dir: Arc::new(Mutex::new(None)),

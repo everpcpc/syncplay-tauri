@@ -36,7 +36,7 @@ pub async fn change_room<R: Runtime>(
 
     // Update client state
     state.client_state.set_room(room.clone());
-    reset_room_sync_state(state.inner());
+    reset_room_sync_state(state.inner()).await;
 
     let message = ProtocolMessage::Set {
         Set: Box::new(SetMessage {

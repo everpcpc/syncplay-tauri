@@ -1,12 +1,12 @@
 use crate::app_state::{AppState, PlayerStateEvent};
 use crate::client::media_index::{resolve_exact_in_directory, resolve_similar_in_directory};
-use crate::commands::playlist::{
-    apply_playlist_index_from_server, change_playlist_from_filename, send_playlist_index,
-    shared_playlists_enabled,
-};
+use crate::client::playback::{CommittedMedia, LoadId, PlaybackEvent};
+use crate::client::playback_runtime;
+use crate::commands::playlist::shared_playlists_enabled;
 use crate::config::{SyncplayConfig, UnpauseAction};
 use crate::network::messages::{FileInfo, PlayState, ProtocolMessage, ReadyState, SetMessage};
 use crate::player::backend::{player_kind_from_path_or_default, PlayerBackend, PlayerKind};
+use crate::player::commands::{LoadfileOptionsSyntax, MpvCommand};
 use crate::player::mpc_api::MpcApiBackend;
 use crate::player::mplayer_slave::MplayerBackend;
 use crate::player::mpv_backend::MpvBackend;
@@ -14,7 +14,7 @@ use crate::player::mpv_ipc::MpvIpc;
 use crate::player::properties::PlayerState;
 use crate::player::vlc_syncplay::VlcSyncplayBackend;
 use crate::utils::{
-    apply_privacy, is_music_file, is_trustable_and_trusted, is_url, same_filename, truncate_text,
+    apply_privacy, is_music_file, is_trustable_and_trusted, is_url, truncate_text,
     PRIVACY_HIDDEN_FILENAME,
 };
 use regex::Regex;
@@ -39,9 +39,30 @@ const DOUBLE_CHECK_REWIND: bool = true;
 const DOUBLE_CHECK_REWIND_POSITION_THRESHOLD: f64 = 5.0;
 const DOUBLE_CHECK_REWIND_DELAYS: [f64; 3] = [0.5, 1.0, 1.5];
 const RECENT_REWIND_FILE_UPDATE_SHIFT_SECONDS: f64 = 4.5;
-const FILE_UPDATE_AFTER_LOAD_DELAY_MS: u64 = 200;
 const PLAYER_SHUTDOWN_TIMEOUT_MS: u64 = 750;
 const PLAYER_PROCESS_KILL_TIMEOUT_MS: u64 = 750;
+const PLAYER_LOAD_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+pub(crate) enum LoadMediaError {
+    MediaNotFound(String),
+    Failed(String),
+    Superseded,
+}
+
+impl std::fmt::Display for LoadMediaError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MediaNotFound(message) | Self::Failed(message) => formatter.write_str(message),
+            Self::Superseded => formatter.write_str("Media load was superseded"),
+        }
+    }
+}
+
+pub(crate) struct StartedMediaLoad {
+    pub lease: playback_runtime::LoadLease,
+    pub is_stream: bool,
+}
 
 struct PlayerConnectingGuard<'a> {
     flag: &'a parking_lot::Mutex<bool>,
@@ -60,6 +81,7 @@ impl<'a> Drop for PlayerConnectingGuard<'a> {
 }
 
 pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String> {
+    let _lifecycle_guard = state.player_lifecycle.lock().await;
     if state.is_player_connected() {
         tracing::debug!("player_lifecycle: ensure connected skipped; backend already connected");
         return Ok(());
@@ -188,19 +210,26 @@ pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String
                 }
             };
             let stdout = child.as_mut().and_then(|process| process.stdout.take());
-            let osc_compatible = match kind {
-                PlayerKind::Iina | PlayerKind::MpvNet => true,
-                _ => check_mpv_version(&player_path)?.osc_visibility_change_compatible,
+            let queried_version_flags = query_mpv_version_flags(&mpv).await;
+            let version_flags = match kind {
+                PlayerKind::Iina | PlayerKind::MpvNet => MpvVersionFlags {
+                    osc_visibility_change_compatible: true,
+                    loadfile_options_syntax: queried_version_flags
+                        .and_then(|flags| flags.loadfile_options_syntax),
+                },
+                _ => queried_version_flags.unwrap_or(check_mpv_version(&player_path)?),
             };
             let backend = Arc::new(MpvBackend::new(
                 kind,
                 mpv,
                 Arc::downgrade(state),
-                osc_compatible,
+                version_flags.loadfile_options_syntax,
+                version_flags.osc_visibility_change_compatible,
                 stdout,
             ));
-            backend.spawn_event_loop(event_rx);
             let backend_dyn: Arc<dyn PlayerBackend> = backend.clone();
+            *state.player.lock() = Some(backend_dyn.clone());
+            backend.spawn_event_loop(event_rx);
             (backend_dyn, child)
         }
         PlayerKind::Vlc => {
@@ -279,6 +308,28 @@ pub async fn restart_player(state: &Arc<AppState>) -> Result<(), String> {
 }
 
 pub async fn stop_player(state: &Arc<AppState>) -> Result<(), String> {
+    let _lifecycle_guard = state.player_lifecycle.lock().await;
+    stop_player_locked(state).await
+}
+
+pub(crate) async fn stop_player_instance(
+    state: &Arc<AppState>,
+    instance_id: u64,
+) -> Result<(), String> {
+    let _lifecycle_guard = state.player_lifecycle.lock().await;
+    let is_current = state
+        .player
+        .lock()
+        .as_ref()
+        .is_some_and(|player| player.instance_id() == instance_id);
+    if !is_current {
+        return Ok(());
+    }
+    stop_player_locked(state).await
+}
+
+async fn stop_player_locked(state: &Arc<AppState>) -> Result<(), String> {
+    playback_runtime::player_disconnected(state).await;
     let player = state.player.lock().take();
     let child = state.player_process.lock().take();
     let player_kind = player.as_ref().map(|player| player.kind());
@@ -294,7 +345,6 @@ pub async fn stop_player(state: &Arc<AppState>) -> Result<(), String> {
     *state.player_connecting.lock() = false;
     *state.mpv_socket_path.lock() = None;
     *state.mpv_runtime_dir.lock() = None;
-    *state.suppress_next_file_update.lock() = false;
 
     if let Some(player) = player {
         match timeout(
@@ -331,56 +381,99 @@ pub async fn stop_player(state: &Arc<AppState>) -> Result<(), String> {
 
 pub fn spawn_player_state_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
-        let mut last_observed: Option<PlayerStateSnapshot> = None;
-        let mut eof_sent = false;
+        let mut media_candidate: Option<PlayerMediaObservation> = None;
+        let mut committed_observation: Option<PlayerMediaObservation> = None;
+        let mut observed_player: Option<Arc<dyn PlayerBackend>> = None;
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
             let player = state.player.lock().clone();
-            let Some(player) = player else { continue };
+            let Some(player) = player else {
+                observed_player = None;
+                media_candidate = None;
+                committed_observation = None;
+                continue;
+            };
+            let player_changed = observed_player
+                .as_ref()
+                .is_none_or(|observed| !Arc::ptr_eq(observed, &player));
+            if player_changed {
+                observed_player = Some(player.clone());
+                media_candidate = None;
+                committed_observation = None;
+            }
             if !player.is_connected() {
                 tracing::warn!("Player backend disconnected; clearing stale player state");
-                clear_disconnected_player(&state, &player);
-                last_observed = None;
-                eof_sent = false;
+                clear_disconnected_player(&state, &player).await;
+                media_candidate = None;
+                committed_observation = None;
                 continue;
             }
             if let Err(e) = player.poll_state().await {
                 tracing::warn!("Failed to poll player state: {}", e);
                 if !player.is_connected() {
-                    clear_disconnected_player(&state, &player);
-                    last_observed = None;
-                    eof_sent = false;
+                    clear_disconnected_player(&state, &player).await;
+                    media_candidate = None;
+                    committed_observation = None;
                     continue;
                 }
             }
+            let is_current = state
+                .player
+                .lock()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &player));
+            if !is_current {
+                observed_player = None;
+                media_candidate = None;
+                committed_observation = None;
+                continue;
+            }
             let player_state = player.get_state();
             emit_player_state(&state, &player_state);
+
+            let is_placeholder = is_placeholder_file(&state, &player_state);
+            if !player.reports_atomic_media_commits() && !is_placeholder {
+                let observation = PlayerMediaObservation::from(&player_state);
+                let stable = media_candidate.as_ref() == Some(&observation);
+                let not_committed = committed_observation.as_ref() != Some(&observation);
+                if stable && not_committed {
+                    let commit = {
+                        let _transition_guard = state.playback.media_transition.lock().await;
+                        let _lifecycle_guard = state.player_lifecycle.lock().await;
+                        let is_current = state
+                            .player
+                            .lock()
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &player));
+                        if !is_current {
+                            observed_player = None;
+                            media_candidate = None;
+                            committed_observation = None;
+                            continue;
+                        }
+                        match commit_player_state(&state, Some(&player), &player_state, None).await
+                        {
+                            Ok(commit) => commit,
+                            Err(error) => {
+                                tracing::warn!("Failed to commit player media: {}", error);
+                                playback_runtime::DispatchResult::default()
+                            }
+                        }
+                    };
+                    if commit.media_settled {
+                        committed_observation = Some(observation.clone());
+                    }
+                }
+                media_candidate = Some(observation);
+            }
 
             if state.is_connected() && crate::commands::connection::check_protocol_timeout(&state) {
                 continue;
             }
 
             if !state.is_connected() {
-                last_observed = Some(PlayerStateSnapshot::from(&player_state));
                 continue;
-            }
-
-            let is_placeholder = is_placeholder_file(&state, &player_state);
-
-            if !is_placeholder && file_info_changed(&player_state, last_observed.as_ref()) {
-                eof_sent = false;
-                let mut suppress_guard = state.suppress_next_file_update.lock();
-                if *suppress_guard {
-                    *suppress_guard = false;
-                } else {
-                    send_file_update(&state, &player_state);
-                }
-                if matches!(player.kind(), PlayerKind::MpcHc | PlayerKind::MpcBe) {
-                    sync_mpc_after_file_change(state.clone(), player.clone());
-                } else if matches!(player.kind(), PlayerKind::Vlc | PlayerKind::Mplayer) {
-                    sync_generic_after_file_change(state.clone(), player.clone());
-                }
             }
 
             if let (Some(position), Some(paused_value)) =
@@ -454,46 +547,32 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
                     }
                 }
             }
-
-            last_observed = Some(PlayerStateSnapshot::from(&player_state));
-
-            if !eof_sent {
-                if let (Some(duration), Some(position)) =
-                    (player_state.duration, player_state.position)
-                {
-                    if duration > 0.0 {
-                        let threshold = if duration > 0.2 {
-                            duration - 0.2
-                        } else {
-                            duration
-                        };
-                        if position >= threshold {
-                            eof_sent = true;
-                            handle_end_of_file(&state).await;
-                        }
-                    }
-                }
-            }
         }
     });
 }
 
-fn clear_disconnected_player(state: &Arc<AppState>, disconnected: &Arc<dyn PlayerBackend>) {
-    {
+async fn clear_disconnected_player(state: &Arc<AppState>, disconnected: &Arc<dyn PlayerBackend>) {
+    let _lifecycle_guard = state.player_lifecycle.lock().await;
+    let claimed = {
         let mut guard = state.player.lock();
         if guard
             .as_ref()
             .map(|current| Arc::ptr_eq(current, disconnected))
             .unwrap_or(false)
         {
-            *guard = None;
+            guard.take()
+        } else {
+            None
         }
+    };
+    if claimed.is_none() {
+        return;
     }
+    playback_runtime::player_disconnected(state).await;
     *state.player_process.lock() = None;
     *state.last_player_spawn.lock() = None;
     *state.last_player_kind.lock() = None;
     *state.player_connecting.lock() = false;
-    *state.suppress_next_file_update.lock() = false;
     state.emit_event(
         "player-state-changed",
         PlayerStateEvent {
@@ -509,122 +588,175 @@ pub async fn load_media_by_name(
     state: &Arc<AppState>,
     filename: &str,
     reset_position: bool,
-    suppress_update: bool,
-) -> Result<(), String> {
+    load_id: LoadId,
+) -> Result<StartedMediaLoad, LoadMediaError> {
     let config = state.config.lock().clone();
-    if is_url(filename) {
+    let (media_path, is_stream) = if is_url(filename) {
         let (trustable, trusted) = is_trustable_and_trusted(
             filename,
             &config.user.trusted_domains,
             config.user.only_switch_to_trusted_domains,
         );
         if !trustable || !trusted {
-            return Err("URL is not trusted".to_string());
+            return Err(LoadMediaError::Failed("URL is not trusted".to_string()));
         }
-        ensure_player_connected(state).await?;
+        (filename.to_string(), true)
+    } else {
+        let media_path = state
+            .media_index
+            .resolve_path(filename)
+            .or_else(|| resolve_media_path(&config.player.media_directories, filename))
+            .ok_or_else(|| {
+                LoadMediaError::MediaNotFound(format!(
+                    "File not found in media directories: {}",
+                    filename
+                ))
+            })?;
+        state.media_index.remember_resolved_path(&media_path);
+        (media_path.to_string_lossy().into_owned(), false)
+    };
+
+    ensure_player_connected(state)
+        .await
+        .map_err(LoadMediaError::Failed)?;
+    let _transition_guard = state.playback.media_transition.lock().await;
+    let (player, lease) = {
+        let _lifecycle_guard = state.player_lifecycle.lock().await;
         let player = state
             .player
             .lock()
             .clone()
-            .ok_or_else(|| "Player not connected".to_string())?;
+            .ok_or_else(|| LoadMediaError::Failed("Player not connected".to_string()))?;
+        let Some(lease) = playback_runtime::claim_load_for_issue(
+            state,
+            load_id,
+            filename,
+            &media_path,
+            player.clone(),
+        ) else {
+            return Err(LoadMediaError::Superseded);
+        };
+        player.begin_file_load(load_id.0, &media_path);
         if reset_position {
-            player.mark_reset(true);
+            player.mark_reset(is_stream);
         }
-        player
-            .load_file(filename)
-            .await
-            .map_err(|e| format!("Failed to load URL: {}", e))?;
-        state.client_state.set_file(Some(filename.to_string()));
-        *state.last_updated_file_time.lock() = Some(std::time::Instant::now());
-        state.playlist.opened_file();
+        let load_result = tokio::select! {
+            biased;
+            () = lease.cancelled() => return Err(LoadMediaError::Superseded),
+            result = timeout(
+                PLAYER_LOAD_COMMAND_TIMEOUT,
+                player.load_file_generation(&media_path, load_id.0),
+            ) => result,
+        };
+        match load_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if state.playback.abort_load(load_id).is_some() {
+                    player.cancel_file_load(load_id.0);
+                }
+                return Err(LoadMediaError::Failed(format!(
+                    "Failed to load file: {}",
+                    error
+                )));
+            }
+            Err(_) => {
+                if state.playback.abort_load(load_id).is_some() {
+                    player.cancel_file_load(load_id.0);
+                }
+                return Err(LoadMediaError::Failed(
+                    "Timed out while sending player load command".to_string(),
+                ));
+            }
+        }
         if reset_position {
-            rewind_player(state).await?;
-            crate::commands::connection::evaluate_autoplay(state);
+            rewind_player_instance(state, player.clone(), load_id).await;
         }
-        if suppress_update {
-            *state.suppress_next_file_update.lock() = true;
-        } else {
-            schedule_file_update_after_load(state.clone());
-        }
-        return Ok(());
-    }
+        (player, lease)
+    };
 
-    let media_path = state
-        .media_index
-        .resolve_path(filename)
-        .or_else(|| resolve_media_path(&config.player.media_directories, filename))
-        .ok_or_else(|| format!("File not found in media directories: {}", filename))?;
-    state.media_index.remember_resolved_path(&media_path);
-
-    ensure_player_connected(state).await?;
-
-    let player = state
-        .player
-        .lock()
-        .clone()
-        .ok_or_else(|| "Player not connected".to_string())?;
-    if reset_position {
-        player.mark_reset(false);
-    }
-    player
-        .load_file(media_path.to_string_lossy().as_ref())
-        .await
-        .map_err(|e| format!("Failed to load file: {}", e))?;
-
-    state.client_state.set_file(Some(filename.to_string()));
-    *state.last_updated_file_time.lock() = Some(std::time::Instant::now());
     state.playlist.opened_file();
     if reset_position {
-        rewind_player(state).await?;
         crate::commands::connection::evaluate_autoplay(state);
     }
-    if suppress_update {
-        *state.suppress_next_file_update.lock() = true;
-    } else {
-        schedule_file_update_after_load(state.clone());
+    debug_assert!(Arc::ptr_eq(&player, &lease.player));
+    Ok(StartedMediaLoad { lease, is_stream })
+}
+
+async fn sync_mpc_after_file_change(
+    state: &Arc<AppState>,
+    player: &Arc<dyn PlayerBackend>,
+    reset_position: bool,
+    load_id: Option<LoadId>,
+) {
+    let global = state.client_state.get_global_state();
+    let position = if reset_position { 0.0 } else { global.position };
+    for _ in 0..3 {
+        if !can_sync_committed_media(state, player, load_id) {
+            return;
+        }
+        let _ = player.set_paused(true).await;
+        sleep(Duration::from_millis(10)).await;
     }
-
-    Ok(())
+    sleep(Duration::from_millis(50)).await;
+    if !can_sync_committed_media(state, player, load_id) {
+        return;
+    }
+    let _ = player.set_paused(global.paused).await;
+    if can_sync_committed_media(state, player, load_id) {
+        let _ = player.set_position(position).await;
+    }
 }
 
-fn schedule_file_update_after_load(state: Arc<AppState>) {
-    tokio::spawn(async move {
-        sleep(Duration::from_millis(FILE_UPDATE_AFTER_LOAD_DELAY_MS)).await;
-        let player = state.player.lock().clone();
-        let Some(player) = player else { return };
-        if let Err(e) = player.poll_state().await {
-            tracing::warn!("Failed to refresh player state after load: {}", e);
-        }
-        let player_state = player.get_state();
-        if is_placeholder_file(&state, &player_state) {
-            return;
-        }
-        if player_state.filename.is_none() && player_state.path.is_none() {
-            return;
-        }
-        send_file_update(&state, &player_state);
-    });
-}
-
-fn sync_mpc_after_file_change(state: Arc<AppState>, player: Arc<dyn PlayerBackend>) {
-    tokio::spawn(async move {
-        let global = state.client_state.get_global_state();
-        for _ in 0..3 {
-            let _ = player.set_paused(true).await;
-            sleep(Duration::from_millis(10)).await;
-        }
-        sleep(Duration::from_millis(50)).await;
+async fn sync_generic_after_file_change(
+    state: &Arc<AppState>,
+    player: &Arc<dyn PlayerBackend>,
+    reset_position: bool,
+    load_id: Option<LoadId>,
+) {
+    let global = state.client_state.get_global_state();
+    let position = if reset_position { 0.0 } else { global.position };
+    if can_sync_committed_media(state, player, load_id) {
         let _ = player.set_paused(global.paused).await;
-        let _ = player.set_position(global.position).await;
-    });
+    }
+    if can_sync_committed_media(state, player, load_id) {
+        let _ = player.set_position(position).await;
+    }
 }
 
-fn sync_generic_after_file_change(state: Arc<AppState>, player: Arc<dyn PlayerBackend>) {
-    tokio::spawn(async move {
-        let global = state.client_state.get_global_state();
-        let _ = player.set_paused(global.paused).await;
+async fn sync_mpv_after_file_change(
+    state: &Arc<AppState>,
+    player: &Arc<dyn PlayerBackend>,
+    load_id: Option<LoadId>,
+) {
+    let global = state.client_state.get_global_state();
+    if can_sync_committed_media(state, player, load_id) {
         let _ = player.set_position(global.position).await;
-    });
+    }
+    if can_sync_committed_media(state, player, load_id) {
+        let _ = player.set_paused(global.paused).await;
+    }
+}
+
+fn can_sync_committed_media(
+    state: &Arc<AppState>,
+    player: &Arc<dyn PlayerBackend>,
+    load_id: Option<LoadId>,
+) -> bool {
+    if !state
+        .player
+        .lock()
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, player))
+    {
+        return false;
+    }
+    match load_id {
+        Some(load_id) => state
+            .playback
+            .active_load(load_id)
+            .is_some_and(|load| Arc::ptr_eq(&load.player, player) && !load.is_cancelled()),
+        None => state.playback.state.lock().pending_load.is_none(),
+    }
 }
 
 pub fn resolve_media_path(media_directories: &[String], filename: &str) -> Option<PathBuf> {
@@ -666,7 +798,6 @@ pub async fn load_placeholder_if_empty(state: &Arc<AppState>) -> Result<(), Stri
     if player_state.filename.is_some() {
         return Ok(());
     }
-    *state.suppress_next_file_update.lock() = true;
     player
         .load_file(placeholder.to_string_lossy().as_ref())
         .await
@@ -828,12 +959,14 @@ fn resolve_syncplayintf_path(state: &AppState) -> Option<PathBuf> {
 
 struct MpvVersionFlags {
     osc_visibility_change_compatible: bool,
+    loadfile_options_syntax: Option<LoadfileOptionsSyntax>,
 }
 
 fn check_mpv_version(player_path: &str) -> Result<MpvVersionFlags, String> {
     let Ok(output) = run_mpv_version_command(player_path) else {
         return Ok(MpvVersionFlags {
             osc_visibility_change_compatible: false,
+            loadfile_options_syntax: None,
         });
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -841,7 +974,7 @@ fn check_mpv_version(player_path: &str) -> Result<MpvVersionFlags, String> {
 }
 
 fn parse_mpv_version_flags(stdout: &str) -> Result<MpvVersionFlags, String> {
-    let re = Regex::new(r"mpv\s+(\d+)\.(\d+)\.").map_err(|e| e.to_string())?;
+    let re = Regex::new(r"(?:mpv\s+)?(\d+)\.(\d+)\.").map_err(|e| e.to_string())?;
     if let Some(captures) = re.captures(stdout) {
         let major = captures
             .get(1)
@@ -858,13 +991,29 @@ fn parse_mpv_version_flags(stdout: &str) -> Result<MpvVersionFlags, String> {
             );
         }
         let osc_visibility_change_compatible = major > 0 || minor >= 28;
+        let loadfile_options_syntax = Some(if major > 0 || minor >= 38 {
+            LoadfileOptionsSyntax::Modern
+        } else {
+            LoadfileOptionsSyntax::Legacy
+        });
         return Ok(MpvVersionFlags {
             osc_visibility_change_compatible,
+            loadfile_options_syntax,
         });
     }
     Ok(MpvVersionFlags {
         osc_visibility_change_compatible: false,
+        loadfile_options_syntax: None,
     })
+}
+
+async fn query_mpv_version_flags(mpv: &MpvIpc) -> Option<MpvVersionFlags> {
+    let response = mpv
+        .send_command_async(MpvCommand::get_property("mpv-version", 0))
+        .await
+        .ok()?;
+    let version = response.data?.as_str()?.to_string();
+    parse_mpv_version_flags(&version).ok()
 }
 
 fn run_mpv_version_command(player_path: &str) -> std::io::Result<std::process::Output> {
@@ -1025,11 +1174,72 @@ fn emit_player_state(state: &Arc<AppState>, player_state: &PlayerState) {
     );
 }
 
-pub(crate) fn send_file_update(state: &Arc<AppState>, player_state: &PlayerState) {
-    if player_state.filename.is_none() && player_state.path.is_none() {
-        return;
+pub(crate) async fn commit_player_state(
+    state: &Arc<AppState>,
+    player: Option<&Arc<dyn PlayerBackend>>,
+    player_state: &PlayerState,
+    load_id: Option<LoadId>,
+) -> Result<playback_runtime::DispatchResult, String> {
+    if is_placeholder_file(state, player_state) {
+        return Ok(playback_runtime::DispatchResult::default());
     }
-    let config = state.config.lock().clone();
+    let Some(media) = committed_media_from_player_state(player_state) else {
+        return Ok(playback_runtime::DispatchResult::default());
+    };
+    let load_id = load_id.or_else(|| {
+        player.and_then(|player| {
+            state
+                .playback
+                .matching_load(player, &media.name)
+                .map(|load| load.id)
+        })
+    });
+    let outcome = playback_runtime::dispatch_all_outcome(
+        state,
+        [PlaybackEvent::PlayerMediaCommitted { load_id, media }],
+    )
+    .await;
+    let result = outcome.result;
+
+    if let (true, Some(player)) = (result.media_accepted && state.is_connected(), player) {
+        match player.kind() {
+            PlayerKind::MpcHc | PlayerKind::MpcBe => {
+                sync_mpc_after_file_change(
+                    state,
+                    player,
+                    result.media_reset,
+                    result.completed_load,
+                )
+                .await;
+            }
+            PlayerKind::Mpv | PlayerKind::MpvNet | PlayerKind::Iina if !result.media_reset => {
+                sync_mpv_after_file_change(state, player, result.completed_load).await;
+            }
+            PlayerKind::Vlc | PlayerKind::Mplayer | PlayerKind::Unknown => {
+                sync_generic_after_file_change(
+                    state,
+                    player,
+                    result.media_reset,
+                    result.completed_load,
+                )
+                .await;
+            }
+            PlayerKind::Mpv | PlayerKind::MpvNet | PlayerKind::Iina => {}
+        }
+    }
+    if let Some(load_id) = result.completed_load {
+        state.playback.finish_load(load_id);
+    }
+    if let Some(error) = outcome.effect_error {
+        return Err(error);
+    }
+    Ok(result)
+}
+
+fn committed_media_from_player_state(player_state: &PlayerState) -> Option<CommittedMedia> {
+    if player_state.filename.is_none() && player_state.path.is_none() {
+        return None;
+    }
     let raw_path = player_state.path.clone();
     let local_path = raw_path.as_deref().and_then(normalize_local_path);
     let raw_name = if let Some(path) = raw_path.as_deref() {
@@ -1050,15 +1260,11 @@ pub(crate) fn send_file_update(state: &Arc<AppState>, player_state: &PlayerState
             })
         }
     } else {
-        let filename = player_state.filename.as_deref();
-        if let Some(filename) = filename {
-            if is_url(filename) {
-                Some(filename.to_string())
-            } else {
-                return;
-            }
+        let filename = player_state.filename.as_deref()?;
+        if is_url(filename) {
+            Some(filename.to_string())
         } else {
-            return;
+            return None;
         }
     };
     let raw_size = if let Some(local_path) = local_path.as_ref() {
@@ -1071,28 +1277,37 @@ pub(crate) fn send_file_update(state: &Arc<AppState>, player_state: &PlayerState
     } else {
         raw_name.as_deref().filter(|name| is_url(name)).map(|_| 0)
     };
-    let raw_duration = player_state.duration;
+    raw_name.map(|name| CommittedMedia::new(name, raw_size, player_state.duration))
+}
+
+pub(crate) fn send_committed_file_update(
+    state: &Arc<AppState>,
+    media: &CommittedMedia,
+) -> Result<(), String> {
+    let config = state.config.lock().clone();
 
     let max_len = state
         .server_features
         .lock()
         .max_filename_length
         .unwrap_or(250);
-    let outbound_name = raw_name.clone().map(|name| truncate_text(&name, max_len));
+    let outbound_name = Some(truncate_text(&media.name, max_len));
     let (name, size) = apply_privacy(
         outbound_name,
-        raw_size,
+        media.size,
         &config.user.filename_privacy_mode,
         &config.user.filesize_privacy_mode,
     );
 
-    state.client_state.set_file(raw_name.clone());
-    state.client_state.set_file_size(size.clone());
-    state.client_state.set_file_duration(raw_duration);
+    state.client_state.set_file_info(FileInfo {
+        name: Some(media.name.clone()),
+        size: size.clone(),
+        duration: media.duration,
+    });
     *state.last_updated_file_time.lock() = Some(std::time::Instant::now());
 
     let Some(connection) = state.connection.lock().clone() else {
-        return;
+        return Ok(());
     };
 
     let message = ProtocolMessage::Set {
@@ -1101,7 +1316,7 @@ pub(crate) fn send_file_update(state: &Arc<AppState>, player_state: &PlayerState
             file: Some(FileInfo {
                 name,
                 size,
-                duration: raw_duration,
+                duration: media.duration,
             }),
             user: None,
             ready: None,
@@ -1113,21 +1328,12 @@ pub(crate) fn send_file_update(state: &Arc<AppState>, player_state: &PlayerState
         }),
     };
     if let Err(e) = connection.send(message) {
-        tracing::warn!("Failed to send file update: {}", e);
-        return;
+        return Err(format!("Failed to send file update: {}", e));
     }
     if let Err(e) = connection.send(ProtocolMessage::List { List: None }) {
         tracing::warn!("Failed to request user list after file update: {}", e);
     }
-
-    if let Some(raw_name) = raw_name {
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = change_playlist_from_filename(&state_clone, &raw_name).await {
-                tracing::warn!("Failed to sync playlist from filename: {}", e);
-            }
-        });
-    }
+    Ok(())
 }
 
 fn normalize_local_path(raw_path: &str) -> Option<PathBuf> {
@@ -1181,30 +1387,46 @@ fn decode_file_url_fallback(raw_path: &str) -> Option<PathBuf> {
     Some(PathBuf::from(decoded))
 }
 
-pub(crate) async fn rewind_player(state: &Arc<AppState>) -> Result<(), String> {
-    ensure_player_connected(state).await?;
-    let player = state
-        .player
-        .lock()
-        .clone()
-        .ok_or_else(|| "Player not connected".to_string())?;
+async fn rewind_player_instance(
+    state: &Arc<AppState>,
+    player: Arc<dyn PlayerBackend>,
+    load_id: LoadId,
+) {
     if let Err(e) = player.set_position(0.0).await {
         tracing::warn!("Failed to rewind player: {}", e);
     }
     *state.last_rewind_time.lock() = Some(Instant::now());
-    schedule_double_check_rewind(player);
-    Ok(())
+    schedule_double_check_rewind(state.clone(), player, RewindGeneration::Load(load_id));
 }
 
-fn schedule_double_check_rewind(player: Arc<dyn PlayerBackend>) {
+#[derive(Clone)]
+enum RewindGeneration {
+    Load(LoadId),
+    Loop(playback_runtime::LoopLease),
+}
+
+fn schedule_double_check_rewind(
+    state: Arc<AppState>,
+    player: Arc<dyn PlayerBackend>,
+    generation: RewindGeneration,
+) {
     if !DOUBLE_CHECK_REWIND {
         return;
     }
     tokio::spawn(async move {
         for delay in DOUBLE_CHECK_REWIND_DELAYS {
             sleep(Duration::from_secs_f64(delay)).await;
+            if !is_current_rewind_target(&state, &player, &generation) {
+                return;
+            }
             if let Err(e) = player.poll_state().await {
                 tracing::warn!("Failed to poll player during rewind check: {}", e);
+            }
+            let _transition_guard = state.playback.media_transition.lock().await;
+            let _lifecycle_guard = state.player_lifecycle.lock().await;
+            let _dispatch_guard = state.playback.dispatch.lock().await;
+            if !is_current_rewind_target(&state, &player, &generation) {
+                return;
             }
             if let Some(position) = player.get_state().position {
                 if position > DOUBLE_CHECK_REWIND_POSITION_THRESHOLD {
@@ -1217,15 +1439,61 @@ fn schedule_double_check_rewind(player: Arc<dyn PlayerBackend>) {
     });
 }
 
-fn file_info_changed(player_state: &PlayerState, last_sent: Option<&PlayerStateSnapshot>) -> bool {
-    match last_sent {
-        None => true,
-        Some(prev) => {
-            prev.filename != player_state.filename
-                || prev.path != player_state.path
-                || prev.duration != player_state.duration
+fn is_current_rewind_target(
+    state: &Arc<AppState>,
+    player: &Arc<dyn PlayerBackend>,
+    generation: &RewindGeneration,
+) -> bool {
+    let current_player = state
+        .player
+        .lock()
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, player));
+    current_player
+        && match generation {
+            RewindGeneration::Load(load_id) => {
+                state.playback.is_latest_generation(*load_id, player)
+            }
+            RewindGeneration::Loop(lease) => playback_runtime::is_current_loop_lease(state, lease),
         }
+}
+
+async fn rewind_looping_media(state: &Arc<AppState>, lease: playback_runtime::LoopLease) {
+    let player = lease.player.clone();
+    let _transition_guard = state.playback.media_transition.lock().await;
+    let _lifecycle_guard = state.player_lifecycle.lock().await;
+    let _dispatch_guard = state.playback.dispatch.lock().await;
+    if !playback_runtime::is_current_loop_lease(state, &lease) {
+        return;
     }
+    if let Err(error) = player.set_position(0.0).await {
+        tracing::warn!("Failed to rewind looping media: {error}");
+    }
+    *state.last_rewind_time.lock() = Some(Instant::now());
+    if let Err(error) = player.set_paused(false).await {
+        tracing::warn!("Failed to unpause looping media: {error}");
+    }
+    drop(_dispatch_guard);
+    drop(_lifecycle_guard);
+    drop(_transition_guard);
+
+    schedule_double_check_rewind(state.clone(), player, RewindGeneration::Loop(lease.clone()));
+    schedule_loop_unpause(state.clone(), lease);
+}
+
+fn schedule_loop_unpause(state: Arc<AppState>, lease: playback_runtime::LoopLease) {
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(500)).await;
+        let _transition_guard = state.playback.media_transition.lock().await;
+        let _lifecycle_guard = state.player_lifecycle.lock().await;
+        let _dispatch_guard = state.playback.dispatch.lock().await;
+        if !playback_runtime::is_current_loop_lease(&state, &lease) {
+            return;
+        }
+        if let Err(error) = lease.player.set_paused(false).await {
+            tracing::warn!("Failed to confirm loop unpause: {error}");
+        }
+    });
 }
 
 pub(crate) fn is_placeholder_file(state: &Arc<AppState>, player_state: &PlayerState) -> bool {
@@ -1243,21 +1511,17 @@ pub(crate) fn is_placeholder_file(state: &Arc<AppState>, player_state: &PlayerSt
     false
 }
 
-#[derive(Clone, Debug)]
-struct PlayerStateSnapshot {
+#[derive(Clone, Debug, PartialEq)]
+struct PlayerMediaObservation {
     filename: Option<String>,
-    position: Option<f64>,
-    paused: Option<bool>,
     duration: Option<f64>,
     path: Option<String>,
 }
 
-impl PlayerStateSnapshot {
+impl PlayerMediaObservation {
     fn from(state: &PlayerState) -> Self {
         Self {
             filename: state.filename.clone(),
-            position: state.position,
-            paused: state.paused,
             duration: state.duration,
             path: state.path.clone(),
         }
@@ -1269,24 +1533,11 @@ async fn advance_playlist_check(state: &Arc<AppState>, position: f64) -> bool {
     if !shared_playlists_enabled(state, &config) {
         return false;
     }
-    if state
-        .playlist
-        .not_just_changed(PLAYLIST_LOAD_NEXT_FILE_TIME_FROM_END_THRESHOLD)
-        && state.client_state.get_file().is_some()
-    {
-        state.client_state.set_file_duration(Some(position));
-    }
     let current_length = state.client_state.get_file_duration().unwrap_or(0.0);
     if current_length <= PLAYLIST_LOAD_NEXT_FILE_MINIMUM_LENGTH {
         return false;
     }
     if (position - current_length).abs() >= PLAYLIST_LOAD_NEXT_FILE_TIME_FROM_END_THRESHOLD {
-        return false;
-    }
-    if !state
-        .playlist
-        .not_just_changed(PLAYLIST_LOAD_NEXT_FILE_TIME_FROM_END_THRESHOLD)
-    {
         return false;
     }
     load_next_file_in_playlist(state, &config).await;
@@ -1297,121 +1548,40 @@ async fn load_next_file_in_playlist(state: &Arc<AppState>, config: &SyncplayConf
     if !shared_playlists_enabled(state, config) {
         return;
     }
-    if !is_playing_current_index(state) {
+    let Some(expected_media) = state.client_state.get_file() else {
         return;
-    }
-
-    let items = state.playlist.get_item_filenames();
-    if items.is_empty() {
-        return;
-    }
+    };
 
     let loop_single = config.user.loop_single_files || is_playing_music(state);
-    if items.len() == 1 && loop_single {
-        state.playlist.opened_file();
-        let _ = rewind_player(state).await;
-        let player = state.player.lock().clone();
-        if let Some(player) = player {
-            if let Err(e) = player.set_paused(false).await {
-                tracing::warn!("Failed to unpause after looping file: {}", e);
-            }
-            let player_clone = player.clone();
-            tokio::spawn(async move {
-                sleep(Duration::from_millis(500)).await;
-                let _ = player_clone.set_paused(false).await;
-            });
-        }
-        return;
-    }
-
     let loop_at_end = config.user.loop_at_end_of_playlist || is_playing_music(state);
-    let current_index = match state.playlist.get_current_index() {
-        Some(index) => index,
-        None => return,
-    };
-    let next_index = if current_index + 1 < items.len() {
-        current_index + 1
-    } else if loop_at_end {
-        0
-    } else {
-        return;
-    };
-
-    if let Some(filename) = items.get(next_index) {
-        if !playlist_item_available(state, filename) {
-            return;
+    let action = playback_runtime::advance_after_eof(
+        state,
+        &expected_media,
+        loop_single,
+        loop_at_end,
+        PLAYLIST_LOAD_NEXT_FILE_TIME_FROM_END_THRESHOLD,
+    )
+    .await;
+    match action {
+        Ok(playback_runtime::EofAction::Rewind(lease)) => {
+            rewind_looping_media(state, lease).await;
         }
-    }
-
-    *state.last_advance_time.lock() = Some(Instant::now());
-    if let Err(e) = send_playlist_index(state, next_index, true) {
-        tracing::warn!("Failed to send playlist index advance: {}", e);
-    }
-    if let Err(e) = apply_playlist_index_from_server(state, next_index, true).await {
-        tracing::warn!("Failed to advance playlist: {}", e);
+        Ok(playback_runtime::EofAction::None | playback_runtime::EofAction::Load) => {}
+        Err(error) => tracing::warn!("Failed to advance playlist: {error}"),
     }
 }
 
-fn is_playing_current_index(state: &Arc<AppState>) -> bool {
-    let Some(index) = state.playlist.get_current_index() else {
-        return false;
-    };
-    let items = state.playlist.get_item_filenames();
-    let Some(filename) = items.get(index) else {
-        return false;
-    };
-    let current_file = state.client_state.get_file();
-    same_filename(current_file.as_deref(), Some(filename))
-}
-
-pub fn playlist_item_available(state: &Arc<AppState>, filename: &str) -> bool {
-    if filename == PRIVACY_HIDDEN_FILENAME {
-        return false;
-    }
-    let (trusted_domains, only_trusted, media_directories) = {
-        let config = state.config.lock();
-        (
-            config.user.trusted_domains.clone(),
-            config.user.only_switch_to_trusted_domains,
-            config.player.media_directories.clone(),
-        )
-    };
-    if is_url(filename) {
-        let (trustable, trusted) =
-            is_trustable_and_trusted(filename, &trusted_domains, only_trusted);
-        return trustable && trusted;
-    }
-    if state.media_index.is_available(filename) {
-        return true;
-    }
-    resolve_media_path(&media_directories, filename).is_some()
-}
-
-pub(crate) async fn handle_end_of_file(state: &Arc<AppState>) {
-    if state
-        .playlist
-        .not_just_changed(PLAYLIST_LOAD_NEXT_FILE_TIME_FROM_END_THRESHOLD)
-        && state.client_state.get_file().is_some()
-    {
-        let player = state.player.lock().clone();
-        if let Some(player) = player {
-            if let Some(position) = player.get_state().position {
-                state.client_state.set_file_duration(Some(position));
-            }
-        }
-    }
-
-    let config = state.config.lock().clone();
-    if !shared_playlists_enabled(state, &config) {
-        return;
-    }
+pub(crate) fn report_end_of_file(state: &Arc<AppState>, position: Option<f64>) {
     if !state
         .playlist
         .not_just_changed(PLAYLIST_LOAD_NEXT_FILE_TIME_FROM_END_THRESHOLD)
+        || state.client_state.get_file().is_none()
     {
         return;
     }
-    load_next_file_in_playlist(state, &config).await;
+    if let Some(position) = position {
+        state.client_state.set_file_duration(Some(position));
+    }
 }
 
 fn current_user_can_control(state: &Arc<AppState>) -> bool {
@@ -1646,13 +1816,18 @@ fn send_ready_state(
 mod tests {
     use super::{
         check_mpv_version, clear_disconnected_player, parse_mpv_version_flags, resolve_media_path,
-        should_pause_on_prepare, stop_player,
+        rewind_looping_media, schedule_double_check_rewind, should_pause_on_prepare, stop_player,
+        LoadfileOptionsSyntax, RewindGeneration,
     };
     use crate::app_state::AppState;
+    use crate::client::playback::{CommittedMedia, LoadId, PlaybackEvent};
+    use crate::client::playback_runtime::{self, EofAction};
     use crate::player::backend::{FakePlayerBackend, FakePlayerCommand, PlayerBackend, PlayerKind};
+    use crate::player::properties::PlayerState;
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::time::{sleep, timeout, Duration};
 
     #[test]
     fn test_resolve_media_path_multiple_directories() {
@@ -1697,21 +1872,26 @@ mod tests {
     #[test]
     fn mpv_version_flags_match_original_thresholds() {
         assert!(parse_mpv_version_flags("mpv 0.22.0 Copyright").is_err());
-        assert!(
-            !parse_mpv_version_flags("mpv 0.23.0 Copyright")
-                .unwrap()
-                .osc_visibility_change_compatible
+        let legacy = parse_mpv_version_flags("mpv 0.23.0 Copyright").unwrap();
+        assert!(!legacy.osc_visibility_change_compatible);
+        assert_eq!(
+            legacy.loadfile_options_syntax,
+            Some(LoadfileOptionsSyntax::Legacy)
         );
         assert!(
             parse_mpv_version_flags("mpv 0.28.0 Copyright")
                 .unwrap()
                 .osc_visibility_change_compatible
         );
-        assert!(
-            !parse_mpv_version_flags("unexpected output")
+        assert_eq!(
+            parse_mpv_version_flags("0.38.0")
                 .unwrap()
-                .osc_visibility_change_compatible
+                .loadfile_options_syntax,
+            Some(LoadfileOptionsSyntax::Modern)
         );
+        let unknown = parse_mpv_version_flags("unexpected output").unwrap();
+        assert!(!unknown.osc_visibility_change_compatible);
+        assert_eq!(unknown.loadfile_options_syntax, None);
     }
 
     #[tokio::test]
@@ -1749,8 +1929,8 @@ mod tests {
         assert!(!state.is_player_connected());
     }
 
-    #[test]
-    fn disconnected_non_mpv_backend_clears_stale_app_state() {
+    #[tokio::test]
+    async fn disconnected_non_mpv_backend_clears_stale_app_state() {
         let state = AppState::new();
         let fake = Arc::new(FakePlayerBackend::new(PlayerKind::Vlc));
         let player: Arc<dyn PlayerBackend> = fake.clone();
@@ -1758,17 +1938,181 @@ mod tests {
         *state.last_player_spawn.lock() = Some(std::time::Instant::now());
         *state.last_player_kind.lock() = Some(PlayerKind::Vlc);
         *state.player_connecting.lock() = true;
-        *state.suppress_next_file_update.lock() = true;
 
-        clear_disconnected_player(&state, &player);
+        clear_disconnected_player(&state, &player).await;
 
         assert!(state.player.lock().is_none());
         assert!(state.player_process.lock().is_none());
         assert!(state.last_player_spawn.lock().is_none());
         assert!(state.last_player_kind.lock().is_none());
         assert!(!*state.player_connecting.lock());
-        assert!(!*state.suppress_next_file_update.lock());
     }
+
+    #[tokio::test]
+    async fn stale_disconnect_callback_cannot_clear_new_player() {
+        let state = AppState::new();
+        let old: Arc<dyn PlayerBackend> = Arc::new(FakePlayerBackend::new(PlayerKind::Vlc));
+        let new: Arc<dyn PlayerBackend> = Arc::new(FakePlayerBackend::new(PlayerKind::Mplayer));
+        *state.player.lock() = Some(new.clone());
+        *state.last_player_kind.lock() = Some(PlayerKind::Mplayer);
+        *state.player_connecting.lock() = true;
+
+        clear_disconnected_player(&state, &old).await;
+
+        assert!(state
+            .player
+            .lock()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &new)));
+        assert_eq!(*state.last_player_kind.lock(), Some(PlayerKind::Mplayer));
+        assert!(*state.player_connecting.lock());
+    }
+
+    #[tokio::test]
+    async fn stale_double_check_rewind_cannot_seek_a_new_generation() {
+        let state = AppState::new();
+        let fake = Arc::new(FakePlayerBackend::with_state(
+            PlayerKind::Vlc,
+            PlayerState {
+                position: Some(12.0),
+                ..PlayerState::default()
+            },
+        ));
+        fake.set_poll_delay(Duration::from_millis(150));
+        let player: Arc<dyn PlayerBackend> = fake.clone();
+        *state.player.lock() = Some(player.clone());
+        state
+            .playback
+            .install_load(LoadId(1), "a.mkv", "/media/a.mkv", player.clone());
+        schedule_double_check_rewind(
+            state.clone(),
+            player.clone(),
+            RewindGeneration::Load(LoadId(1)),
+        );
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if fake
+                    .commands()
+                    .iter()
+                    .any(|command| matches!(command, FakePlayerCommand::PollState))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state
+            .playback
+            .install_load(LoadId(2), "b.mkv", "/media/b.mkv", player.clone());
+        sleep(Duration::from_millis(250)).await;
+
+        assert!(!fake
+            .commands()
+            .iter()
+            .any(|command| matches!(command, FakePlayerCommand::SetPosition(0.0))));
+    }
+
+    #[tokio::test]
+    async fn stale_loop_lease_cannot_rewind_after_an_aba_media_change() {
+        let state = AppState::new();
+        let fake = FakePlayerBackend::new(PlayerKind::Vlc);
+        *state.player.lock() = Some(Arc::new(fake.clone()) as Arc<dyn PlayerBackend>);
+        playback_runtime::replace_playlist(&state, vec!["a.mkv".into()], Some(0))
+            .await
+            .unwrap();
+        playback_runtime::dispatch(
+            &state,
+            PlaybackEvent::PlayerMediaCommitted {
+                load_id: None,
+                media: CommittedMedia::new("a.mkv", Some(1), Some(120.0)),
+            },
+        )
+        .await
+        .unwrap();
+        let lease = match playback_runtime::advance_after_eof(&state, "a.mkv", true, false, -1.0)
+            .await
+            .unwrap()
+        {
+            EofAction::Rewind(lease) => lease,
+            _ => panic!("expected loop rewind lease"),
+        };
+
+        for filename in ["b.mkv", "a.mkv"] {
+            playback_runtime::dispatch(
+                &state,
+                PlaybackEvent::PlayerMediaCommitted {
+                    load_id: None,
+                    media: CommittedMedia::new(filename, Some(1), Some(120.0)),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        rewind_looping_media(&state, lease).await;
+
+        assert!(!fake.commands().iter().any(|command| matches!(
+            command,
+            FakePlayerCommand::SetPosition(0.0) | FakePlayerCommand::SetPaused(false)
+        )));
+    }
+
+    #[tokio::test]
+    async fn media_change_cancels_delayed_loop_rewind_and_unpause() {
+        let state = AppState::new();
+        let fake = FakePlayerBackend::new(PlayerKind::Vlc);
+        *state.player.lock() = Some(Arc::new(fake.clone()) as Arc<dyn PlayerBackend>);
+        playback_runtime::replace_playlist(&state, vec!["a.mkv".into()], Some(0))
+            .await
+            .unwrap();
+        playback_runtime::dispatch(
+            &state,
+            PlaybackEvent::PlayerMediaCommitted {
+                load_id: None,
+                media: CommittedMedia::new("a.mkv", Some(1), Some(120.0)),
+            },
+        )
+        .await
+        .unwrap();
+        let lease = match playback_runtime::advance_after_eof(&state, "a.mkv", true, false, -1.0)
+            .await
+            .unwrap()
+        {
+            EofAction::Rewind(lease) => lease,
+            _ => panic!("expected loop rewind lease"),
+        };
+        rewind_looping_media(&state, lease).await;
+
+        playback_runtime::dispatch(
+            &state,
+            PlaybackEvent::PlayerMediaCommitted {
+                load_id: None,
+                media: CommittedMedia::new("b.mkv", Some(1), Some(120.0)),
+            },
+        )
+        .await
+        .unwrap();
+        sleep(Duration::from_millis(650)).await;
+
+        let commands = fake.commands();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, FakePlayerCommand::SetPosition(0.0)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, FakePlayerCommand::SetPaused(false)))
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn stop_player_shuts_down_fake_backend_and_is_idempotent() {
         let state = AppState::new();
@@ -1780,7 +2124,6 @@ mod tests {
         *state.player_connecting.lock() = true;
         *state.mpv_socket_path.lock() = Some("stale-socket".to_string());
         *state.mpv_runtime_dir.lock() = Some(TempDir::new().unwrap());
-        *state.suppress_next_file_update.lock() = true;
 
         stop_player(&state).await.unwrap();
 
@@ -1791,7 +2134,6 @@ mod tests {
         assert!(!*state.player_connecting.lock());
         assert!(state.mpv_socket_path.lock().is_none());
         assert!(state.mpv_runtime_dir.lock().is_none());
-        assert!(!*state.suppress_next_file_update.lock());
         assert_eq!(fake.shutdown_count(), 1);
         assert_eq!(fake.commands(), vec![FakePlayerCommand::Shutdown]);
 

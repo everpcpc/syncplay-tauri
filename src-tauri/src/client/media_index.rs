@@ -1,7 +1,6 @@
 use crate::app_state::AppState;
 use crate::commands::connection::emit_error_message;
 use crate::config::DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS;
-use crate::player::controller::load_media_by_name;
 use crate::utils::{hash_filename, same_filename, strip_filename, PRIVACY_HIDDEN_FILENAME};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -147,12 +146,17 @@ impl MediaIndex {
         self.cache.write().insert_override(filename, path);
     }
 
-    pub fn is_available(&self, filename: &str) -> bool {
-        self.resolve_path(filename).is_some()
-    }
-
     pub fn is_refreshing(&self) -> bool {
         self.updating.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn finish_refresh(&self) {
+        self.updating.store(false, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_refreshing_for_test(&self, refreshing: bool) {
+        self.updating.store(refreshing, Ordering::SeqCst);
     }
 
     fn resolve_from_last_directory(&self, filename: &str) -> Option<PathBuf> {
@@ -197,55 +201,40 @@ impl MediaIndex {
         );
         let directories = self.directories.read().clone();
         let timeout_seconds = *self.timeout_seconds.read();
-        if directories.is_empty() {
-            self.updating.store(false, Ordering::SeqCst);
-            state.emit_event(
-                "media-index-refreshing",
-                serde_json::json!({ "refreshing": false }),
-            );
-            return;
-        }
-        let result =
-            tokio::task::spawn_blocking(move || scan_directories(&directories, timeout_seconds))
-                .await;
-        match result {
-            Ok(Ok(cache)) => {
-                *self.cache.write() = cache;
-                state.emit_event(
-                    "media-index-updated",
-                    serde_json::json!({ "timestamp": chrono::Utc::now().to_rfc3339() }),
-                );
-                let queued = state.playlist.get_queued_index_filename();
-                if let Some(filename) = queued {
-                    let current = state.client_state.get_file();
-                    let already_loaded = same_filename(current.as_deref(), Some(&filename));
-                    if !already_loaded && self.is_available(&filename) {
-                        if let Err(e) = load_media_by_name(state, &filename, true, false).await {
-                            tracing::warn!("Failed to load queued playlist item after scan: {}", e);
-                        }
-                    }
+        if !directories.is_empty() {
+            let result = tokio::task::spawn_blocking(move || {
+                scan_directories(&directories, timeout_seconds)
+            })
+            .await;
+            match result {
+                Ok(Ok(cache)) => {
+                    *self.cache.write() = cache;
+                    state.emit_event(
+                        "media-index-updated",
+                        serde_json::json!({ "timestamp": chrono::Utc::now().to_rfc3339() }),
+                    );
+                }
+                Ok(Err(ScanError::FirstFileTimeout(dir))) => {
+                    self.disabled.store(true, Ordering::SeqCst);
+                    emit_error_message(
+                        state,
+                        &format!("Media directory scan timed out while accessing '{}'", dir),
+                    );
+                }
+                Ok(Err(ScanError::ScanTimeout(dir))) => {
+                    self.disabled.store(true, Ordering::SeqCst);
+                    emit_error_message(
+                        state,
+                        &format!("Media directory scan timed out in '{}'", dir),
+                    );
+                }
+                Ok(Err(ScanError::NoDirectories)) => {}
+                Ok(Err(ScanError::Io(_))) | Err(_) => {
+                    emit_error_message(state, "Media directory scan failed");
                 }
             }
-            Ok(Err(ScanError::FirstFileTimeout(dir))) => {
-                self.disabled.store(true, Ordering::SeqCst);
-                emit_error_message(
-                    state,
-                    &format!("Media directory scan timed out while accessing '{}'", dir),
-                );
-            }
-            Ok(Err(ScanError::ScanTimeout(dir))) => {
-                self.disabled.store(true, Ordering::SeqCst);
-                emit_error_message(
-                    state,
-                    &format!("Media directory scan timed out in '{}'", dir),
-                );
-            }
-            Ok(Err(ScanError::NoDirectories)) => {}
-            Ok(Err(ScanError::Io(_))) | Err(_) => {
-                emit_error_message(state, "Media directory scan failed");
-            }
         }
-        self.updating.store(false, Ordering::SeqCst);
+        crate::client::playback_runtime::media_index_refresh_finished(state).await;
         state.emit_event(
             "media-index-refreshing",
             serde_json::json!({ "refreshing": false }),

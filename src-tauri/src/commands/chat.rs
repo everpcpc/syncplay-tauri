@@ -72,7 +72,7 @@ async fn send_chat_message_inner(state: &Arc<AppState>, message: &str) -> Result
                     store_control_password(state, &room, &password, true);
                 }
                 state.client_state.set_room(room);
-                reset_room_sync_state(state);
+                reset_room_sync_state(state).await;
                 let set_msg = ProtocolMessage::Set {
                     Set: Box::new(SetMessage {
                         room: Some(RoomInfo {

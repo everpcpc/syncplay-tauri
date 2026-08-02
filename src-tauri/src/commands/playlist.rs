@@ -1,10 +1,11 @@
 // Playlist command handlers
 
-use crate::app_state::{AppState, PlaylistEvent};
+use crate::app_state::AppState;
+use crate::client::playback_runtime;
 use crate::config::SyncplayConfig;
 use crate::network::messages::{PlayState, StateMessage};
 use crate::network::messages::{PlaylistChange, PlaylistIndexUpdate, ProtocolMessage, SetMessage};
-use crate::player::controller::{load_media_by_name, resolve_media_path};
+use crate::player::controller::resolve_media_path;
 use crate::utils::{is_music_file, is_url};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -24,9 +25,6 @@ pub async fn update_playlist(
     if !shared_playlists_enabled(state.inner(), &config) {
         return Err("Shared playlists are disabled".to_string());
     }
-    let current_items = state.playlist.get_item_filenames();
-    let mut new_items = current_items.clone();
-
     match action.as_str() {
         "add" => {
             let file = filename.ok_or_else(|| "Filename required for add action".to_string())?;
@@ -34,8 +32,11 @@ pub async fn update_playlist(
             if let Some(path) = override_path {
                 state.media_index.add_override_path(&normalized, path);
             }
-            new_items.push(normalized);
-            apply_playlist_change_local(state.inner(), new_items, false)?;
+            apply_playlist_edit_local(state.inner(), false, move |items, _| {
+                items.push(normalized);
+                Ok(())
+            })
+            .await?;
         }
         "remove" => {
             let index_str =
@@ -43,15 +44,21 @@ pub async fn update_playlist(
             let index = index_str
                 .parse::<usize>()
                 .map_err(|_| "Invalid index for remove action".to_string())?;
-            if index >= new_items.len() {
-                return Err("Invalid index for remove action".to_string());
-            }
-            new_items.remove(index);
-            apply_playlist_change_local(state.inner(), new_items, false)?;
+            apply_playlist_edit_local(state.inner(), false, move |items, _| {
+                if index >= items.len() {
+                    return Err("Invalid index for remove action".to_string());
+                }
+                items.remove(index);
+                Ok(())
+            })
+            .await?;
         }
         "clear" => {
-            new_items.clear();
-            apply_playlist_change_local(state.inner(), new_items, false)?;
+            apply_playlist_edit_local(state.inner(), false, |items, _| {
+                items.clear();
+                Ok(())
+            })
+            .await?;
         }
         "select" => {
             let index_str =
@@ -59,53 +66,59 @@ pub async fn update_playlist(
             let index = index_str
                 .parse::<usize>()
                 .map_err(|_| "Invalid index for select action".to_string())?;
-            if index >= new_items.len() {
-                return Err("Invalid index for select action".to_string());
-            }
-            send_playlist_index(state.inner(), index, true)?;
-            if let Err(e) = apply_playlist_index_from_server(state.inner(), index, true).await {
-                tracing::warn!("Failed to load selected playlist item: {}", e);
-            }
+            playback_runtime::local_select(state.inner(), index, true).await?;
         }
         "next" => {
-            let index = next_index(state.inner(), &config)?;
-            send_playlist_index(state.inner(), index, true)?;
-            if let Err(e) = apply_playlist_index_from_server(state.inner(), index, true).await {
-                tracing::warn!("Failed to load next playlist item: {}", e);
-            }
+            let loop_at_end =
+                config.user.loop_at_end_of_playlist || is_playing_music(state.inner());
+            playback_runtime::local_step(
+                state.inner(),
+                playback_runtime::PlaylistStep::Next { loop_at_end },
+                true,
+            )
+            .await?;
         }
         "previous" => {
-            let index = previous_index(state.inner())?;
-            send_playlist_index(state.inner(), index, true)?;
-            if let Err(e) = apply_playlist_index_from_server(state.inner(), index, true).await {
-                tracing::warn!("Failed to load previous playlist item: {}", e);
-            }
+            playback_runtime::local_step(
+                state.inner(),
+                playback_runtime::PlaylistStep::Previous,
+                true,
+            )
+            .await?;
         }
         "undo" => {
-            if let Some(previous) = state.playlist.previous_playlist() {
-                apply_playlist_change_local(state.inner(), previous, false)?;
+            if state.playlist.previous_playlist().is_some() {
+                let playlist = state.playlist.clone();
+                apply_playlist_edit_local(state.inner(), false, move |items, _| {
+                    if let Some(previous) = playlist.previous_playlist() {
+                        *items = previous;
+                    }
+                    Ok(())
+                })
+                .await?;
             }
         }
         "shuffle" => {
-            new_items.shuffle(&mut thread_rng());
-            apply_playlist_change_local(state.inner(), new_items, true)?;
-            if !state.playlist.get_item_filenames().is_empty() {
-                if let Err(e) = apply_playlist_index_from_server(state.inner(), 0, true).await {
-                    tracing::warn!("Failed to load shuffled playlist start: {}", e);
-                }
-            }
+            apply_playlist_edit_local(state.inner(), true, |items, _| {
+                items.shuffle(&mut thread_rng());
+                Ok(())
+            })
+            .await?;
         }
         "shuffle_remaining" => {
-            let Some(current_index) = state.playlist.get_current_index() else {
-                return Ok(());
-            };
-            let split_point = current_index + 1;
-            if split_point < new_items.len() {
-                let mut tail = new_items.split_off(split_point);
-                tail.shuffle(&mut thread_rng());
-                new_items.extend(tail);
-            }
-            apply_playlist_change_local(state.inner(), new_items, false)?;
+            apply_playlist_edit_local(state.inner(), false, |items, current_index| {
+                let Some(current_index) = current_index else {
+                    return Ok(());
+                };
+                let split_point = current_index + 1;
+                if split_point < items.len() {
+                    let mut tail = items.split_off(split_point);
+                    tail.shuffle(&mut thread_rng());
+                    items.extend(tail);
+                }
+                Ok(())
+            })
+            .await?;
         }
         "load" => {
             let path = filename.ok_or_else(|| "Path required for load action".to_string())?;
@@ -119,15 +132,23 @@ pub async fn update_playlist(
             if items.is_empty() {
                 return Err("Playlist file is empty".to_string());
             }
-            apply_playlist_change_local(state.inner(), items, true)?;
+            apply_playlist_edit_local(state.inner(), true, move |current, _| {
+                *current = items;
+                Ok(())
+            })
+            .await?;
         }
         "reorder" => {
             let items = items.ok_or_else(|| "Items required for reorder action".to_string())?;
-            apply_playlist_change_local(state.inner(), items, false)?;
+            apply_playlist_edit_local(state.inner(), false, move |current, _| {
+                *current = items;
+                Ok(())
+            })
+            .await?;
         }
         "save" => {
             let path = filename.ok_or_else(|| "Path required for save action".to_string())?;
-            let contents = current_items.join("\n");
+            let contents = state.playback.snapshot().playlist_items.join("\n");
             std::fs::write(&path, contents)
                 .map_err(|_| "Failed to save playlist file".to_string())?;
         }
@@ -182,9 +203,6 @@ pub(crate) fn send_playlist_index(
     index: usize,
     reset_position: bool,
 ) -> Result<(), String> {
-    state.playlist.set_current_index(index);
-    emit_playlist_update(state);
-
     let message = ProtocolMessage::Set {
         Set: Box::new(SetMessage {
             room: None,
@@ -224,117 +242,35 @@ pub(crate) fn send_playlist_index(
     Ok(())
 }
 
-pub(crate) async fn apply_playlist_index_from_server(
+async fn apply_playlist_edit_local(
     state: &Arc<AppState>,
-    index: usize,
-    reset_position: bool,
-) -> Result<(), String> {
-    state.playlist.set_current_index(index);
-    let filename = state.playlist.get_current_filename();
-    state.playlist.set_queued_index_filename(filename.clone());
-    emit_playlist_update(state);
-
-    if let Some(filename) = filename {
-        if let Err(e) = load_media_by_name(state, &filename, reset_position, false).await {
-            let message = format!("Failed to load playlist item '{}': {}", filename, e);
-            tracing::warn!("{}", message);
-            crate::commands::connection::emit_error_message(state, &message);
-        }
-    }
-
-    Ok(())
-}
-
-pub(crate) async fn change_playlist_from_filename(
-    state: &Arc<AppState>,
-    filename: &str,
-) -> Result<(), String> {
-    let config = state.config.lock().clone();
-    if !shared_playlists_enabled(state, &config) {
-        return Ok(());
-    }
-
-    let normalized =
-        crate::utils::playlist_filename_from_path(filename).unwrap_or_else(|| filename.to_string());
-    let Some(index) = state.playlist.index_of_filename(&normalized) else {
-        return Ok(());
-    };
-
-    if state.playlist.get_current_index() != Some(index) {
-        send_playlist_index(state, index, true)?;
-        return Ok(());
-    }
-
-    if state.playlist.get_queued_index_filename().as_deref() == Some(&normalized) {
-        return Ok(());
-    }
-
-    if let Err(e) = crate::player::controller::rewind_player(state).await {
-        tracing::warn!("Failed to rewind after playlist match: {}", e);
-    }
-
-    Ok(())
-}
-
-fn apply_playlist_change_local(
-    state: &Arc<AppState>,
-    new_items: Vec<String>,
     reset_index: bool,
-) -> Result<(), String> {
-    let room = state.client_state.get_room();
-    state.playlist.set_queued_index_filename(None);
-    state.playlist.update_previous_playlist(&new_items, &room);
-    let previous_index = state.playlist.get_current_index();
-
-    let new_index = if new_items.is_empty() {
-        None
-    } else if reset_index {
-        Some(0)
-    } else {
-        Some(state.playlist.compute_valid_index(&new_items))
-    };
-
-    state
-        .playlist
-        .set_items_with_index(new_items.clone(), new_index);
-
-    let message = ProtocolMessage::Set {
-        Set: Box::new(SetMessage {
-            room: None,
-            file: None,
-            user: None,
-            ready: None,
-            playlist_index: None,
-            playlist_change: Some(PlaylistChange {
+    edit: impl FnOnce(&mut Vec<String>, Option<usize>) -> Result<(), String>,
+) -> Result<playback_runtime::PlaylistEditResult, String> {
+    playback_runtime::edit_playlist_and_publish(state, reset_index, edit, |result| {
+        let message = ProtocolMessage::Set {
+            Set: Box::new(SetMessage {
+                room: None,
+                file: None,
                 user: None,
-                files: new_items,
+                ready: None,
+                playlist_index: None,
+                playlist_change: Some(PlaylistChange {
+                    user: None,
+                    files: result.items.clone(),
+                }),
+                controller_auth: None,
+                new_controlled_room: None,
+                features: None,
             }),
-            controller_auth: None,
-            new_controlled_room: None,
-            features: None,
-        }),
-    };
-    send_to_server(state, message)?;
-
-    if should_send_playlist_index(previous_index, new_index, reset_index) {
-        let Some(index) = new_index else {
-            emit_playlist_update(state);
-            return Ok(());
         };
-        send_playlist_index(state, index, false)?;
-    } else {
-        emit_playlist_update(state);
-    }
-
-    Ok(())
-}
-
-fn should_send_playlist_index(
-    previous_index: Option<usize>,
-    next_index: Option<usize>,
-    reset_index: bool,
-) -> bool {
-    next_index.is_some() && (reset_index || previous_index != next_index)
+        send_to_server(state, message)?;
+        if let Some(index) = result.index {
+            send_playlist_index(state, index, false)?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 fn normalize_playlist_entry(entry: &str) -> (String, Option<PathBuf>) {
@@ -350,34 +286,6 @@ fn normalize_playlist_entry(entry: &str) -> (String, Option<PathBuf>) {
     (entry.to_string(), None)
 }
 
-fn next_index(state: &Arc<AppState>, config: &SyncplayConfig) -> Result<usize, String> {
-    let items = state.playlist.get_item_filenames();
-    if items.is_empty() {
-        return Err("Playlist is empty".to_string());
-    }
-    let current = state.playlist.get_current_index().unwrap_or(0);
-    let loop_at_end = config.user.loop_at_end_of_playlist || is_playing_music(state);
-    if current + 1 < items.len() {
-        return Ok(current + 1);
-    }
-    if loop_at_end {
-        return Ok(0);
-    }
-    Err("Already at end of playlist".to_string())
-}
-
-fn previous_index(state: &Arc<AppState>) -> Result<usize, String> {
-    let items = state.playlist.get_item_filenames();
-    if items.is_empty() {
-        return Err("Playlist is empty".to_string());
-    }
-    let current = state.playlist.get_current_index().unwrap_or(0);
-    if current == 0 {
-        return Err("Already at start of playlist".to_string());
-    }
-    Ok(current - 1)
-}
-
 fn is_playing_music(state: &Arc<AppState>) -> bool {
     state
         .client_state
@@ -385,17 +293,6 @@ fn is_playing_music(state: &Arc<AppState>) -> bool {
         .as_deref()
         .map(is_music_file)
         .unwrap_or(false)
-}
-
-fn emit_playlist_update(state: &Arc<AppState>) {
-    let items = state.playlist.get_item_filenames();
-    state.emit_event(
-        "playlist-updated",
-        PlaylistEvent {
-            items,
-            current_index: state.playlist.get_current_index(),
-        },
-    );
 }
 
 fn send_to_server(state: &Arc<AppState>, message: ProtocolMessage) -> Result<(), String> {
@@ -411,24 +308,88 @@ fn send_to_server(state: &Arc<AppState>, message: ProtocolMessage) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::connection::Connection;
+    use crate::network::fake_server::FakeSyncplayServer;
 
-    #[test]
-    fn unchanged_playlist_index_does_not_need_broadcast() {
-        assert!(!should_send_playlist_index(Some(0), Some(0), false));
+    async fn fixture() -> (Arc<AppState>, FakeSyncplayServer) {
+        let state = AppState::new();
+        let server = FakeSyncplayServer::start().await.unwrap();
+        let connection = Arc::new(Connection::new());
+        let (_receiver, _peer) = connection
+            .connect(server.host(), server.port())
+            .await
+            .unwrap();
+        *state.connection.lock() = Some(connection);
+        playback_runtime::replace_playlist(
+            &state,
+            vec!["a.mkv".into(), "b.mkv".into(), "c.mkv".into()],
+            Some(1),
+        )
+        .await
+        .unwrap();
+        (state, server)
     }
 
-    #[test]
-    fn changed_playlist_index_needs_broadcast() {
-        assert!(should_send_playlist_index(Some(1), Some(0), false));
+    #[tokio::test]
+    async fn current_item_removal_sends_index_even_when_its_number_is_unchanged() {
+        let (state, mut server) = fixture().await;
+
+        apply_playlist_edit_local(&state, false, |items, _| {
+            items.remove(1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let playlist = server.next_received().await.unwrap();
+        let index = server.next_received().await.unwrap();
+        assert!(matches!(
+            playlist,
+            ProtocolMessage::Set { Set }
+                if Set.playlist_change.is_some() && Set.playlist_index.is_none()
+        ));
+        assert!(matches!(
+            index,
+            ProtocolMessage::Set { Set }
+                if Set.playlist_index.as_ref().and_then(|update| update.index) == Some(1)
+        ));
     }
 
-    #[test]
-    fn reset_playlist_index_needs_broadcast() {
-        assert!(should_send_playlist_index(Some(0), Some(0), true));
-    }
+    #[tokio::test]
+    async fn concurrent_edits_publish_complete_transactions_in_coordinator_order() {
+        let (state, mut server) = fixture().await;
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            apply_playlist_edit_local(&first_state, false, |items, _| {
+                items.push("d.mkv".to_string());
+                Ok(())
+            })
+            .await
+        });
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            apply_playlist_edit_local(&second_state, false, |items, _| {
+                items.push("e.mkv".to_string());
+                Ok(())
+            })
+            .await
+        });
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
 
-    #[test]
-    fn empty_playlist_index_does_not_need_broadcast() {
-        assert!(!should_send_playlist_index(Some(0), None, false));
+        let mut playlist_lengths = Vec::new();
+        for pair in 0..2 {
+            let playlist = server.next_received().await.unwrap();
+            let index = server.next_received().await.unwrap();
+            let ProtocolMessage::Set { Set } = playlist else {
+                panic!("expected playlist message for transaction {pair}");
+            };
+            playlist_lengths.push(Set.playlist_change.unwrap().files.len());
+            assert!(matches!(
+                index,
+                ProtocolMessage::Set { Set } if Set.playlist_index.is_some()
+            ));
+        }
+        assert_eq!(playlist_lengths, vec![4, 5]);
     }
 }

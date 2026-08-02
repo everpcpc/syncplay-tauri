@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::network::messages::FileSizeInfo;
+use crate::network::messages::{FileInfo, FileSizeInfo};
 
 /// User information
 #[derive(Debug, Clone)]
@@ -39,10 +39,8 @@ pub struct ClientState {
     username: RwLock<String>,
     /// Current room
     room: RwLock<String>,
-    /// Current file
-    file: RwLock<Option<String>>,
-    file_size: RwLock<Option<FileSizeInfo>>,
-    file_duration: RwLock<Option<f64>>,
+    /// Last media snapshot confirmed by the player.
+    file: RwLock<FileInfo>,
     /// User list (username -> User)
     users: RwLock<HashMap<String, User>>,
     /// Global playback state
@@ -58,9 +56,11 @@ impl ClientState {
         Arc::new(Self {
             username: RwLock::new(String::new()),
             room: RwLock::new(String::new()),
-            file: RwLock::new(None),
-            file_size: RwLock::new(None),
-            file_duration: RwLock::new(None),
+            file: RwLock::new(FileInfo {
+                name: None,
+                size: None,
+                duration: None,
+            }),
             users: RwLock::new(HashMap::new()),
             global_state: RwLock::new(GlobalPlayState {
                 position: 0.0,
@@ -92,27 +92,32 @@ impl ClientState {
 
     // File methods
     pub fn get_file(&self) -> Option<String> {
-        self.file.read().clone()
+        self.file.read().name.clone()
     }
 
     pub fn set_file(&self, file: Option<String>) {
+        let mut current = self.file.write();
+        if current.name != file {
+            current.size = None;
+            current.duration = None;
+        }
+        current.name = file;
+    }
+
+    pub fn get_file_info(&self) -> FileInfo {
+        self.file.read().clone()
+    }
+
+    pub fn set_file_info(&self, file: FileInfo) {
         *self.file.write() = file;
     }
 
-    pub fn get_file_size(&self) -> Option<FileSizeInfo> {
-        self.file_size.read().clone()
-    }
-
-    pub fn set_file_size(&self, size: Option<FileSizeInfo>) {
-        *self.file_size.write() = size;
-    }
-
     pub fn get_file_duration(&self) -> Option<f64> {
-        *self.file_duration.read()
+        self.file.read().duration
     }
 
     pub fn set_file_duration(&self, duration: Option<f64>) {
-        *self.file_duration.write() = duration;
+        self.file.write().duration = duration;
     }
 
     // User list methods
@@ -193,9 +198,11 @@ impl Default for ClientState {
         Self {
             username: RwLock::new(String::new()),
             room: RwLock::new(String::new()),
-            file: RwLock::new(None),
-            file_size: RwLock::new(None),
-            file_duration: RwLock::new(None),
+            file: RwLock::new(FileInfo {
+                name: None,
+                size: None,
+                duration: None,
+            }),
             users: RwLock::new(HashMap::new()),
             global_state: RwLock::new(GlobalPlayState {
                 position: 0.0,

@@ -19,6 +19,7 @@ pub async fn update_config<R: Runtime>(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     tracing::info!("Updating configuration");
+    let shared_playlist_was_enabled = state.config.lock().user.shared_playlist_enabled;
 
     // Validate config
     config.validate().map_err(|e| {
@@ -52,6 +53,17 @@ pub async fn update_config<R: Runtime>(
         if !autoplay.enabled {
             autoplay.countdown_active = false;
             autoplay.countdown_remaining = 0;
+        }
+    }
+    if !shared_playlist_was_enabled
+        && config.user.shared_playlist_enabled
+        && state.server_features.lock().shared_playlists
+        && state.connection.lock().is_some()
+    {
+        if let Err(error) =
+            crate::client::playback_runtime::reconcile_shared_playlist(state.inner()).await
+        {
+            tracing::warn!("Failed to reconcile shared playlist after enabling it: {error}");
         }
     }
     state.emit_event("config-updated", config.clone());

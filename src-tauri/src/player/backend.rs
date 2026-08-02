@@ -2,10 +2,17 @@ use super::properties::PlayerState;
 use async_trait::async_trait;
 #[cfg(test)]
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Arc;
+
+static NEXT_PLAYER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_player_instance_id() -> u64 {
+    NEXT_PLAYER_INSTANCE_ID.fetch_add(1, AtomicOrdering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerKind {
@@ -75,6 +82,9 @@ pub fn default_player_path_for_kind(kind: PlayerKind) -> &'static str {
 
 #[async_trait]
 pub trait PlayerBackend: Send + Sync {
+    fn instance_id(&self) -> u64 {
+        0
+    }
     fn kind(&self) -> PlayerKind;
     fn name(&self) -> &'static str;
     fn get_state(&self) -> PlayerState;
@@ -82,7 +92,15 @@ pub trait PlayerBackend: Send + Sync {
     async fn set_position(&self, position: f64) -> anyhow::Result<()>;
     async fn set_paused(&self, paused: bool) -> anyhow::Result<()>;
     async fn set_speed(&self, speed: f64) -> anyhow::Result<()>;
+    fn begin_file_load(&self, _load_id: u64, _target: &str) {}
+    fn cancel_file_load(&self, _load_id: u64) {}
     async fn load_file(&self, path: &str) -> anyhow::Result<()>;
+    async fn load_file_generation(&self, path: &str, _load_id: u64) -> anyhow::Result<()> {
+        self.load_file(path).await
+    }
+    fn reports_atomic_media_commits(&self) -> bool {
+        false
+    }
     fn set_features(&self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -122,6 +140,8 @@ struct FakePlayerInner {
     commands: Vec<FakePlayerCommand>,
     shutdown_count: usize,
     connected: bool,
+    load_delay: Option<std::time::Duration>,
+    poll_delay: Option<std::time::Duration>,
 }
 
 #[cfg(test)]
@@ -140,6 +160,8 @@ impl FakePlayerBackend {
                 commands: Vec::new(),
                 shutdown_count: 0,
                 connected: true,
+                load_delay: None,
+                poll_delay: None,
             })),
         }
     }
@@ -152,6 +174,8 @@ impl FakePlayerBackend {
                 commands: Vec::new(),
                 shutdown_count: 0,
                 connected: true,
+                load_delay: None,
+                poll_delay: None,
             })),
         }
     }
@@ -170,6 +194,14 @@ impl FakePlayerBackend {
 
     pub fn set_connected(&self, connected: bool) {
         self.inner.lock().connected = connected;
+    }
+
+    pub fn set_load_delay(&self, delay: std::time::Duration) {
+        self.inner.lock().load_delay = Some(delay);
+    }
+
+    pub fn set_poll_delay(&self, delay: std::time::Duration) {
+        self.inner.lock().poll_delay = Some(delay);
     }
 }
 
@@ -214,10 +246,14 @@ impl PlayerBackend for FakePlayerBackend {
     }
 
     async fn poll_state(&self) -> anyhow::Result<()> {
-        self.inner
-            .lock()
-            .commands
-            .push(FakePlayerCommand::PollState);
+        let delay = {
+            let mut inner = self.inner.lock();
+            inner.commands.push(FakePlayerCommand::PollState);
+            inner.poll_delay
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(())
     }
 
@@ -245,6 +281,16 @@ impl PlayerBackend for FakePlayerBackend {
     }
 
     async fn load_file(&self, path: &str) -> anyhow::Result<()> {
+        let delay = {
+            let mut inner = self.inner.lock();
+            inner
+                .commands
+                .push(FakePlayerCommand::LoadFile(path.to_string()));
+            inner.load_delay
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let mut inner = self.inner.lock();
         inner.state.path = Some(path.to_string());
         inner.state.filename = std::path::Path::new(path)
@@ -252,9 +298,6 @@ impl PlayerBackend for FakePlayerBackend {
             .and_then(|name| name.to_str())
             .map(|name| name.to_string())
             .or_else(|| Some(path.to_string()));
-        inner
-            .commands
-            .push(FakePlayerCommand::LoadFile(path.to_string()));
         Ok(())
     }
 

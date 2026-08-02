@@ -1,12 +1,17 @@
 /// MPV events that we care about
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MpvPlayerEvent {
+    /// MPV began processing a playlist entry.
+    StartFile { playlist_entry_id: Option<i64> },
     /// File has been loaded
-    FileLoaded,
+    FileLoaded { playlist_entry_id: Option<i64> },
     /// Playback has started
     PlaybackRestart,
     /// Playback has ended
-    EndFile { reason: EndFileReason },
+    EndFile {
+        reason: EndFileReason,
+        playlist_entry_id: Option<i64>,
+    },
     /// MPV reported it is quitting
     Quit,
     /// MPV IPC socket/stdout reader reached EOF or disconnected
@@ -38,15 +43,23 @@ pub enum EndFileReason {
 }
 
 impl MpvPlayerEvent {
-    pub fn from_event_name(name: &str, reason: Option<&str>) -> Self {
+    pub fn from_event_name(
+        name: &str,
+        reason: Option<&str>,
+        playlist_entry_id: Option<i64>,
+    ) -> Self {
         match name {
-            "file-loaded" => Self::FileLoaded,
+            "start-file" => Self::StartFile { playlist_entry_id },
+            "file-loaded" => Self::FileLoaded { playlist_entry_id },
             "playback-restart" => Self::PlaybackRestart,
             "end-file" => {
                 let end_reason = reason
                     .map(EndFileReason::from_str)
                     .unwrap_or(EndFileReason::Unknown("none".to_string()));
-                Self::EndFile { reason: end_reason }
+                Self::EndFile {
+                    reason: end_reason,
+                    playlist_entry_id,
+                }
             }
             "shutdown" | "quit" => Self::Quit,
             "seek" => Self::SeekCompleted,

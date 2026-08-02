@@ -96,15 +96,12 @@ impl FakeSyncplayServer {
 
     pub async fn wait_for_reconnect_message(&mut self) -> Option<ProtocolMessage> {
         loop {
-            if let Some(message) = self.next_received().await {
-                if matches!(
-                    message,
-                    ProtocolMessage::TLS { .. } | ProtocolMessage::Hello { .. }
-                ) {
-                    return Some(message);
-                }
-            } else {
-                return None;
+            let message = self.next_received().await?;
+            if matches!(
+                message,
+                ProtocolMessage::TLS { .. } | ProtocolMessage::Hello { .. }
+            ) {
+                return Some(message);
             }
         }
     }
