@@ -144,16 +144,10 @@ pub struct UserPreferences {
     pub loop_at_end_of_playlist: bool,
     pub loop_single_files: bool,
     pub show_playlist: bool,
-    #[serde(default = "default_side_panel_layout")]
-    pub side_panel_layout: String,
     #[serde(default)]
     pub side_column_width: Option<u32>,
     #[serde(default)]
     pub side_panel_primary_size: Option<u32>,
-    #[serde(default)]
-    pub unified_panel_primary_size: Option<u32>,
-    #[serde(default)]
-    pub unified_panel_secondary_size: Option<u32>,
     #[serde(default)]
     pub window_width: Option<u32>,
     #[serde(default)]
@@ -271,11 +265,8 @@ impl Default for UserPreferences {
             loop_at_end_of_playlist: false,
             loop_single_files: false,
             show_playlist: true,
-            side_panel_layout: default_side_panel_layout(),
             side_column_width: None,
             side_panel_primary_size: None,
-            unified_panel_primary_size: None,
-            unified_panel_secondary_size: None,
             window_width: None,
             window_height: None,
             auto_connect: false,
@@ -284,10 +275,6 @@ impl Default for UserPreferences {
             debug: false,
         }
     }
-}
-
-fn default_side_panel_layout() -> String {
-    "rows".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

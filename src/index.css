@@ -152,16 +152,6 @@
   overflow: hidden;
 }
 
-.app-layout[data-layout="left-chat"] {
-  grid-template-columns: minmax(0, 1fr) minmax(420px, 560px);
-  grid-template-rows: minmax(0, 1fr);
-}
-
-.app-layout[data-layout="three-rows"] {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr);
-}
-
 .drag-strip {
   position: absolute;
   top: 0;
@@ -205,36 +195,6 @@
   z-index: 4;
   background: transparent;
   overflow: visible;
-}
-
-.app-unified-column {
-  min-height: 0;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  background: transparent;
-  overflow: hidden;
-}
-
-.app-unified-panels {
-  flex: 1;
-  min-height: 0;
-  min-width: 0;
-  display: grid;
-  gap: 0;
-  position: relative;
-  background: transparent;
-  overflow: hidden;
-}
-
-.app-unified-panels[data-layout="three-rows"] {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: repeat(3, minmax(0, 1fr));
-}
-
-.app-unified-panels[data-layout="three-rows"] .app-main-panel {
-  border-right: none;
-  border-bottom: 1px solid var(--app-border);
 }
 
 .app-resizer {
@@ -729,15 +689,6 @@ body {
 
 .animate-slide-in {
   animation: slide-in 0.3s ease-out;
-}
-
-/* Side-panel divider borders based on layout direction */
-.app-side-panels[data-layout="rows"] > .app-sidebar-right {
-  border-top: 1px solid var(--app-border);
-}
-
-.app-side-panels[data-layout="columns"] > .app-sidebar-right {
-  border-left: 1px solid var(--app-border);
 }
 
 /* Platform-specific: Windows */
