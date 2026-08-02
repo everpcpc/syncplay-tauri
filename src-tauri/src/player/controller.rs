@@ -1260,13 +1260,9 @@ fn committed_media_from_player_state(player_state: &PlayerState) -> Option<Commi
             })
         }
     } else {
-        let filename = player_state.filename.as_deref();
-        if let Some(filename) = filename {
-            if is_url(filename) {
-                Some(filename.to_string())
-            } else {
-                return None;
-            }
+        let filename = player_state.filename.as_deref()?;
+        if is_url(filename) {
+            Some(filename.to_string())
         } else {
             return None;
         }
