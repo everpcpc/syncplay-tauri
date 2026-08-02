@@ -11,8 +11,6 @@ import {
   LuListMinus,
   LuListMusic,
   LuMoon,
-  LuPanelLeft,
-  LuRows3,
   LuSettings,
   LuSun,
   LuZap,
@@ -46,29 +44,14 @@ import {
   shouldAutoCheckUpdates,
   type UpdateProgress,
 } from "../../services/updater";
-import { SyncplayConfig, SidePanelLayout, UserPreferences } from "../../types/config";
+import { SyncplayConfig, UserPreferences } from "../../types/config";
 
 type UiLayoutPreferencePatch = Partial<
   Pick<
     UserPreferences,
-    | "side_column_width"
-    | "side_panel_primary_size"
-    | "window_width"
-    | "window_height"
-    | "side_panel_layout"
-    | "unified_panel_primary_size"
-    | "unified_panel_secondary_size"
+    "side_column_width" | "side_panel_primary_size" | "window_width" | "window_height"
   >
 >;
-
-const SIDE_LAYOUTS: SidePanelLayout[] = ["left-chat", "three-rows"];
-
-const normalizeSidePanelLayout = (layout: unknown): SidePanelLayout => {
-  if (layout === "rows" || layout === "left-chat") return "left-chat";
-  if (layout === "columns" || layout === "three-columns") return "left-chat";
-  if (layout === "chat-bottom" || layout === "three-rows") return "three-rows";
-  return "left-chat";
-};
 
 interface AppHeaderProps {
   appVersion: string | null;
@@ -76,7 +59,6 @@ interface AppHeaderProps {
   isInstallingUpdate: boolean;
   updateProgress: UpdateProgress | null;
   showPlaylist: boolean;
-  sideLayout: SidePanelLayout;
   theme: ThemePreference;
   transparencyMode: TransparencyPreference;
   connected: boolean;
@@ -85,7 +67,6 @@ interface AppHeaderProps {
   onMouseDown: (event: React.MouseEvent) => void;
   onInstallUpdate: () => void;
   onTogglePlaylist: () => void;
-  onToggleLayout: () => void;
   onToggleTheme: () => void;
   onToggleTransparency: () => void;
   onOpenConnection: () => void;
@@ -98,7 +79,6 @@ function AppHeader({
   isInstallingUpdate,
   updateProgress,
   showPlaylist,
-  sideLayout,
   theme,
   transparencyMode,
   connected,
@@ -107,20 +87,11 @@ function AppHeader({
   onMouseDown,
   onInstallUpdate,
   onTogglePlaylist,
-  onToggleLayout,
   onToggleTheme,
   onToggleTransparency,
   onOpenConnection,
   onOpenSettings,
 }: AppHeaderProps) {
-  const layoutLabel = sideLayout === "three-rows" ? "Layout: three rows" : "Layout: left chat";
-  const layoutIcon =
-    sideLayout === "three-rows" ? (
-      <LuRows3 className="app-icon" />
-    ) : (
-      <LuPanelLeft className="app-icon" />
-    );
-
   return (
     <header
       className="app-header relative"
@@ -143,15 +114,6 @@ function AppHeader({
               ) : (
                 <LuListMinus className="app-icon" />
               )}
-            </button>
-            <button
-              onClick={onToggleLayout}
-              className="btn-neutral app-icon-button"
-              data-tauri-drag-region="false"
-              aria-label={layoutLabel}
-              title={layoutLabel}
-            >
-              {layoutIcon}
             </button>
             <button
               onClick={onToggleTheme}
@@ -258,17 +220,12 @@ export function MainLayout() {
   const [showConnectionDialog, setShowConnectionDialog] = useState(false);
   const [showSettingsDialog, setShowSettingsDialog] = useState(false);
   const [showPlaylist, setShowPlaylist] = useState(true);
-  const [sideLayout, setSideLayout] = useState<SidePanelLayout>("left-chat");
-  const isLeftChatLayout = sideLayout === "left-chat";
-  const sidePanelsDirection = "three-rows";
   const [theme, setTheme] = useState<ThemePreference>("dark");
   const [transparencyMode, setTransparencyMode] = useState<TransparencyPreference>("off");
-  const [layoutSize, setLayoutSize] = useState({ width: 0, height: 0 });
-  const [sidePanelsSize, setSidePanelsSize] = useState({ width: 0, height: 0 });
+  const [layoutWidth, setLayoutWidth] = useState(0);
+  const [sidePanelsHeight, setSidePanelsHeight] = useState(0);
   const [sideWidth, setSideWidth] = useState<number | null>(null);
   const [sidePanelSize, setSidePanelSize] = useState<number | null>(null);
-  const [unifiedPanelPrimarySize, setUnifiedPanelPrimarySize] = useState<number | null>(null);
-  const [unifiedPanelSecondarySize, setUnifiedPanelSecondarySize] = useState<number | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
@@ -483,9 +440,6 @@ export function MainLayout() {
       showPlaylistRef.current = config.user.show_playlist;
       setShowPlaylist(config.user.show_playlist);
     }
-    if (config.user.side_panel_layout) {
-      setSideLayout(normalizeSidePanelLayout(config.user.side_panel_layout));
-    }
     const normalizedTheme = normalizeTheme(config.user.theme);
     setTheme(normalizedTheme);
     applyTheme(normalizedTheme);
@@ -502,18 +456,6 @@ export function MainLayout() {
         config.user.side_panel_primary_size > 0
       ) {
         setSidePanelSize(config.user.side_panel_primary_size);
-      }
-      if (
-        typeof config.user.unified_panel_primary_size === "number" &&
-        config.user.unified_panel_primary_size > 0
-      ) {
-        setUnifiedPanelPrimarySize(config.user.unified_panel_primary_size);
-      }
-      if (
-        typeof config.user.unified_panel_secondary_size === "number" &&
-        config.user.unified_panel_secondary_size > 0
-      ) {
-        setUnifiedPanelSecondarySize(config.user.unified_panel_secondary_size);
       }
     }
   }, [config]);
@@ -578,8 +520,7 @@ export function MainLayout() {
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (!entry) return;
-      const { width, height } = entry.contentRect;
-      setLayoutSize({ width, height });
+      setLayoutWidth(entry.contentRect.width);
     });
     observer.observe(layoutRef.current);
     return () => observer.disconnect();
@@ -590,27 +531,26 @@ export function MainLayout() {
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (!entry) return;
-      const { width, height } = entry.contentRect;
-      setSidePanelsSize({ width, height });
+      setSidePanelsHeight(entry.contentRect.height);
     });
     observer.observe(sidePanelsRef.current);
     return () => observer.disconnect();
-  }, [sideLayout, showPlaylist]);
+  }, [showPlaylist]);
 
   useEffect(() => {
-    if (!layoutSize.width) return;
+    if (!layoutWidth) return;
     setSideWidth((previous) => {
       const min = SIDE_MIN_WIDTH;
-      const max = Math.max(min, layoutSize.width - MAIN_MIN_WIDTH - GAP_SIZE);
-      const fallback = Math.round(Math.min(560, Math.max(min, layoutSize.width * 0.36)));
+      const max = Math.max(min, layoutWidth - MAIN_MIN_WIDTH - GAP_SIZE);
+      const fallback = Math.round(Math.min(560, Math.max(min, layoutWidth * 0.36)));
       const next = previous ?? fallback;
       return Math.min(Math.max(next, min), max);
     });
-  }, [layoutSize.width]);
+  }, [layoutWidth]);
 
   useEffect(() => {
-    if (!showPlaylist || !isLeftChatLayout) return;
-    const total = sidePanelsSize.height;
+    if (!showPlaylist) return;
+    const total = sidePanelsHeight;
     if (!total) return;
     setSidePanelSize((previous) => {
       const min = resolveSidePanelMin(total);
@@ -619,41 +559,7 @@ export function MainLayout() {
       const next = previous ?? fallback;
       return Math.min(Math.max(next, min), max);
     });
-  }, [sidePanelsSize.height, showPlaylist, isLeftChatLayout]);
-
-  useEffect(() => {
-    if (!showPlaylist || isLeftChatLayout) return;
-    const total = sidePanelsSize.height;
-    if (!total) return;
-    const min = SIDE_PANEL_MIN;
-    const maxPrimary = Math.max(min, total - min * 2 - GAP_SIZE * 2);
-    const fallbackPrimary = Math.round(total / 3);
-    const nextPrimary = Math.min(
-      Math.max(unifiedPanelPrimarySize ?? fallbackPrimary, min),
-      maxPrimary
-    );
-    const remaining = Math.max(min * 2, total - nextPrimary - GAP_SIZE * 2);
-    const maxSecondary = Math.max(min, remaining - min);
-    const fallbackSecondary = Math.round(remaining / 2);
-    const nextSecondary = Math.min(
-      Math.max(unifiedPanelSecondarySize ?? fallbackSecondary, min),
-      maxSecondary
-    );
-    if (nextPrimary !== unifiedPanelPrimarySize) {
-      setUnifiedPanelPrimarySize(nextPrimary);
-    }
-    if (nextSecondary !== unifiedPanelSecondarySize) {
-      setUnifiedPanelSecondarySize(nextSecondary);
-    }
-  }, [
-    sidePanelsSize.height,
-    sidePanelsSize.width,
-    sidePanelsDirection,
-    showPlaylist,
-    isLeftChatLayout,
-    unifiedPanelPrimarySize,
-    unifiedPanelSecondarySize,
-  ]);
+  }, [sidePanelsHeight, showPlaylist]);
 
   const handleToggleTheme = async () => {
     const previousTheme = theme;
@@ -747,25 +653,15 @@ export function MainLayout() {
   const clampValue = (value: number, min: number, max: number) =>
     Math.min(Math.max(value, min), max);
   const layoutMainWidth =
-    isLeftChatLayout && sideWidth && layoutSize.width
-      ? Math.max(MAIN_MIN_WIDTH, layoutSize.width - sideWidth - GAP_SIZE)
-      : null;
+    sideWidth && layoutWidth ? Math.max(MAIN_MIN_WIDTH, layoutWidth - sideWidth - GAP_SIZE) : null;
   const sidePanelPrimarySize = showPlaylist && sidePanelSize !== null ? sidePanelSize : null;
-  const sidePanelTotal = isLeftChatLayout && showPlaylist ? sidePanelsSize.height : 0;
+  const sidePanelTotal = showPlaylist ? sidePanelsHeight : 0;
   const sidePanelMin = resolveSidePanelMin(sidePanelTotal);
   const sidePanelSecondarySize =
     sidePanelPrimarySize !== null && sidePanelTotal
       ? Math.max(sidePanelMin, sidePanelTotal - sidePanelPrimarySize - GAP_SIZE)
       : null;
   const sidePanelFallback = showPlaylist ? `minmax(0, 1fr) minmax(0, 1fr)` : "minmax(0, 1fr)";
-  const unifiedPanelTotal = !isLeftChatLayout && showPlaylist ? sidePanelsSize.height : 0;
-  const unifiedPanelTertiarySize =
-    unifiedPanelPrimarySize !== null && unifiedPanelSecondarySize !== null && unifiedPanelTotal
-      ? Math.max(
-          SIDE_PANEL_MIN,
-          unifiedPanelTotal - unifiedPanelPrimarySize - unifiedPanelSecondarySize - GAP_SIZE * 2
-        )
-      : null;
   const mainResizerStyle =
     layoutMainWidth !== null
       ? {
@@ -853,54 +749,6 @@ export function MainLayout() {
     window.addEventListener("pointerup", handlePointerUp);
   };
 
-  const handleUnifiedResizeStart = (
-    divider: "primary-secondary" | "secondary-tertiary",
-    event: React.PointerEvent<HTMLDivElement>
-  ) => {
-    if (!sidePanelsRef.current || unifiedPanelPrimarySize === null) return;
-    if (divider === "secondary-tertiary" && unifiedPanelSecondarySize === null) return;
-    event.preventDefault();
-    const startOffset = event.clientY;
-    const startPrimarySize = unifiedPanelPrimarySize;
-    const startSecondarySize = unifiedPanelSecondarySize ?? 0;
-    let latestPrimarySize = startPrimarySize;
-    let latestSecondarySize = startSecondarySize;
-    const rect = sidePanelsRef.current.getBoundingClientRect();
-    const total = rect.height;
-    const min = SIDE_PANEL_MIN;
-
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      const currentOffset = moveEvent.clientY;
-      const delta = currentOffset - startOffset;
-
-      if (divider === "primary-secondary") {
-        const maxPrimary = Math.max(min, total - startSecondarySize - min - GAP_SIZE * 2);
-        latestPrimarySize = clampValue(startPrimarySize + delta, min, maxPrimary);
-        setUnifiedPanelPrimarySize(latestPrimarySize);
-        return;
-      }
-
-      const maxSecondary = Math.max(min, total - startPrimarySize - min - GAP_SIZE * 2);
-      latestSecondarySize = clampValue(startSecondarySize + delta, min, maxSecondary);
-      setUnifiedPanelSecondarySize(latestSecondarySize);
-    };
-
-    const handlePointerUp = () => {
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-      queueUiLayoutPatch(
-        {
-          unified_panel_primary_size: Math.round(latestPrimarySize),
-          unified_panel_secondary_size: Math.round(latestSecondarySize),
-        },
-        120
-      );
-    };
-
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-  };
-
   const handleOpenSettings = (
     initialTab?: "sync" | "ready" | "privacy" | "chat" | "osd" | "misc"
   ) => {
@@ -944,15 +792,6 @@ export function MainLayout() {
     setSettingsInitialTab(undefined);
   };
 
-  const handleToggleLayout = () => {
-    setSideLayout((prev) => {
-      const currentIndex = SIDE_LAYOUTS.indexOf(normalizeSidePanelLayout(prev));
-      const next = SIDE_LAYOUTS[(currentIndex + 1) % SIDE_LAYOUTS.length];
-      queueUiLayoutPatch({ side_panel_layout: next }, 120);
-      return next;
-    });
-  };
-
   const chatPanel = (
     <section className="app-main-column" data-panel="chat">
       <main className="app-main-panel">
@@ -980,7 +819,6 @@ export function MainLayout() {
       isInstallingUpdate={isInstallingUpdate}
       updateProgress={updateProgress}
       showPlaylist={showPlaylist}
-      sideLayout={sideLayout}
       theme={theme}
       transparencyMode={transparencyMode}
       connected={connection.connected}
@@ -989,7 +827,6 @@ export function MainLayout() {
       onMouseDown={handleHeaderMouseDown}
       onInstallUpdate={handleInstallHeaderUpdate}
       onTogglePlaylist={handleTogglePlaylist}
-      onToggleLayout={handleToggleLayout}
       onToggleTheme={handleToggleTheme}
       onToggleTransparency={handleToggleTransparency}
       onOpenConnection={() => setShowConnectionDialog(true)}
@@ -997,24 +834,22 @@ export function MainLayout() {
     />
   );
 
-  const sideResizer =
-    isLeftChatLayout && showPlaylist ? (
-      <div
-        className="app-resizer app-resizer-overlay app-resizer-horizontal"
-        role="separator"
-        aria-orientation="horizontal"
-        onPointerDown={handleSideResizeStart}
-        style={sideResizerStyle}
-      />
-    ) : null;
+  const sideResizer = showPlaylist ? (
+    <div
+      className="app-resizer app-resizer-overlay app-resizer-horizontal"
+      role="separator"
+      aria-orientation="horizontal"
+      onPointerDown={handleSideResizeStart}
+      style={sideResizerStyle}
+    />
+  ) : null;
 
-  const leftChatPanels = (
+  const sideColumn = (
     <section className="app-side-column">
       {header}
       <div
         className="app-side-panels"
         ref={sidePanelsRef}
-        data-layout={sideLayout}
         style={{
           gridTemplateColumns: "minmax(0, 1fr)",
           gridTemplateRows:
@@ -1030,78 +865,6 @@ export function MainLayout() {
     </section>
   );
 
-  const unifiedPanelGrid = showPlaylist
-    ? `${unifiedPanelPrimarySize ?? 0}px ${unifiedPanelSecondarySize ?? 0}px ${
-        unifiedPanelTertiarySize ?? 0
-      }px`
-    : `minmax(0, 1fr) minmax(0, 1fr)`;
-
-  const unifiedDividerOrientation = "horizontal";
-
-  const unifiedChatUsersResizerStyle =
-    showPlaylist && !isLeftChatLayout && unifiedPanelPrimarySize !== null
-      ? {
-          top: `${unifiedPanelPrimarySize + GAP_SIZE / 2}px`,
-          left: 0,
-          width: "100%",
-          height: `${RESIZER_SIZE}px`,
-          transform: "translateY(-50%)",
-        }
-      : undefined;
-
-  const unifiedUsersPlaylistResizerStyle =
-    showPlaylist &&
-    !isLeftChatLayout &&
-    unifiedPanelPrimarySize !== null &&
-    unifiedPanelSecondarySize !== null
-      ? {
-          top: `${unifiedPanelPrimarySize + unifiedPanelSecondarySize + GAP_SIZE / 2}px`,
-          left: 0,
-          width: "100%",
-          height: `${RESIZER_SIZE}px`,
-          transform: "translateY(-50%)",
-        }
-      : undefined;
-
-  const unifiedResizers =
-    !isLeftChatLayout && showPlaylist ? (
-      <>
-        <div
-          className="app-resizer app-resizer-overlay app-resizer-horizontal"
-          role="separator"
-          aria-orientation={unifiedDividerOrientation}
-          onPointerDown={(event) => handleUnifiedResizeStart("primary-secondary", event)}
-          style={unifiedChatUsersResizerStyle}
-        />
-        <div
-          className="app-resizer app-resizer-overlay app-resizer-horizontal"
-          role="separator"
-          aria-orientation={unifiedDividerOrientation}
-          onPointerDown={(event) => handleUnifiedResizeStart("secondary-tertiary", event)}
-          style={unifiedUsersPlaylistResizerStyle}
-        />
-      </>
-    ) : null;
-
-  const unifiedPanels = (
-    <section className="app-unified-column">
-      {header}
-      <div
-        ref={sidePanelsRef}
-        className="app-unified-panels"
-        data-layout={sideLayout}
-        style={{
-          gridTemplateRows: unifiedPanelGrid,
-        }}
-      >
-        {playlistPanel}
-        {usersPanel}
-        {unifiedResizers}
-        {chatPanel}
-      </div>
-    </section>
-  );
-
   return (
     <div className="app-shell">
       <NotificationContainer />
@@ -1110,29 +873,20 @@ export function MainLayout() {
       <div
         className="app-layout"
         ref={layoutRef}
-        data-layout={sideLayout}
         style={{
           gridTemplateColumns:
-            isLeftChatLayout && layoutMainWidth && sideWidth
-              ? `${layoutMainWidth}px ${sideWidth}px`
-              : undefined,
+            layoutMainWidth && sideWidth ? `${layoutMainWidth}px ${sideWidth}px` : undefined,
         }}
       >
-        {isLeftChatLayout ? (
-          <>
-            {chatPanel}
-            <div
-              className="app-resizer app-resizer-vertical app-resizer-overlay"
-              role="separator"
-              aria-orientation="vertical"
-              onPointerDown={handleMainResizeStart}
-              style={mainResizerStyle}
-            />
-            {leftChatPanels}
-          </>
-        ) : (
-          unifiedPanels
-        )}
+        {chatPanel}
+        <div
+          className="app-resizer app-resizer-vertical app-resizer-overlay"
+          role="separator"
+          aria-orientation="vertical"
+          onPointerDown={handleMainResizeStart}
+          style={mainResizerStyle}
+        />
+        {sideColumn}
       </div>
 
       <ConnectionDialog

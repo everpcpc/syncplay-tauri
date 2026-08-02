@@ -7,7 +7,6 @@ export type UnpauseAction =
 export type ChatInputPosition = "top" | "middle" | "bottom";
 export type ChatOutputMode = "chatroom" | "scrolling";
 export type TransparencyMode = "off" | "low" | "high";
-export type SidePanelLayout = "three-rows" | "left-chat";
 
 export interface ServerConfig {
   host: string;
@@ -88,11 +87,8 @@ export interface UserPreferences {
   loop_at_end_of_playlist: boolean;
   loop_single_files: boolean;
   show_playlist: boolean;
-  side_panel_layout: SidePanelLayout;
   side_column_width?: number;
   side_panel_primary_size?: number;
-  unified_panel_primary_size?: number;
-  unified_panel_secondary_size?: number;
   window_width?: number;
   window_height?: number;
   auto_connect: boolean;
