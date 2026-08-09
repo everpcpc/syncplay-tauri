@@ -56,6 +56,7 @@ type UiLayoutPreferencePatch = Partial<
 interface AppHeaderProps {
   appVersion: string | null;
   updateVersion: string | null;
+  isCheckingForUpdates: boolean;
   isInstallingUpdate: boolean;
   updateProgress: UpdateProgress | null;
   showPlaylist: boolean;
@@ -65,6 +66,7 @@ interface AppHeaderProps {
   showTls: boolean;
   rttLabel: string;
   onMouseDown: (event: React.MouseEvent) => void;
+  onCheckForUpdates: () => void;
   onInstallUpdate: () => void;
   onTogglePlaylist: () => void;
   onToggleTheme: () => void;
@@ -76,6 +78,7 @@ interface AppHeaderProps {
 function AppHeader({
   appVersion,
   updateVersion,
+  isCheckingForUpdates,
   isInstallingUpdate,
   updateProgress,
   showPlaylist,
@@ -85,6 +88,7 @@ function AppHeader({
   showTls,
   rttLabel,
   onMouseDown,
+  onCheckForUpdates,
   onInstallUpdate,
   onTogglePlaylist,
   onToggleTheme,
@@ -170,27 +174,53 @@ function AppHeader({
               </div>
             )}
             {appVersion && (
-              <div
-                className="inline-flex items-center justify-center px-2 py-1 rounded-lg text-xs app-panel-muted shrink-0"
-                aria-label={`Version ${appVersion}`}
-                title={`Version ${appVersion}`}
+              <button
+                type="button"
+                onClick={onCheckForUpdates}
+                disabled={isCheckingForUpdates || isInstallingUpdate}
+                className="btn-neutral inline-flex items-center justify-center px-2 py-1 rounded-lg text-xs shrink-0"
+                data-tauri-drag-region="false"
+                aria-busy={isCheckingForUpdates}
+                aria-label={
+                  isCheckingForUpdates
+                    ? "Checking for updates"
+                    : isInstallingUpdate
+                      ? `Version ${appVersion}. Update installation in progress`
+                      : `Version ${appVersion}. Check for updates`
+                }
+                title={
+                  isCheckingForUpdates
+                    ? "Checking for updates..."
+                    : isInstallingUpdate
+                      ? "Update installation in progress"
+                      : `Version ${appVersion}. Check for updates`
+                }
               >
-                v{appVersion}
-              </div>
+                {isCheckingForUpdates ? "Checking..." : `v${appVersion}`}
+              </button>
             )}
             {updateVersion && (
               <button
                 onClick={onInstallUpdate}
-                disabled={isInstallingUpdate}
+                disabled={isInstallingUpdate || isCheckingForUpdates}
                 className="inline-flex items-center px-2 py-1 rounded-lg text-xs app-panel-muted shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
                 data-tauri-drag-region="false"
-                aria-label={`Update available: ${updateVersion}`}
+                aria-busy={isInstallingUpdate}
+                aria-label={
+                  isCheckingForUpdates
+                    ? "Checking for updates"
+                    : isInstallingUpdate
+                      ? `Installing update ${updateVersion}`
+                      : `Update available: ${updateVersion}`
+                }
                 title={
-                  isInstallingUpdate && updateProgress
-                    ? `Installing ${updateVersion}: ${formatBytes(updateProgress.downloaded)}${
-                        updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""
-                      }`
-                    : `Install update ${updateVersion}`
+                  isCheckingForUpdates
+                    ? "Checking for updates..."
+                    : isInstallingUpdate && updateProgress
+                      ? `Installing ${updateVersion}: ${formatBytes(updateProgress.downloaded)}${
+                          updateProgress.total ? ` / ${formatBytes(updateProgress.total)}` : ""
+                        }`
+                      : `Install update ${updateVersion}`
                 }
               >
                 {isInstallingUpdate ? "Installing..." : "Update"}
@@ -239,6 +269,7 @@ export function MainLayout() {
   const [sidePanelSize, setSidePanelSize] = useState<number | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
+  const [isCheckingForUpdates, setIsCheckingForUpdates] = useState(false);
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
   const [settingsInitialTab, setSettingsInitialTab] = useState<
@@ -252,6 +283,7 @@ export function MainLayout() {
   const addNotification = useNotificationStore((state) => state.addNotification);
   const initializedRef = useRef(false);
   const autoUpdateCheckedRef = useRef(false);
+  const updateOperationRef = useRef<"checking" | "installing" | null>(null);
   const availableUpdateRef = useRef<Update | null>(null);
   const updateProgressRef = useRef<UpdateProgress>({ downloaded: 0 });
   const showPlaylistRef = useRef<boolean | null>(null);
@@ -278,6 +310,54 @@ export function MainLayout() {
       });
     }
   }, []);
+
+  const runUpdateCheck = useCallback(
+    async (notifyResult: boolean) => {
+      if (updateOperationRef.current) {
+        return;
+      }
+
+      updateOperationRef.current = "checking";
+      setIsCheckingForUpdates(true);
+
+      try {
+        const updateResult = await checkForUpdates();
+        if (updateResult.status === "available") {
+          replaceAvailableUpdate(updateResult.update);
+          addNotification({
+            type: "info",
+            message: `Update ${updateResult.update.version} available. Click Update in the header to install.`,
+          });
+        } else if (updateResult.status === "up-to-date") {
+          replaceAvailableUpdate(null);
+          if (notifyResult) {
+            addNotification({
+              type: "success",
+              message: "Syncplay is up to date.",
+            });
+          }
+        } else if (updateResult.status === "unsupported") {
+          if (notifyResult) {
+            addNotification({
+              type: "warning",
+              message: "Update checks are unavailable in this environment.",
+            });
+          }
+        } else if (notifyResult) {
+          addNotification({
+            type: "error",
+            message: `Update check failed: ${updateResult.message}`,
+          });
+        } else {
+          console.warn("Auto update check failed", updateResult.message);
+        }
+      } finally {
+        updateOperationRef.current = null;
+        setIsCheckingForUpdates(false);
+      }
+    },
+    [addNotification, replaceAvailableUpdate]
+  );
 
   useEffect(() => {
     let active = true;
@@ -321,19 +401,7 @@ export function MainLayout() {
           shouldAutoCheckUpdates(config.user.check_for_updates_automatically)
         ) {
           autoUpdateCheckedRef.current = true;
-          const updateResult = await checkForUpdates();
-          if (updateResult.status === "available") {
-            replaceAvailableUpdate(updateResult.update);
-            addNotification({
-              type: "info",
-              message: `Update ${updateResult.update.version} available. Click Update in the header to install.`,
-            });
-          } else {
-            replaceAvailableUpdate(null);
-            if (updateResult.status === "error") {
-              console.warn("Auto update check failed", updateResult.message);
-            }
-          }
+          await runUpdateCheck(false);
         }
 
         if (config.user.force_gui_prompt) {
@@ -367,7 +435,7 @@ export function MainLayout() {
     };
 
     initFromConfig();
-  }, [connection.connected, addNotification, replaceAvailableUpdate, setConfig]);
+  }, [connection.connected, addNotification, runUpdateCheck, setConfig]);
 
   useEffect(() => {
     return () => {
@@ -768,6 +836,10 @@ export function MainLayout() {
   };
 
   const handleInstallHeaderUpdate = async () => {
+    if (updateOperationRef.current) {
+      return;
+    }
+
     const availableUpdate = availableUpdateRef.current;
     if (!availableUpdate) {
       addNotification({
@@ -778,6 +850,7 @@ export function MainLayout() {
       return;
     }
 
+    updateOperationRef.current = "installing";
     setIsInstallingUpdate(true);
     updateProgressRef.current = { downloaded: 0 };
     setUpdateProgress({ downloaded: 0 });
@@ -795,7 +868,13 @@ export function MainLayout() {
       });
       setIsInstallingUpdate(false);
       setUpdateProgress(null);
+    } finally {
+      updateOperationRef.current = null;
     }
+  };
+
+  const handleCheckForUpdates = () => {
+    void runUpdateCheck(true);
   };
 
   const handleCloseSettings = () => {
@@ -827,6 +906,7 @@ export function MainLayout() {
     <AppHeader
       appVersion={appVersion}
       updateVersion={updateVersion}
+      isCheckingForUpdates={isCheckingForUpdates}
       isInstallingUpdate={isInstallingUpdate}
       updateProgress={updateProgress}
       showPlaylist={showPlaylist}
@@ -836,6 +916,7 @@ export function MainLayout() {
       showTls={showTls}
       rttLabel={rttLabel}
       onMouseDown={handleHeaderMouseDown}
+      onCheckForUpdates={handleCheckForUpdates}
       onInstallUpdate={handleInstallHeaderUpdate}
       onTogglePlaylist={handleTogglePlaylist}
       onToggleTheme={handleToggleTheme}

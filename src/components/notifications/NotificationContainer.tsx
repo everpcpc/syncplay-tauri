@@ -38,9 +38,8 @@ export function NotificationContainer() {
       {notifications.map((notification) => (
         <div
           key={notification.id}
-          className={`${getNotificationStyles(
-            notification.type
-          )} p-4 rounded-lg animate-slide-in`}
+          role={notification.type === "error" ? "alert" : "status"}
+          className={`${getNotificationStyles(notification.type)} p-4 rounded-lg animate-slide-in`}
         >
           <div className="flex items-start justify-between">
             <div className="flex items-start gap-3">
