@@ -102,6 +102,12 @@ pub async fn ensure_player_connected(state: &Arc<AppState>) -> Result<(), String
     #[cfg(test)]
     let fake_player_factory = state.fake_player_factory.lock().clone();
     #[cfg(test)]
+    if fake_player_factory.is_none() {
+        return Err(
+            "Real player launch is disabled in tests; install FakePlayerFactory".to_string(),
+        );
+    }
+    #[cfg(test)]
     if let Some(factory) = fake_player_factory {
         let fake = Arc::new(factory.launch(PlayerKind::Mpv));
         prepare_player_after_connect(&(fake.clone() as Arc<dyn PlayerBackend>)).await;
@@ -1072,6 +1078,7 @@ fn start_mpv_process_if_needed(
     }
 
     let mut cmd = Command::new(player_path);
+    cmd.kill_on_drop(true);
     cmd.env_remove("TERM");
     let launch_args = args.to_vec();
     let mut full_args = Vec::new();
@@ -1815,9 +1822,10 @@ fn send_ready_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_mpv_version, clear_disconnected_player, parse_mpv_version_flags, resolve_media_path,
-        rewind_looping_media, schedule_double_check_rewind, should_pause_on_prepare, stop_player,
-        LoadfileOptionsSyntax, RewindGeneration,
+        check_mpv_version, clear_disconnected_player, ensure_player_connected,
+        parse_mpv_version_flags, resolve_media_path, rewind_looping_media,
+        schedule_double_check_rewind, should_pause_on_prepare, stop_player, LoadfileOptionsSyntax,
+        RewindGeneration,
     };
     use crate::app_state::AppState;
     use crate::client::playback::{CommittedMedia, LoadId, PlaybackEvent};
@@ -1892,6 +1900,20 @@ mod tests {
         let unknown = parse_mpv_version_flags("unexpected output").unwrap();
         assert!(!unknown.osc_visibility_change_compatible);
         assert_eq!(unknown.loadfile_options_syntax, None);
+    }
+
+    #[tokio::test]
+    async fn real_player_launch_is_disabled_in_unit_tests() {
+        let state = AppState::new();
+
+        let error = ensure_player_connected(&state).await.unwrap_err();
+
+        assert_eq!(
+            error,
+            "Real player launch is disabled in tests; install FakePlayerFactory"
+        );
+        assert!(state.player.lock().is_none());
+        assert!(state.player_process.lock().is_none());
     }
 
     #[tokio::test]

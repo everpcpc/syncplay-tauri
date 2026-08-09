@@ -3566,6 +3566,8 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn every_state_response_includes_client_timing() {
         let state = AppState::new();
+        let factory = Arc::new(FakePlayerFactory::default());
+        *state.fake_player_factory.lock() = Some(factory.clone());
         let mut server = FakeSyncplayServer::start().await.unwrap();
         connect_to_server_state::<tauri::test::MockRuntime>(
             server.host(),
@@ -3603,7 +3605,7 @@ mod lifecycle_tests {
         // the connection is still marked only as Connected.
         timeout(Duration::from_secs(2), async {
             loop {
-                if state
+                let authenticated = state
                     .connection
                     .lock()
                     .as_ref()
@@ -3611,8 +3613,8 @@ mod lifecycle_tests {
                         connection.state()
                             == crate::network::connection::ConnectionState::Authenticated
                     })
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                if authenticated && factory.launch_count() == 1 {
                     break;
                 }
                 sleep(Duration::from_millis(10)).await;
@@ -3689,5 +3691,10 @@ mod lifecycle_tests {
         assert_eq!(second_ping.latency_calculation, Some(101.0));
         assert!(second_ping.client_latency_calculation.is_some());
         assert!(second_ping.client_rtt.is_some());
+
+        let player = factory.players().first().cloned().unwrap();
+        disconnect_from_server_state(&state).await.unwrap();
+        assert_eq!(player.shutdown_count(), 1);
+        server.close();
     }
 }
