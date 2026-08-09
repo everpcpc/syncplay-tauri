@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// MPV JSON IPC command
@@ -46,11 +46,30 @@ pub struct MpvEvent {
 }
 
 /// MPV message (either response or event)
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum MpvMessage {
     Response(MpvResponse),
     Event(MpvEvent),
+}
+
+impl<'de> Deserialize<'de> for MpvMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        // Responses are sparse and accept unknown fields, so untagged variant
+        // matching would otherwise classify every asynchronous event as a reply.
+        if value.get("event").is_some() {
+            serde_json::from_value(value)
+                .map(Self::Event)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Response)
+                .map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +270,39 @@ impl MpvCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_message_is_deserialized_as_event() {
+        let message: MpvMessage = serde_json::from_value(serde_json::json!({
+            "event": "log-message",
+            "prefix": "term-msg",
+            "level": "info",
+            "text": "ANS_filename=movie.mkv\n"
+        }))
+        .unwrap();
+
+        let MpvMessage::Event(event) = message else {
+            panic!("async MPV message was classified as a command response");
+        };
+        assert_eq!(event.event, "log-message");
+        assert_eq!(event.text.as_deref(), Some("ANS_filename=movie.mkv\n"));
+    }
+
+    #[test]
+    fn command_reply_is_deserialized_as_response() {
+        let message: MpvMessage = serde_json::from_value(serde_json::json!({
+            "data": "0.41.0",
+            "request_id": 7,
+            "error": "success"
+        }))
+        .unwrap();
+
+        let MpvMessage::Response(response) = message else {
+            panic!("MPV command reply was classified as an async event");
+        };
+        assert_eq!(response.request_id, Some(7));
+        assert_eq!(response.error, "success");
+    }
 
     fn options() -> serde_json::Map<String, Value> {
         serde_json::from_value(serde_json::json!({
