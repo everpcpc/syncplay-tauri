@@ -1,3 +1,4 @@
+import { LuCheck, LuInfo, LuTriangleAlert, LuX } from "react-icons/lu";
 import { useNotificationStore } from "../../store/notifications";
 
 export function NotificationContainer() {
@@ -21,14 +22,14 @@ export function NotificationContainer() {
   const getNotificationIcon = (type: string) => {
     switch (type) {
       case "success":
-        return "✓";
+        return <LuCheck className="app-icon app-text-success" />;
       case "error":
-        return "✕";
+        return <LuX className="app-icon app-text-danger" />;
       case "warning":
-        return "⚠";
+        return <LuTriangleAlert className="app-icon app-text-warning" />;
       case "info":
       default:
-        return "ℹ";
+        return <LuInfo className="app-icon app-text-accent" />;
     }
   };
 
@@ -39,18 +40,19 @@ export function NotificationContainer() {
           key={notification.id}
           className={`${getNotificationStyles(
             notification.type
-          )} p-4 rounded-lg shadow-lg animate-slide-in`}
+          )} p-4 rounded-lg animate-slide-in`}
         >
           <div className="flex items-start justify-between">
             <div className="flex items-start gap-3">
-              <span className="text-xl font-bold">{getNotificationIcon(notification.type)}</span>
+              <span className="mt-0.5 inline-flex">{getNotificationIcon(notification.type)}</span>
               <p className="text-sm">{notification.message}</p>
             </div>
             <button
               onClick={() => removeNotification(notification.id)}
               className="app-text-muted hover:opacity-80 ml-4"
+              aria-label="Dismiss notification"
             >
-              ✕
+              <LuX className="app-icon" />
             </button>
           </div>
         </div>

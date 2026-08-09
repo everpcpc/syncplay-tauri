@@ -103,7 +103,7 @@ export function TrustedDomainsDialog({ isOpen, onClose }: TrustedDomainsDialogPr
 
   return (
     <AppDialogPortal className="fixed inset-0 app-overlay app-dialog-overlay flex items-center justify-center">
-      <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl max-h-[80vh] overflow-auto shadow-xl">
+      <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl max-h-[80vh] overflow-auto app-dialog-panel">
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
           <div>
             <h2 className="text-xl font-bold">Trusted Domains</h2>
@@ -125,7 +125,7 @@ export function TrustedDomainsDialog({ isOpen, onClose }: TrustedDomainsDialogPr
                 type="checkbox"
                 checked={config.user.only_switch_to_trusted_domains}
                 onChange={(e) => toggleOnlySwitch(e.target.checked)}
-                className="w-4 h-4"
+                className="app-checkbox"
               />
               Only switch to trusted domains
             </label>
@@ -143,7 +143,7 @@ export function TrustedDomainsDialog({ isOpen, onClose }: TrustedDomainsDialogPr
                       addTrustedDomain();
                     }
                   }}
-                  className="flex-1 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                  className="flex-1 app-input px-3 py-2 rounded focus:outline-none"
                   placeholder="youtube.com"
                 />
                 <button
@@ -161,7 +161,7 @@ export function TrustedDomainsDialog({ isOpen, onClose }: TrustedDomainsDialogPr
                   {config.user.trusted_domains.map((domain) => (
                     <div
                       key={domain}
-                      className="flex items-center justify-between app-panel-muted px-3 py-2 rounded"
+                      className="flex items-center justify-between app-panel-muted px-3 py-2 rounded-lg"
                     >
                       <span className="text-sm truncate">{domain}</span>
                       <button

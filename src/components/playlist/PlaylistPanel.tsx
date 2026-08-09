@@ -2,6 +2,7 @@ import { useSyncplayStore } from "../../store";
 import {
   LuChevronLeft,
   LuChevronRight,
+  LuFilm,
   LuFolder,
   LuListMusic,
   LuPlay,
@@ -589,8 +590,12 @@ export function PlaylistPanel() {
       <div className="p-4 border-b app-divider app-surface">
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between gap-2">
-            <LuListMusic className="app-icon app-text-muted" />
-            <div className="flex items-center gap-2 flex-1">
+            <div className="flex items-center gap-2 shrink-0">
+              <LuListMusic className="app-icon app-text-muted" />
+              <span className="text-sm font-semibold">Playlist</span>
+              <span className="text-xs app-text-muted app-tnum">({playlist.items.length})</span>
+            </div>
+            <div className="flex items-center gap-2 flex-1 justify-center">
               <button
                 onClick={handleAddFile}
                 disabled={!connection.connected}
@@ -674,7 +679,7 @@ export function PlaylistPanel() {
                         void handlePlayItem(index);
                       }
                     }}
-                    className={`p-2 rounded-md text-sm select-none transition-transform transition-opacity duration-150 ${
+                    className={`p-2.5 rounded-lg text-sm select-none transition-transform transition-opacity duration-150 ${
                       isCurrent ? "app-item-playing" : "app-panel-muted group"
                     } ${draggingIndex === index ? "opacity-40 scale-[0.98]" : ""}`}
                     data-playlist-item
@@ -719,6 +724,16 @@ export function PlaylistPanel() {
                       >
                         <LuPlay className="app-icon" />
                       </button>
+                      <LuFilm
+                        className={`app-icon shrink-0 ${
+                          available
+                            ? isCurrent
+                              ? "app-text-accent"
+                              : "app-text-muted"
+                            : "app-text-muted opacity-50"
+                        }`}
+                        aria-hidden="true"
+                      />
                       <span
                         className={`app-tooltip-text truncate flex-1 ${
                           available
@@ -732,7 +747,7 @@ export function PlaylistPanel() {
                         {item}
                       </span>
                       {isCurrent && (
-                        <span className="text-[10px] px-2 leading-4 rounded-full app-tag-muted app-text-accent">
+                        <span className="text-[10px] px-2 leading-4 rounded-full app-tag-accent">
                           Playing
                         </span>
                       )}
