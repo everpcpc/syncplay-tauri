@@ -449,9 +449,14 @@ mod tests {
 
     #[test]
     fn iina_app_binary_is_normalized_to_sibling_cli() {
+        let app_binary = "/Applications/IINA.app/Contents/MacOS/IINA";
+        let normalized = normalize_iina_player_path(app_binary);
+        let normalized = Path::new(&normalized);
+
+        assert_eq!(normalized.parent(), Path::new(app_binary).parent());
         assert_eq!(
-            normalize_iina_player_path("/Applications/IINA.app/Contents/MacOS/IINA"),
-            "/Applications/IINA.app/Contents/MacOS/iina-cli"
+            normalized.file_name().and_then(|name| name.to_str()),
+            Some("iina-cli")
         );
         assert_eq!(
             normalize_iina_player_path("/Applications/IINA.app/Contents/MacOS/iina-cli"),

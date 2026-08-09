@@ -2397,7 +2397,7 @@ mod tests {
 
     #[test]
     fn bundled_lua_redirect_contract_is_explicit_and_single_claim() {
-        let script = include_str!("../../resources/syncplayintf.lua");
+        let script = include_str!("../../resources/syncplayintf.lua").replace("\r\n", "\n");
         let claim = script
             .find("syncplay_clear_redirects(redirected_token)")
             .expect("redirect claim must clear sibling mappings");
