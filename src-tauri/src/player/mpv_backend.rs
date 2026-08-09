@@ -829,7 +829,7 @@ async fn finish_media_transaction(
         }
         if context.kind == PlayerKind::Iina
             && explicit_external
-            && transaction.filename() == Some("iina-bkg.png")
+            && transaction.filename() == Some("placeholder.png")
         {
             context.file_loaded.store(false, Ordering::SeqCst);
             return;
@@ -1819,9 +1819,9 @@ mod tests {
             context.kind = kind;
             for line in [
                 "<SyncplayUpdateFile>",
-                "ANS_filename=iina-bkg.png",
+                "ANS_filename=placeholder.png",
                 "ANS_duration=0",
-                "ANS_path=/resources/iina-bkg.png",
+                "ANS_path=/resources/placeholder.png",
                 "</SyncplayUpdateFile>",
             ] {
                 feed_test_line(&context, MpvLineSource::IpcLog, line).await;
@@ -1832,7 +1832,7 @@ mod tests {
         assert_eq!(feed_snapshot(PlayerKind::Iina).await, (false, None));
         assert_eq!(
             feed_snapshot(PlayerKind::Mpv).await,
-            (true, Some("iina-bkg.png".to_string()))
+            (true, Some("placeholder.png".to_string()))
         );
     }
 

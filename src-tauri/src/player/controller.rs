@@ -1198,17 +1198,6 @@ fn resolve_placeholder_path(state: &AppState) -> Option<PathBuf> {
     )
 }
 
-fn resolve_iina_placeholder_path(state: &AppState) -> Option<PathBuf> {
-    resolve_resource_path(
-        state,
-        &[
-            "resources/iina-bkg.png",
-            "iina-bkg.png",
-            "src-tauri/resources/iina-bkg.png",
-        ],
-    )
-}
-
 fn resolve_syncplay_lua_path(state: &AppState) -> Option<PathBuf> {
     resolve_resource_path(
         state,
@@ -1576,11 +1565,9 @@ fn start_mpv_process_if_needed(
     let mut cmd = Command::new(player_path);
     cmd.kill_on_drop(true);
     cmd.env_remove("TERM");
-    let placeholder_path = if kind == PlayerKind::Iina {
-        resolve_iina_placeholder_path(state)
-    } else {
-        None
-    };
+    let placeholder_path = (kind == PlayerKind::Iina)
+        .then(|| resolve_placeholder_path(state))
+        .flatten();
     let full_args = build_mpv_launch_arguments(
         kind,
         args,
@@ -2011,19 +1998,13 @@ fn schedule_loop_unpause(state: Arc<AppState>, lease: playback_runtime::LoopLeas
 
 pub(crate) fn is_placeholder_file(state: &Arc<AppState>, player_state: &PlayerState) -> bool {
     if let Some(name) = player_state.filename.as_deref() {
-        if matches!(name, "placeholder.png" | "iina-bkg.png") {
+        if name == "placeholder.png" {
             return true;
         }
     }
     if let Some(path) = player_state.path.as_deref() {
         let path = Path::new(path);
-        if [
-            resolve_placeholder_path(state),
-            resolve_iina_placeholder_path(state),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|placeholder_path| path == placeholder_path)
+        if resolve_placeholder_path(state).is_some_and(|placeholder_path| path == placeholder_path)
         {
             return true;
         }
@@ -2680,7 +2661,7 @@ mod tests {
             PlayerKind::Iina,
             &["--profile=cinema".into(), "--osc".into()],
             "/tmp/syncplay-mpv",
-            Some(std::path::Path::new("/resources/iina-bkg.png")),
+            Some(std::path::Path::new("/resources/placeholder.png")),
             Some(std::path::Path::new("/resources/syncplayintf.lua")),
         )
         .unwrap();
@@ -2689,7 +2670,7 @@ mod tests {
             arguments,
             vec![
                 "--no-stdin",
-                "/resources/iina-bkg.png",
+                "/resources/placeholder.png",
                 "--profile=cinema",
                 "--osc=yes",
                 "--mpv-input-ipc-server=/tmp/syncplay-mpv",
