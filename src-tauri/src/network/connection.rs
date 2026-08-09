@@ -399,10 +399,19 @@ mod tests {
 
     #[tokio::test]
     async fn tls_upgrade_timeout_aborts_worker_and_closes_receiver() {
-        let server = FakeSyncplayServer::start().await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_server, hold_server) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = hold_server.await;
+            drop(stream);
+        });
         let connection = Connection::new();
         let (mut receiver, _) = connection
-            .connect(server.host(), server.port())
+            .connect(address.ip().to_string(), address.port())
             .await
             .unwrap();
 
@@ -414,13 +423,14 @@ mod tests {
         .expect("TLS timeout must settle")
         .unwrap_err();
 
-        assert!(result.to_string().contains("timed out"));
+        assert_eq!(result.to_string(), "TLS upgrade timed out");
         assert!(timeout(Duration::from_secs(2), receiver.recv())
             .await
             .expect("connection worker must close its receiver")
             .is_none());
         assert_eq!(connection.state(), super::ConnectionState::Disconnected);
-        server.close();
+        let _ = release_server.send(());
+        server_task.await.unwrap();
     }
 
     #[tokio::test]
