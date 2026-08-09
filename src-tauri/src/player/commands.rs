@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// MPV JSON IPC command
@@ -43,14 +43,40 @@ pub struct MpvEvent {
     pub prefix: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
 }
 
 /// MPV message (either response or event)
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum MpvMessage {
     Response(MpvResponse),
     Event(MpvEvent),
+}
+
+impl<'de> Deserialize<'de> for MpvMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        // MPV replies are identified by request_id. Check it before `event` to
+        // match the reference IPC client and avoid treating a reply containing
+        // event-shaped extension data as an asynchronous notification.
+        if value.get("request_id").is_some() {
+            serde_json::from_value(value)
+                .map(Self::Response)
+                .map_err(serde::de::Error::custom)
+        } else if value.get("event").is_some() {
+            serde_json::from_value(value)
+                .map(Self::Event)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Response)
+                .map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,28 +174,6 @@ impl MpvCommand {
         }
     }
 
-    pub fn loadfile_with_options(
-        path: &str,
-        mode: &str,
-        options: serde_json::Map<String, Value>,
-        syntax: LoadfileOptionsSyntax,
-    ) -> Self {
-        let mut command = vec![
-            Value::String("loadfile".to_string()),
-            Value::String(path.to_string()),
-            Value::String(mode.to_string()),
-        ];
-        if syntax == LoadfileOptionsSyntax::Modern {
-            command.push(Value::Number((-1).into()));
-        }
-        command.push(Value::Object(options));
-        Self {
-            command,
-            request_id: None,
-            load_id: None,
-        }
-    }
-
     /// Create a seek command
     pub fn seek(position: f64, mode: &str, request_id: u64) -> Self {
         Self {
@@ -235,6 +239,29 @@ impl MpvCommand {
         }
     }
 
+    pub fn load_generation_via_script(
+        path: &str,
+        load_id: u64,
+        syntax: Option<LoadfileOptionsSyntax>,
+    ) -> Self {
+        let syntax = match syntax {
+            Some(LoadfileOptionsSyntax::Legacy) => "legacy",
+            Some(LoadfileOptionsSyntax::Modern) => "modern",
+            None => "auto",
+        };
+        let mut command = Self::script_message_to(
+            "syncplayintf",
+            "syncplay-load-file",
+            vec![
+                Value::String(load_id.to_string()),
+                Value::String(path.to_string()),
+                Value::String(syntax.to_string()),
+            ],
+        );
+        command.load_id = Some(load_id);
+        command
+    }
+
     /// Request log messages from MPV
     pub fn request_log_messages(level: &str) -> Self {
         Self {
@@ -252,39 +279,76 @@ impl MpvCommand {
 mod tests {
     use super::*;
 
-    fn options() -> serde_json::Map<String, Value> {
-        serde_json::from_value(serde_json::json!({
-            "term-playing-msg": "marker"
+    #[test]
+    fn async_message_is_deserialized_as_event() {
+        let message: MpvMessage = serde_json::from_value(serde_json::json!({
+            "event": "log-message",
+            "prefix": "term-msg",
+            "level": "info",
+            "text": "ANS_filename=movie.mkv\n"
         }))
-        .unwrap()
+        .unwrap();
+
+        let MpvMessage::Event(event) = message else {
+            panic!("async MPV message was classified as a command response");
+        };
+        assert_eq!(event.event, "log-message");
+        assert_eq!(event.text.as_deref(), Some("ANS_filename=movie.mkv\n"));
     }
 
     #[test]
-    fn legacy_loadfile_places_options_after_mode() {
-        let command = MpvCommand::loadfile_with_options(
-            "movie.mkv",
-            "replace",
-            options(),
-            LoadfileOptionsSyntax::Legacy,
-        );
+    fn command_reply_is_deserialized_as_response() {
+        let message: MpvMessage = serde_json::from_value(serde_json::json!({
+            "data": "0.41.0",
+            "request_id": 7,
+            "error": "success"
+        }))
+        .unwrap();
 
-        assert_eq!(command.command.len(), 4);
-        assert_eq!(command.command[3]["term-playing-msg"], "marker");
-        assert_eq!(command.request_id, None);
+        let MpvMessage::Response(response) = message else {
+            panic!("MPV command reply was classified as an async event");
+        };
+        assert_eq!(response.request_id, Some(7));
+        assert_eq!(response.error, "success");
     }
 
     #[test]
-    fn modern_loadfile_places_insertion_index_before_options() {
-        let command = MpvCommand::loadfile_with_options(
-            "movie.mkv",
-            "replace",
-            options(),
-            LoadfileOptionsSyntax::Modern,
+    fn request_id_takes_precedence_over_event_in_mixed_envelope() {
+        let message: MpvMessage = serde_json::from_value(serde_json::json!({
+            "event": "log-message",
+            "request_id": 9,
+            "error": "success",
+            "data": "accepted"
+        }))
+        .unwrap();
+
+        let MpvMessage::Response(response) = message else {
+            panic!("request reply was classified as an asynchronous event");
+        };
+        assert_eq!(response.request_id, Some(9));
+        assert_eq!(response.data, Some(Value::String("accepted".into())));
+    }
+
+    #[test]
+    fn generation_load_targets_the_syncplay_lua_protocol() {
+        let command = MpvCommand::load_generation_via_script(
+            "movie with spaces.mkv",
+            17,
+            Some(LoadfileOptionsSyntax::Modern),
         );
 
-        assert_eq!(command.command.len(), 5);
-        assert_eq!(command.command[3], serde_json::json!(-1));
-        assert_eq!(command.command[4]["term-playing-msg"], "marker");
+        assert_eq!(
+            command.command,
+            vec![
+                serde_json::json!("script-message-to"),
+                serde_json::json!("syncplayintf"),
+                serde_json::json!("syncplay-load-file"),
+                serde_json::json!("17"),
+                serde_json::json!("movie with spaces.mkv"),
+                serde_json::json!("modern"),
+            ]
+        );
+        assert_eq!(command.load_id, Some(17));
         assert_eq!(command.request_id, None);
     }
 }

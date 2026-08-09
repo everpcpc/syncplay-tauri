@@ -1,6 +1,8 @@
 use super::backend::{PlayerBackend, PlayerKind};
 use super::properties::PlayerState;
 use async_trait::async_trait;
+#[cfg(any(windows, test))]
+use parking_lot::Condvar;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
@@ -11,6 +13,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 const MPC_OPEN_MAX_WAIT_TIME: Duration = Duration::from_secs(10);
+const MPC_EXISTENCE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const MPC_LOCK_WAIT_TIME: Duration = Duration::from_millis(200);
 const MPC_RETRY_WAIT_TIME: Duration = Duration::from_millis(10);
 const MPC_MAX_RETRIES: usize = 30;
@@ -38,6 +41,170 @@ const CMD_SETSPEED: u32 = 0xA0004008;
 const CMD_OSDSHOWMESSAGE: u32 = 0xA0005000;
 const CMD_CLOSEAPP: u32 = 0xA0004006;
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Default)]
+struct MpcShutdownSignal {
+    inner: Arc<MpcShutdownSignalInner>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct MpcShutdownSignalInner {
+    requested: Mutex<bool>,
+    wake: Condvar,
+}
+
+#[cfg(any(windows, test))]
+impl MpcShutdownSignal {
+    fn request(&self) -> bool {
+        let mut requested = self.inner.requested.lock();
+        let first_request = !*requested;
+        *requested = true;
+        drop(requested);
+        self.inner.wake.notify_all();
+        first_request
+    }
+
+    fn wait_timeout(&self, duration: Duration) -> bool {
+        let deadline = Instant::now() + duration;
+        let mut requested = self.inner.requested.lock();
+        while !*requested {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            self.inner.wake.wait_for(&mut requested, remaining);
+        }
+        *requested
+    }
+}
+
+#[cfg(windows)]
+fn join_owned_thread(owner: &Mutex<Option<std::thread::JoinHandle<()>>>, thread_name: &str) {
+    let Some(handle) = owner.lock().take() else {
+        return;
+    };
+    if handle.join().is_err() {
+        warn!(thread_name, "MPC lifecycle thread panicked during teardown");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum MpcMediaSettleAction {
+    SetPaused { paused: bool, delay: Duration },
+    TogglePaused { delay: Duration },
+    SetPosition(f64),
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MpcMediaSettleStage {
+    ForcePause { remaining: usize },
+    ApplyTarget,
+    VerifyTarget,
+    RefreshPause { remaining: usize },
+    VerifyRefresh,
+    SetPosition,
+    Complete,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MpcMediaSettle {
+    target_paused: bool,
+    target_position: f64,
+    attempts_remaining: usize,
+    stage: MpcMediaSettleStage,
+}
+
+impl MpcMediaSettle {
+    pub(crate) fn new(target_paused: bool, target_position: f64) -> Self {
+        Self {
+            target_paused,
+            target_position,
+            attempts_remaining: MPC_MAX_RETRIES,
+            stage: MpcMediaSettleStage::ForcePause {
+                remaining: MPC_MAX_RETRIES,
+            },
+        }
+    }
+
+    pub(crate) fn needs_pause_observation(&self) -> bool {
+        matches!(
+            self.stage,
+            MpcMediaSettleStage::VerifyTarget | MpcMediaSettleStage::VerifyRefresh
+        )
+    }
+
+    pub(crate) fn next(&mut self, observed_paused: Option<bool>) -> Option<MpcMediaSettleAction> {
+        match self.stage {
+            MpcMediaSettleStage::ForcePause { remaining } => {
+                self.stage = if remaining > 1 {
+                    MpcMediaSettleStage::ForcePause {
+                        remaining: remaining - 1,
+                    }
+                } else {
+                    MpcMediaSettleStage::ApplyTarget
+                };
+                Some(MpcMediaSettleAction::SetPaused {
+                    paused: true,
+                    delay: MPC_RETRY_WAIT_TIME,
+                })
+            }
+            MpcMediaSettleStage::ApplyTarget => {
+                self.stage = MpcMediaSettleStage::VerifyTarget;
+                Some(MpcMediaSettleAction::SetPaused {
+                    paused: self.target_paused,
+                    delay: Duration::ZERO,
+                })
+            }
+            MpcMediaSettleStage::VerifyTarget => {
+                if mpc_is_paused(observed_paused) == self.target_paused {
+                    self.stage = MpcMediaSettleStage::SetPosition;
+                } else {
+                    self.stage = MpcMediaSettleStage::RefreshPause { remaining: 2 };
+                }
+                self.next(observed_paused)
+            }
+            MpcMediaSettleStage::RefreshPause { remaining } => {
+                self.stage = if remaining > 1 {
+                    MpcMediaSettleStage::RefreshPause {
+                        remaining: remaining - 1,
+                    }
+                } else {
+                    MpcMediaSettleStage::VerifyRefresh
+                };
+                Some(MpcMediaSettleAction::TogglePaused {
+                    delay: MPC_PAUSE_TOGGLE_DELAY,
+                })
+            }
+            MpcMediaSettleStage::VerifyRefresh => {
+                if mpc_is_paused(observed_paused) == self.target_paused {
+                    self.stage = MpcMediaSettleStage::SetPosition;
+                    return self.next(observed_paused);
+                }
+                if self.attempts_remaining > 1 {
+                    self.attempts_remaining -= 1;
+                    self.stage = MpcMediaSettleStage::ForcePause {
+                        remaining: MPC_MAX_RETRIES,
+                    };
+                    return self.next(observed_paused);
+                }
+                self.stage = MpcMediaSettleStage::Complete;
+                Some(MpcMediaSettleAction::Failed)
+            }
+            MpcMediaSettleStage::SetPosition => {
+                self.stage = MpcMediaSettleStage::Complete;
+                Some(MpcMediaSettleAction::SetPosition(self.target_position))
+            }
+            MpcMediaSettleStage::Complete => None,
+        }
+    }
+}
+
+fn mpc_is_paused(observed_paused: Option<bool>) -> bool {
+    observed_paused.unwrap_or(false)
+}
+
 #[cfg(windows)]
 mod win {
     use super::*;
@@ -49,10 +216,12 @@ mod win {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-        RegisterClassW, SendMessageW, SetWindowLongPtrW, CW_USEDEFAULT, GWLP_USERDATA, MSG,
-        WM_COPYDATA, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+        GetWindowLongPtrW, IsWindow, PostMessageW, PostQuitMessage, PostThreadMessageW,
+        RegisterClassW, SendMessageW, SetWindowLongPtrW, CREATESTRUCTW, GWLP_USERDATA, MSG,
+        WM_CLOSE, WM_COPYDATA, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_QUIT, WNDCLASSW,
     };
 
     #[derive(Debug)]
@@ -65,12 +234,18 @@ mod win {
         Seek(f64),
         Version(String),
         Disconnected,
+        Shutdown,
     }
 
     pub struct MpcListener {
         hwnd_raw: isize,
+        listener_thread_id: u32,
         mpc_handle: Arc<AtomicIsize>,
         event_tx: Sender<MpcEvent>,
+        shutdown: MpcShutdownSignal,
+        teardown_lock: Mutex<()>,
+        window_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+        liveness_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     }
 
     impl MpcListener {
@@ -78,11 +253,11 @@ mod win {
             let (tx, rx) = mpsc::channel();
             let mpc_handle = Arc::new(AtomicIsize::new(0));
             let mpc_handle_clone = mpc_handle.clone();
-            let (hwnd_tx, hwnd_rx) = mpsc::channel::<anyhow::Result<isize>>();
+            let (hwnd_tx, hwnd_rx) = mpsc::channel::<anyhow::Result<(isize, u32)>>();
 
             let event_tx = tx.clone();
-            std::thread::spawn(move || unsafe {
-                let result = (|| -> anyhow::Result<isize> {
+            let window_thread = std::thread::spawn(move || unsafe {
+                let result = (|| -> anyhow::Result<(HWND, u32)> {
                     let class_name = widestr("MPCApiListener");
                     let title = widestr("MPC Listener");
                     let hinstance = GetModuleHandleW(PCWSTR(null()))?;
@@ -93,6 +268,9 @@ mod win {
                         ..Default::default()
                     };
                     RegisterClassW(&wc);
+                    let mut create_params = MpcCreateParams {
+                        state: Some(Box::new(MpcListenerState::new(event_tx, mpc_handle_clone))),
+                    };
                     let hwnd = CreateWindowExW(
                         Default::default(),
                         PCWSTR(class_name.as_ptr()),
@@ -105,23 +283,24 @@ mod win {
                         None,
                         None,
                         Some(hinstance.into()),
-                        None,
-                    );
-                    let hwnd = hwnd?;
-                    let boxed = Box::new(MpcListenerState {
-                        tx: event_tx.clone(),
-                        mpc_handle: mpc_handle_clone,
-                    });
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(boxed) as isize);
-                    Ok(hwnd.0 as isize)
+                        Some(&mut create_params as *mut MpcCreateParams as *const _),
+                    )?;
+                    Ok((hwnd, GetCurrentThreadId()))
                 })();
 
                 match result {
-                    Ok(hwnd_raw) => {
-                        let _ = hwnd_tx.send(Ok(hwnd_raw));
+                    Ok((hwnd, thread_id)) => {
+                        let _ = hwnd_tx.send(Ok((hwnd.0 as isize, thread_id)));
                         let mut msg = MSG::default();
-                        while GetMessageW(&mut msg, None, 0, 0).into() {
+                        loop {
+                            let status = GetMessageW(&mut msg, None, 0, 0);
+                            if status.0 <= 0 {
+                                break;
+                            }
                             DispatchMessageW(&msg);
+                        }
+                        if IsWindow(Some(hwnd)).as_bool() {
+                            let _ = DestroyWindow(hwnd);
                         }
                     }
                     Err(err) => {
@@ -130,14 +309,27 @@ mod win {
                 }
             });
 
-            let hwnd_raw = hwnd_rx
-                .recv()
-                .map_err(|_| anyhow::anyhow!("Failed to create MPC listener window"))??;
+            let (hwnd_raw, listener_thread_id) = match hwnd_rx.recv() {
+                Ok(Ok(window)) => window,
+                Ok(Err(error)) => {
+                    let _ = window_thread.join();
+                    return Err(error);
+                }
+                Err(_) => {
+                    let _ = window_thread.join();
+                    anyhow::bail!("Failed to create MPC listener window");
+                }
+            };
             Ok((
                 Self {
                     hwnd_raw,
+                    listener_thread_id,
                     mpc_handle,
                     event_tx: tx,
+                    shutdown: MpcShutdownSignal::default(),
+                    teardown_lock: Mutex::new(()),
+                    window_thread: Mutex::new(Some(window_thread)),
+                    liveness_thread: Mutex::new(None),
                 },
                 rx,
             ))
@@ -157,6 +349,57 @@ mod win {
 
         pub fn clear_mpc_handle(&self) {
             self.mpc_handle.store(0, Ordering::SeqCst);
+        }
+
+        pub fn spawn_liveness_probe(&self) {
+            let mut owner = self.liveness_thread.lock();
+            if owner.is_some() {
+                return;
+            }
+            let mpc_handle = self.mpc_handle.clone();
+            let event_tx = self.event_tx.clone();
+            let shutdown = self.shutdown.clone();
+            *owner = Some(std::thread::spawn(move || loop {
+                if shutdown.wait_timeout(MPC_EXISTENCE_CHECK_INTERVAL) {
+                    break;
+                }
+                let raw = mpc_handle.load(Ordering::SeqCst);
+                if raw == 0 {
+                    break;
+                }
+                let hwnd = HWND(raw as *mut std::ffi::c_void);
+                if unsafe { IsWindow(Some(hwnd)).as_bool() } {
+                    continue;
+                }
+                if mpc_handle.swap(0, Ordering::SeqCst) != 0 {
+                    let _ = event_tx.send(MpcEvent::Disconnected);
+                }
+                break;
+            }));
+        }
+
+        pub fn shutdown(&self) {
+            let _teardown = self.teardown_lock.lock();
+            let first_request = self.shutdown.request();
+            self.mpc_handle.store(0, Ordering::SeqCst);
+            if first_request {
+                let _ = self.event_tx.send(MpcEvent::Shutdown);
+                let close_result =
+                    unsafe { PostMessageW(Some(self.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                if close_result.is_err() {
+                    let _ = unsafe {
+                        PostThreadMessageW(self.listener_thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
+                    };
+                }
+            }
+            join_owned_thread(&self.window_thread, "MPC listener window");
+            join_owned_thread(&self.liveness_thread, "MPC liveness probe");
+        }
+
+        #[cfg(test)]
+        pub fn owned_thread_count(&self) -> usize {
+            usize::from(self.window_thread.lock().is_some())
+                + usize::from(self.liveness_thread.lock().is_some())
         }
 
         pub fn mpc_handle_raw(&self) -> Option<isize> {
@@ -181,6 +424,12 @@ mod win {
             let mpc_handle = self
                 .mpc_handle()
                 .ok_or_else(|| anyhow::anyhow!("MPC handle not available"))?;
+            if !unsafe { IsWindow(Some(mpc_handle)).as_bool() } {
+                if self.mpc_handle.swap(0, Ordering::SeqCst) != 0 {
+                    let _ = self.event_tx.send(MpcEvent::Disconnected);
+                }
+                anyhow::bail!("MPC window is no longer available");
+            }
             let (ptr, len, _payload_guard) = build_payload(payload);
             let cds = COPYDATASTRUCT {
                 dwData: cmd as usize,
@@ -199,9 +448,43 @@ mod win {
         }
     }
 
+    impl Drop for MpcListener {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    struct MpcCreateParams {
+        state: Option<Box<MpcListenerState>>,
+    }
+
     struct MpcListenerState {
         tx: Sender<MpcEvent>,
         mpc_handle: Arc<AtomicIsize>,
+    }
+
+    #[cfg(test)]
+    static LIVE_LISTENER_STATES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    impl MpcListenerState {
+        fn new(tx: Sender<MpcEvent>, mpc_handle: Arc<AtomicIsize>) -> Self {
+            #[cfg(test)]
+            LIVE_LISTENER_STATES.fetch_add(1, Ordering::SeqCst);
+            Self { tx, mpc_handle }
+        }
+    }
+
+    impl Drop for MpcListenerState {
+        fn drop(&mut self) {
+            #[cfg(test)]
+            LIVE_LISTENER_STATES.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn live_listener_state_count() -> usize {
+        LIVE_LISTENER_STATES.load(Ordering::SeqCst)
     }
 
     unsafe extern "system" fn wndproc(
@@ -210,6 +493,40 @@ mod win {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if msg == WM_NCCREATE {
+            let create = &*(lparam.0 as *const CREATESTRUCTW);
+            let params = create.lpCreateParams as *mut MpcCreateParams;
+            if params.is_null() {
+                return LRESULT(0);
+            }
+            let Some(state) = (&mut *params).state.take() else {
+                return LRESULT(0);
+            };
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        if msg == WM_CLOSE {
+            let _ = DestroyWindow(hwnd);
+            return LRESULT(0);
+        }
+        if msg == WM_DESTROY {
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut MpcListenerState;
+            if !state_ptr.is_null() {
+                let state = &*state_ptr;
+                state.mpc_handle.store(0, Ordering::SeqCst);
+                let _ = state.tx.send(MpcEvent::Disconnected);
+            }
+            PostQuitMessage(0);
+            return LRESULT(0);
+        }
+        if msg == WM_NCDESTROY {
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut MpcListenerState;
+            if !state_ptr.is_null() {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                drop(Box::from_raw(state_ptr));
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
         if msg == WM_COPYDATA {
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut MpcListenerState;
             if state_ptr.is_null() {
@@ -253,6 +570,7 @@ mod win {
                     let _ = state.tx.send(MpcEvent::Version(value));
                 }
                 CMD_DISCONNECT => {
+                    state.mpc_handle.store(0, Ordering::SeqCst);
                     let _ = state.tx.send(MpcEvent::Disconnected);
                 }
                 _ => {}
@@ -427,6 +745,8 @@ pub struct MpcApiBackend {
     version: Arc<Mutex<Option<String>>>,
     position_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     version_waiter: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    event_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    teardown_lock: Mutex<()>,
 }
 
 #[cfg(windows)]
@@ -444,12 +764,16 @@ impl MpcApiBackend {
         let (listener, event_rx) = start_listener()?;
 
         let mut cmd = Command::new(player_path);
+        cmd.kill_on_drop(true);
         let full_args = mpc_startup_arguments(args, listener.hwnd_raw());
         cmd.args(&full_args);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let child = cmd.spawn().ok();
+        let child = Some(
+            cmd.spawn()
+                .map_err(|error| anyhow::anyhow!("Failed to start MPC: {error}"))?,
+        );
 
         let state = Arc::new(Mutex::new(PlayerState::default()));
         let connected = Arc::new(AtomicBool::new(false));
@@ -459,7 +783,7 @@ impl MpcApiBackend {
         let position_waiter = Arc::new(Mutex::new(None));
         let version_waiter = Arc::new(Mutex::new(None));
 
-        spawn_event_loop(EventLoopArgs {
+        let event_thread = spawn_event_loop(EventLoopArgs {
             event_rx,
             listener_hwnd: listener.hwnd_raw(),
             state: state.clone(),
@@ -481,9 +805,12 @@ impl MpcApiBackend {
             version,
             position_waiter,
             version_waiter,
+            event_thread: Mutex::new(Some(event_thread)),
+            teardown_lock: Mutex::new(()),
         };
 
         backend.wait_for_connect().await?;
+        backend.listener.spawn_liveness_probe();
         backend.check_version().await?;
         if let Some(path) = initial_file {
             backend.load_initial_file(path)?;
@@ -581,6 +908,32 @@ impl MpcApiBackend {
         }
         anyhow::bail!("MPC command failed after retries")
     }
+
+    fn send_paused_command(&self, paused: bool) -> anyhow::Result<()> {
+        let value = if self.switch_pause_calls.load(Ordering::SeqCst) {
+            !paused
+        } else {
+            paused
+        };
+        self.send_command_retry(if value { CMD_PAUSE } else { CMD_PLAY }, None)
+    }
+
+    fn teardown(&self) {
+        let _teardown = self.teardown_lock.lock();
+        let _ = self.listener.send_command(CMD_CLOSEAPP, None);
+        self.mark_disconnected();
+        self.position_waiter.lock().take();
+        self.version_waiter.lock().take();
+        self.listener.shutdown();
+        join_owned_thread(&self.event_thread, "MPC event receiver");
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MpcApiBackend {
+    fn drop(&mut self) {
+        self.teardown();
+    }
 }
 
 #[cfg(windows)]
@@ -615,21 +968,38 @@ impl PlayerBackend for MpcApiBackend {
     }
 
     async fn set_paused(&self, paused: bool) -> anyhow::Result<()> {
-        let mut value = paused;
-        if self.switch_pause_calls.load(Ordering::SeqCst) {
-            value = !value;
-        }
-        let cmd = if value { CMD_PAUSE } else { CMD_PLAY };
-        self.send_command_retry(cmd, None)?;
-        tokio::time::sleep(MPC_PAUSE_TOGGLE_DELAY).await;
-        if let Some(current) = self.state.lock().paused {
-            if current != paused {
-                if let Err(e) = self.listener.send_command(CMD_PLAYPAUSE, None) {
-                    warn!("Failed to toggle pause: {}", e);
+        self.send_paused_command(paused)
+    }
+
+    async fn settle_media_change(&self, paused: bool, position: f64) -> anyhow::Result<()> {
+        let mut settle = MpcMediaSettle::new(paused, position);
+        loop {
+            let observed_paused = self.state.lock().paused;
+            let Some(action) = settle.next(observed_paused) else {
+                return Ok(());
+            };
+            match action {
+                MpcMediaSettleAction::SetPaused { paused, delay } => {
+                    self.send_paused_command(paused)?;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                MpcMediaSettleAction::TogglePaused { delay } => {
+                    self.send_command_retry(CMD_PLAYPAUSE, None)?;
+                    tokio::time::sleep(delay).await;
+                }
+                MpcMediaSettleAction::SetPosition(position) => {
+                    self.send_command_retry(
+                        CMD_SETPOSITION,
+                        Some(CommandPayload::Text(position.to_string())),
+                    )?;
+                }
+                MpcMediaSettleAction::Failed => {
+                    anyhow::bail!("MPC pause state did not settle after retries");
                 }
             }
         }
-        Ok(())
     }
 
     async fn set_speed(&self, speed: f64) -> anyhow::Result<()> {
@@ -654,8 +1024,7 @@ impl PlayerBackend for MpcApiBackend {
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
-        let _ = self.listener.send_command(CMD_CLOSEAPP, None);
-        self.mark_disconnected();
+        self.teardown();
         Ok(())
     }
 
@@ -678,7 +1047,7 @@ struct EventLoopArgs {
 }
 
 #[cfg(windows)]
-fn spawn_event_loop(args: EventLoopArgs) {
+fn spawn_event_loop(args: EventLoopArgs) -> std::thread::JoinHandle<()> {
     let EventLoopArgs {
         event_rx,
         listener_hwnd,
@@ -739,9 +1108,12 @@ fn spawn_event_loop(args: EventLoopArgs) {
                     connected.store(false, Ordering::SeqCst);
                     file_ready.store(false, Ordering::SeqCst);
                 }
+                MpcEvent::Shutdown => break,
             }
         }
-    });
+        connected.store(false, Ordering::SeqCst);
+        file_ready.store(false, Ordering::SeqCst);
+    })
 }
 
 fn mpc_startup_arguments(args: &[String], listener_hwnd: isize) -> Vec<String> {
@@ -906,12 +1278,82 @@ impl PlayerBackend for MpcApiBackend {
 mod tests {
     use super::{
         apply_mpc_load_state, mpc_filename_from_path, mpc_load_state_ready, mpc_startup_arguments,
-        split_mpc_fields,
+        split_mpc_fields, MpcMediaSettle, MpcMediaSettleAction, MpcShutdownSignal,
+        MPC_EXISTENCE_CHECK_INTERVAL, MPC_MAX_RETRIES, MPC_PAUSE_TOGGLE_DELAY, MPC_RETRY_WAIT_TIME,
     };
     use crate::player::properties::PlayerState;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn mpc_shutdown_signal_is_idempotent_and_wakes_waiters() {
+        assert!(!MpcShutdownSignal::default().wait_timeout(std::time::Duration::ZERO));
+
+        let signal = MpcShutdownSignal::default();
+        let waiter_signal = signal.clone();
+        let waiter = std::thread::spawn(move || {
+            waiter_signal.wait_timeout(std::time::Duration::from_secs(1))
+        });
+
+        assert!(signal.request());
+        assert!(!signal.request());
+        assert!(waiter.join().expect("shutdown waiter should not panic"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn mpc_listener_teardown_releases_threads_window_state_and_startup_failure() {
+        use crate::player::backend::PlayerKind;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+        let baseline_states = super::win::live_listener_state_count();
+        let (listener, event_rx) = super::start_listener().expect("listener should start");
+        let hwnd = listener.hwnd();
+        assert!(unsafe { IsWindow(Some(hwnd)).as_bool() });
+
+        let event_thread = super::spawn_event_loop(super::EventLoopArgs {
+            event_rx,
+            listener_hwnd: listener.hwnd_raw(),
+            state: Arc::new(Mutex::new(PlayerState::default())),
+            connected: Arc::new(AtomicBool::new(false)),
+            file_ready: Arc::new(AtomicBool::new(false)),
+            switch_pause_calls: Arc::new(AtomicBool::new(false)),
+            version: Arc::new(Mutex::new(None)),
+            position_waiter: Arc::new(Mutex::new(None)),
+            version_waiter: Arc::new(Mutex::new(None)),
+        });
+        listener.spawn_liveness_probe();
+        assert_eq!(listener.owned_thread_count(), 2);
+
+        listener.shutdown();
+        event_thread
+            .join()
+            .expect("event receiver should stop after listener shutdown");
+
+        assert_eq!(listener.owned_thread_count(), 0);
+        assert!(!unsafe { IsWindow(Some(hwnd)).as_bool() });
+        assert_eq!(super::win::live_listener_state_count(), baseline_states);
+
+        let missing_player = std::env::temp_dir().join(format!(
+            "syncplay-missing-mpc-{}-{}.exe",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should follow the Unix epoch")
+                .as_nanos()
+        ));
+        let result = super::MpcApiBackend::start(
+            PlayerKind::MpcHc,
+            &missing_player.to_string_lossy(),
+            &[],
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(super::win::live_listener_state_count(), baseline_states);
+    }
 
     #[test]
     fn split_mpc_fields_keeps_windows_path_separators() {
@@ -987,6 +1429,103 @@ mod tests {
 
         assert!(!file_ready.load(Ordering::SeqCst));
         assert_eq!(state.lock().paused, None);
+    }
+
+    #[test]
+    fn mpc_liveness_probe_matches_original_ten_second_interval() {
+        assert_eq!(
+            MPC_EXISTENCE_CHECK_INTERVAL,
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn mpc_media_settle_force_pauses_before_target_and_seek() {
+        let mut settle = MpcMediaSettle::new(true, 42.5);
+        let mut actions = Vec::new();
+        while let Some(action) = settle.next(Some(true)) {
+            actions.push(action);
+        }
+
+        assert_eq!(actions.len(), MPC_MAX_RETRIES + 2);
+        assert!(actions[..MPC_MAX_RETRIES].iter().all(|action| {
+            *action
+                == MpcMediaSettleAction::SetPaused {
+                    paused: true,
+                    delay: MPC_RETRY_WAIT_TIME,
+                }
+        }));
+        assert_eq!(
+            actions[MPC_MAX_RETRIES],
+            MpcMediaSettleAction::SetPaused {
+                paused: true,
+                delay: std::time::Duration::ZERO,
+            }
+        );
+        assert_eq!(
+            actions.last(),
+            Some(&MpcMediaSettleAction::SetPosition(42.5))
+        );
+    }
+
+    #[test]
+    fn mpc_media_settle_double_toggles_when_target_does_not_apply() {
+        let mut settle = MpcMediaSettle::new(true, 19.0);
+        let mut actions = Vec::new();
+        let mut toggles = 0;
+        loop {
+            let observed = if settle.needs_pause_observation() {
+                Some(toggles == 2)
+            } else {
+                None
+            };
+            let Some(action) = settle.next(observed) else {
+                break;
+            };
+            if matches!(action, MpcMediaSettleAction::TogglePaused { .. }) {
+                toggles += 1;
+            }
+            actions.push(action);
+        }
+
+        assert_eq!(toggles, 2);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| {
+                    **action
+                        == MpcMediaSettleAction::TogglePaused {
+                            delay: MPC_PAUSE_TOGGLE_DELAY,
+                        }
+                })
+                .count(),
+            2
+        );
+        assert_eq!(
+            actions.last(),
+            Some(&MpcMediaSettleAction::SetPosition(19.0))
+        );
+    }
+
+    #[test]
+    fn mpc_media_settle_never_seeks_when_pause_does_not_converge() {
+        let mut settle = MpcMediaSettle::new(true, 7.0);
+        let mut actions = Vec::new();
+        while let Some(action) = settle.next(Some(false)) {
+            actions.push(action);
+        }
+
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, MpcMediaSettleAction::TogglePaused { .. }))
+                .count(),
+            MPC_MAX_RETRIES * 2
+        );
+        assert_eq!(actions.last(), Some(&MpcMediaSettleAction::Failed));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, MpcMediaSettleAction::SetPosition(_))));
     }
 
     #[test]

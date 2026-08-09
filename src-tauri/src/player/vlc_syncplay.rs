@@ -1,4 +1,7 @@
 use super::backend::PlayerBackend;
+use super::media_update::{
+    MediaMetadataField, MediaRefreshOutcome, MediaSnapshot, OrderedMediaRefresh,
+};
 use super::properties::PlayerState;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -104,6 +107,7 @@ impl Default for VlcPositionHistory {
 pub struct VlcSyncplayBackend {
     state: Arc<Mutex<PlayerState>>,
     connection: Connection,
+    media_refresh: Arc<Mutex<OrderedMediaRefresh>>,
     last_position_update: Arc<Mutex<Option<Instant>>>,
     last_duration: Arc<Mutex<Option<f64>>>,
     last_loaded: Arc<Mutex<Option<String>>>,
@@ -127,6 +131,7 @@ impl VlcSyncplayBackend {
 
         let module_path = format!("{}/modules/?.luac", intf_path.replace('\\', "/"));
         let mut cmd = Command::new(player_path);
+        cmd.kill_on_drop(true);
         cmd.args(VLC_ARGS);
         cmd.arg(format!(
             "--lua-config=syncplay={{modulepath=\"{}\",port=\"{}\"}}",
@@ -162,20 +167,26 @@ impl VlcSyncplayBackend {
         let last_duration = Arc::new(Mutex::new(None));
         let last_loaded = Arc::new(Mutex::new(initial_file.map(|s| s.to_string())));
         let position_history = Arc::new(Mutex::new(VlcPositionHistory::default()));
+        let media_refresh = Arc::new(Mutex::new(OrderedMediaRefresh::new([
+            MediaMetadataField::Duration,
+            MediaMetadataField::Path,
+            MediaMetadataField::Filename,
+        ])));
 
         spawn_reader(
             connection.clone(),
             read_half,
             state.clone(),
+            media_refresh.clone(),
             last_position_update.clone(),
             last_duration.clone(),
-            last_loaded.clone(),
             position_history,
         );
 
         let backend = Self {
             state,
             connection,
+            media_refresh,
             last_position_update,
             last_duration,
             last_loaded,
@@ -191,9 +202,13 @@ impl VlcSyncplayBackend {
     }
 
     async fn request_file_info(&self) -> anyhow::Result<()> {
-        self.connection.send_line("get-duration").await?;
-        self.connection.send_line("get-filepath").await?;
-        self.connection.send_line("get-filename").await?;
+        if !self.media_refresh.lock().start_if_idle() {
+            return Ok(());
+        }
+        if let Err(error) = send_file_info_commands(&self.connection).await {
+            self.media_refresh.lock().abort();
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -263,6 +278,7 @@ impl PlayerBackend for VlcSyncplayBackend {
             build_mrl(path)
         };
         *self.last_loaded.lock() = Some(path.to_string());
+        self.media_refresh.lock().invalidate_active();
         self.connection
             .send_line(&format!("load-file: {}", arg))
             .await
@@ -292,9 +308,9 @@ fn spawn_reader(
     connection: Connection,
     read_half: OwnedReadHalf,
     state: Arc<Mutex<PlayerState>>,
+    media_refresh: Arc<Mutex<OrderedMediaRefresh>>,
     last_position_update: Arc<Mutex<Option<Instant>>>,
     last_duration: Arc<Mutex<Option<f64>>>,
-    _last_loaded: Arc<Mutex<Option<String>>>,
     position_history: Arc<Mutex<VlcPositionHistory>>,
 ) {
     tokio::spawn(async move {
@@ -307,6 +323,7 @@ fn spawn_reader(
             handle_line(
                 &connection,
                 &state,
+                &media_refresh,
                 &last_position_update,
                 &last_duration,
                 &position_history,
@@ -321,6 +338,7 @@ fn spawn_reader(
 async fn handle_line(
     connection: &Connection,
     state: &Arc<Mutex<PlayerState>>,
+    media_refresh: &Arc<Mutex<OrderedMediaRefresh>>,
     last_position_update: &Arc<Mutex<Option<Instant>>>,
     last_duration: &Arc<Mutex<Option<f64>>>,
     position_history: &Arc<Mutex<VlcPositionHistory>>,
@@ -328,9 +346,7 @@ async fn handle_line(
 ) {
     debug!("vlc >> {}", line);
     if line == "filepath-change-notification" {
-        let _ = connection.send_line("get-duration").await;
-        let _ = connection.send_line("get-filepath").await;
-        let _ = connection.send_line("get-filename").await;
+        request_vlc_media_refresh(connection, media_refresh).await;
         return;
     }
 
@@ -363,47 +379,67 @@ async fn handle_line(
                 state.lock().position = None;
             }
         }
-        "duration" | "duration-change" => {
-            if argument == "no-input" {
-                state.lock().duration = None;
-            } else if argument == "invalid-32-bit-value" {
-                warn!("VLC reported invalid duration value");
-                state.lock().duration = None;
-            } else if let Ok(value) = argument.replace(',', ".").parse::<f64>() {
-                state.lock().duration = Some(value);
-                *last_duration.lock() = Some(value);
+        "duration-change" => {
+            request_vlc_media_refresh(connection, media_refresh).await;
+        }
+        "duration" => {
+            if argument == "invalid-32-bit-value" {
+                warn!("VLC reported an incompatible 32-bit duration value");
+                media_refresh.lock().abort();
+                connection.connected.store(false, Ordering::SeqCst);
+                return;
+            }
+            let duration = if argument == "no-input" {
+                None
+            } else {
+                argument.replace(',', ".").parse::<f64>().ok()
+            };
+            if handle_vlc_media_response(
+                state,
+                media_refresh,
+                last_duration,
+                VlcMediaResponse::Duration(duration),
+            ) {
+                send_restarted_vlc_media_refresh(connection, media_refresh).await;
             }
         }
         "filepath" => {
-            if argument == "no-input" {
-                state.lock().path = None;
-            } else {
-                let mut value = argument.clone();
-                if value.starts_with("file://") {
-                    value = value.trim_start_matches("file://").to_string();
-                    if !Path::new(&value).exists() {
-                        value = value.trim_start_matches('/').to_string();
-                    }
-                } else if is_url(&value) {
-                    value = urlencoding::decode(&value)
-                        .unwrap_or_else(|_| value.clone().into())
-                        .to_string();
-                }
-                state.lock().path = Some(value.clone());
-                state.lock().filename = Path::new(&value)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string());
+            let path = normalize_vlc_path(&argument);
+            if handle_vlc_media_response(
+                state,
+                media_refresh,
+                last_duration,
+                VlcMediaResponse::Path(path),
+            ) {
+                send_restarted_vlc_media_refresh(connection, media_refresh).await;
             }
         }
-        "filename" if argument != "no-input" => {
-            state.lock().filename = Some(argument.clone());
+        "filename" => {
+            let filename = (argument != "no-input").then_some(argument);
+            if handle_vlc_media_response(
+                state,
+                media_refresh,
+                last_duration,
+                VlcMediaResponse::Filename(filename),
+            ) {
+                send_restarted_vlc_media_refresh(connection, media_refresh).await;
+            }
         }
         "inputstate-change" if argument == "no-input" => {
             let mut guard = state.lock();
-            guard.path = None;
-            guard.filename = None;
-            guard.duration = None;
+            apply_media_snapshot(
+                &mut guard,
+                MediaSnapshot {
+                    filename: None,
+                    path: None,
+                    duration: None,
+                    size: None,
+                },
+            );
             guard.position = None;
+            drop(guard);
+            *last_duration.lock() = None;
+            media_refresh.lock().invalidate_active();
         }
         "vlc-version" if !meets_min_version(&argument, VLC_MIN_VERSION) => {
             warn!(
@@ -413,6 +449,90 @@ async fn handle_line(
         }
         _ => {}
     }
+}
+
+enum VlcMediaResponse {
+    Filename(Option<String>),
+    Path(Option<String>),
+    Duration(Option<f64>),
+}
+
+async fn send_file_info_commands(connection: &Connection) -> anyhow::Result<()> {
+    connection.send_line("get-duration").await?;
+    connection.send_line("get-filepath").await?;
+    connection.send_line("get-filename").await
+}
+
+async fn request_vlc_media_refresh(
+    connection: &Connection,
+    media_refresh: &Arc<Mutex<OrderedMediaRefresh>>,
+) {
+    if !media_refresh.lock().restart_after_active() {
+        return;
+    }
+    if let Err(error) = send_file_info_commands(connection).await {
+        media_refresh.lock().abort();
+        warn!("Failed to refresh VLC media metadata: {}", error);
+    }
+}
+
+async fn send_restarted_vlc_media_refresh(
+    connection: &Connection,
+    media_refresh: &Arc<Mutex<OrderedMediaRefresh>>,
+) {
+    if let Err(error) = send_file_info_commands(connection).await {
+        media_refresh.lock().abort();
+        warn!("Failed to restart VLC media metadata refresh: {}", error);
+    }
+}
+
+fn handle_vlc_media_response(
+    state: &Arc<Mutex<PlayerState>>,
+    media_refresh: &Arc<Mutex<OrderedMediaRefresh>>,
+    last_duration: &Arc<Mutex<Option<f64>>>,
+    response: VlcMediaResponse,
+) -> bool {
+    let outcome = {
+        let mut refresh = media_refresh.lock();
+        match response {
+            VlcMediaResponse::Filename(filename) => refresh.push_filename(filename),
+            VlcMediaResponse::Path(path) => refresh.push_path(path),
+            VlcMediaResponse::Duration(duration) => refresh.push_duration(duration),
+        }
+    };
+    match outcome {
+        MediaRefreshOutcome::Committed(snapshot) => {
+            *last_duration.lock() = snapshot.duration;
+            apply_media_snapshot(&mut state.lock(), snapshot);
+            false
+        }
+        MediaRefreshOutcome::Restarted => true,
+        MediaRefreshOutcome::Ignored | MediaRefreshOutcome::Pending => false,
+    }
+}
+
+fn apply_media_snapshot(state: &mut PlayerState, snapshot: MediaSnapshot) {
+    state.filename = snapshot.filename;
+    state.path = snapshot.path;
+    state.duration = snapshot.duration;
+}
+
+fn normalize_vlc_path(argument: &str) -> Option<String> {
+    if argument == "no-input" {
+        return None;
+    }
+    let mut value = argument.to_string();
+    if value.starts_with("file://") {
+        value = value.trim_start_matches("file://").to_string();
+        if !Path::new(&value).exists() {
+            value = value.trim_start_matches('/').to_string();
+        }
+    } else if is_url(&value) {
+        value = urlencoding::decode(&value)
+            .unwrap_or_else(|_| value.clone().into())
+            .to_string();
+    }
+    Some(value)
 }
 
 fn should_treat_vlc_playing_as_eof_pause(
@@ -517,14 +637,10 @@ fn build_vlc_extra_args(player_path: &str) -> Vec<String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        if player_path.to_ascii_lowercase().contains("vlcportable.exe") {
-            Vec::new()
-        } else {
-            vec![
-                "--no-one-instance".to_string(),
-                "--no-one-instance-when-started-from-file".to_string(),
-            ]
-        }
+        vec![
+            "--no-one-instance".to_string(),
+            "--no-one-instance-when-started-from-file".to_string(),
+        ]
     }
 }
 
@@ -668,4 +784,178 @@ fn meets_min_version(version: &str, min: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_vlc_keeps_the_original_single_instance_guards() {
+        assert_eq!(
+            build_vlc_extra_args("C:/Portable/VLCPortable.exe"),
+            build_vlc_extra_args("C:/Program Files/VideoLAN/VLC/vlc.exe")
+        );
+    }
+
+    fn media_refresh() -> Arc<Mutex<OrderedMediaRefresh>> {
+        Arc::new(Mutex::new(OrderedMediaRefresh::new([
+            MediaMetadataField::Duration,
+            MediaMetadataField::Path,
+            MediaMetadataField::Filename,
+        ])))
+    }
+
+    fn assert_media(state: &Arc<Mutex<PlayerState>>, name: &str, duration: f64, path: &str) {
+        let state = state.lock();
+        assert_eq!(state.filename.as_deref(), Some(name));
+        assert_eq!(state.duration, Some(duration));
+        assert_eq!(state.path.as_deref(), Some(path));
+    }
+
+    #[test]
+    fn interleaved_file_change_never_exposes_mixed_vlc_metadata() {
+        let state = Arc::new(Mutex::new(PlayerState::default()));
+        let media_refresh = media_refresh();
+        let last_duration = Arc::new(Mutex::new(None));
+
+        assert!(media_refresh.lock().start_if_idle());
+        assert!(!handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Duration(Some(100.0)),
+        ));
+        assert!(!handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Path(Some("/media/A.mkv".to_string())),
+        ));
+        assert!(!handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Filename(Some("A.mkv".to_string())),
+        ));
+        assert_media(&state, "A.mkv", 100.0, "/media/A.mkv");
+
+        assert!(media_refresh.lock().start_if_idle());
+        let _ = handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Duration(Some(100.0)),
+        );
+        assert!(!media_refresh.lock().restart_after_active());
+        let _ = handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Path(Some("/media/B.mkv".to_string())),
+        );
+        assert!(handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Filename(Some("B.mkv".to_string())),
+        ));
+        assert_media(&state, "A.mkv", 100.0, "/media/A.mkv");
+
+        let _ = handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Duration(Some(200.0)),
+        );
+        assert_media(&state, "A.mkv", 100.0, "/media/A.mkv");
+        let _ = handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Path(Some("/media/B.mkv".to_string())),
+        );
+        assert_media(&state, "A.mkv", 100.0, "/media/A.mkv");
+        let _ = handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Filename(Some("B.mkv".to_string())),
+        );
+        assert_media(&state, "B.mkv", 200.0, "/media/B.mkv");
+    }
+
+    #[test]
+    fn no_input_clears_vlc_metadata_atomically() {
+        let state = Arc::new(Mutex::new(PlayerState {
+            filename: Some("A.mkv".to_string()),
+            duration: Some(100.0),
+            path: Some("/media/A.mkv".to_string()),
+            ..PlayerState::default()
+        }));
+        let media_refresh = media_refresh();
+        let last_duration = Arc::new(Mutex::new(Some(100.0)));
+        assert!(media_refresh.lock().start_if_idle());
+
+        let _ = handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Duration(None),
+        );
+        let _ = handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Path(None),
+        );
+        assert_media(&state, "A.mkv", 100.0, "/media/A.mkv");
+        let _ = handle_vlc_media_response(
+            &state,
+            &media_refresh,
+            &last_duration,
+            VlcMediaResponse::Filename(None),
+        );
+
+        let state = state.lock();
+        assert_eq!(state.filename, None);
+        assert_eq!(state.duration, None);
+        assert_eq!(state.path, None);
+        assert_eq!(*last_duration.lock(), None);
+    }
+
+    #[tokio::test]
+    async fn invalid_32_bit_duration_disconnects_without_committing_a_snapshot() {
+        let state = Arc::new(Mutex::new(PlayerState {
+            filename: Some("A.mkv".to_string()),
+            duration: Some(100.0),
+            path: Some("/media/A.mkv".to_string()),
+            ..PlayerState::default()
+        }));
+        let media_refresh = media_refresh();
+        let last_duration = Arc::new(Mutex::new(Some(100.0)));
+        let connection = Connection {
+            writer: Arc::new(TokioMutex::new(None)),
+            connected: Arc::new(AtomicBool::new(true)),
+        };
+        let last_position_update = Arc::new(Mutex::new(None));
+        let position_history = Arc::new(Mutex::new(VlcPositionHistory::default()));
+        assert!(media_refresh.lock().start_if_idle());
+
+        handle_line(
+            &connection,
+            &state,
+            &media_refresh,
+            &last_position_update,
+            &last_duration,
+            &position_history,
+            "duration: invalid-32-bit-value",
+        )
+        .await;
+
+        assert!(!connection.is_connected());
+        assert_media(&state, "A.mkv", 100.0, "/media/A.mkv");
+        assert_eq!(*last_duration.lock(), Some(100.0));
+        assert!(media_refresh.lock().start_if_idle());
+    }
 }

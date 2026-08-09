@@ -11,14 +11,7 @@ pub const MUSIC_FORMATS: [&str; 8] = [
 ];
 
 pub fn truncate_text(value: &str, max_len: usize) -> String {
-    if max_len == 0 {
-        return String::new();
-    }
-    let bytes = value.as_bytes();
-    if bytes.len() <= max_len {
-        return value.to_string();
-    }
-    String::from_utf8_lossy(&bytes[..max_len]).to_string()
+    value.chars().take(max_len).collect()
 }
 
 pub fn is_music_file(filename: &str) -> bool {
@@ -96,17 +89,20 @@ pub fn is_trustable_and_trusted(
 }
 
 pub fn strip_filename(filename: &str, strip_url: bool) -> String {
-    let mut base = filename.to_string();
-    if strip_url || is_url(filename) {
-        if let Ok(url) = Url::parse(filename) {
-            if let Some(segment) = url
-                .path_segments()
-                .and_then(|mut segments| segments.next_back())
-            {
-                base = segment.to_string();
-            }
-        }
-    }
+    // The reference client percent-decodes before selecting the final URL
+    // segment, then decodes that segment once more. Preserve that order so
+    // privacy hashes remain interoperable for encoded and double-encoded names.
+    let decoded = urlencoding::decode(filename)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| filename.to_string());
+    let selected = if strip_url || is_url(filename) {
+        decoded.rsplit('/').next().unwrap_or(&decoded)
+    } else {
+        &decoded
+    };
+    let base = urlencoding::decode(selected)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| selected.to_string());
     let regex = Regex::new(r"[-~_\.\[\](): ]").expect("invalid filename regex");
     regex.replace_all(&base, "").to_string()
 }
@@ -311,6 +307,22 @@ mod tests {
     }
 
     #[test]
+    fn hash_filename_matches_reference_for_percent_encoded_urls() {
+        assert_eq!(
+            hash_filename("https://example.com/My%20Movie.mkv", true),
+            "a9fc3f97cce9"
+        );
+        assert_eq!(
+            hash_filename("https://example.com/%E6%B5%8B%E8%AF%95.mkv", true),
+            "eb7701c65986"
+        );
+        assert_eq!(
+            hash_filename("https://example.com/My%2520Movie.mkv", true),
+            "a9fc3f97cce9"
+        );
+    }
+
+    #[test]
     fn test_same_filename_hidden() {
         assert!(same_filename(Some(PRIVACY_HIDDEN_FILENAME), Some("foo")));
     }
@@ -329,8 +341,20 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_text() {
-        let text = truncate_text("hello", 3);
-        assert_eq!(text, "hel");
+    fn truncate_text_counts_unicode_code_points() {
+        assert_eq!(truncate_text("hello", 3), "hel");
+        assert_eq!(truncate_text("测试用户名", 4), "测试用户");
+        assert_eq!(truncate_text("😀🚀✨", 2), "😀🚀");
+        assert_eq!(truncate_text("anything", 0), "");
+    }
+
+    #[test]
+    fn controlled_room_password_is_parsed_from_complete_input() {
+        let (room, password) = parse_controlled_room_input(
+            "+abcdefghijklmnopqrstuvwxyz0123456789:123456789012:AB-123-456",
+        );
+
+        assert_eq!(room, "+abcdefghijklmnopqrstuvwxyz0123456789:123456789012");
+        assert_eq!(password.as_deref(), Some("AB-123-456"));
     }
 }

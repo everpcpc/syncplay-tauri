@@ -12,6 +12,22 @@ pub enum MpvPlayerEvent {
         reason: EndFileReason,
         playlist_entry_id: Option<i64>,
     },
+    /// The Syncplay Lua interface began opening a generation-tagged file.
+    GenerationLoadStarted {
+        load_id: Option<u64>,
+        target: Option<String>,
+    },
+    /// The Syncplay Lua interface ended a generation-tagged or external file.
+    GenerationLoadEnded {
+        load_id: Option<u64>,
+        reason: EndFileReason,
+        /// Whether a redirect carried the token to a concrete child entry.
+        propagated: bool,
+    },
+    /// The Syncplay Lua interface could not execute a generation load command.
+    GenerationLoadRejected { load_id: u64, error: String },
+    /// The Syncplay Lua generation-load protocol answered a readiness probe.
+    GenerationLoadProtocolReady,
     /// MPV reported it is quitting
     Quit,
     /// MPV IPC socket/stdout reader reached EOF or disconnected

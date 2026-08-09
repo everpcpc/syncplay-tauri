@@ -2,11 +2,13 @@
 
 use crate::app_state::AppState;
 use crate::commands::connection::{
-    reidentify_as_controller, reset_room_sync_state, store_control_password,
+    emit_system_message, is_readiness_supported, reidentify_as_controller, reset_room_sync_state,
+    send_controller_auth, set_authoritative_room, store_control_password,
 };
 use crate::config::save_config;
 use crate::network::messages::{ProtocolMessage, ReadyState, RoomInfo, SetMessage};
 use crate::utils::parse_controlled_room_input;
+use rand::Rng;
 use std::sync::Arc;
 use tauri::{AppHandle, Runtime, State};
 
@@ -22,20 +24,13 @@ pub async fn change_room<R: Runtime>(
     if !state.is_connected() {
         return Err("Not connected to server".to_string());
     }
-    let max_len = state
-        .server_features
-        .lock()
-        .max_room_name_length
-        .unwrap_or(35);
-    let trimmed_room = crate::utils::truncate_text(&room, max_len);
-    let (normalized_room, control_password) = parse_controlled_room_input(&trimmed_room);
-    let room = normalized_room;
+    let (room, control_password) = parse_controlled_room_input(&room);
     if let Some(password) = control_password {
         store_control_password(state.inner(), &room, &password, true);
     }
 
     // Update client state
-    state.client_state.set_room(room.clone());
+    set_authoritative_room(state.inner(), room.clone());
     reset_room_sync_state(state.inner()).await;
 
     let message = ProtocolMessage::Set {
@@ -83,6 +78,9 @@ pub async fn set_ready(is_ready: bool, state: State<'_, Arc<AppState>>) -> Resul
     if !state.is_connected() {
         return Err("Not connected to server".to_string());
     }
+    if !is_readiness_supported(state.inner(), false) {
+        return Err("Readiness is not supported by this server".to_string());
+    }
 
     // Update client state
     state.client_state.set_ready(is_ready);
@@ -110,6 +108,70 @@ pub async fn set_ready(is_ready: bool, state: State<'_, Arc<AppState>>) -> Resul
     Ok(())
 }
 
+#[tauri::command]
+pub async fn create_managed_room(
+    room: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    ensure_managed_rooms_supported(state.inner())?;
+    if room.is_empty() {
+        return Err("Room name cannot be empty".to_string());
+    }
+
+    let password = generate_control_password();
+    *state.last_control_password_attempt.lock() = Some(password.clone());
+    send_controller_auth(state.inner(), &room, &password)
+}
+
+#[tauri::command]
+pub async fn identify_as_controller(
+    password: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    ensure_managed_rooms_supported(state.inner())?;
+    let password = crate::utils::strip_control_password(&password);
+    if password.is_empty() {
+        return Err("Controller password cannot be empty".to_string());
+    }
+
+    let room = state.client_state.get_room();
+    if room.is_empty() {
+        return Err("Not in a room".to_string());
+    }
+
+    emit_system_message(
+        state.inner(),
+        &format!(
+            "Identifying as room operator with password '{}'...",
+            password
+        ),
+    );
+    *state.last_control_password_attempt.lock() = Some(password.clone());
+    send_controller_auth(state.inner(), &room, &password)
+}
+
+fn ensure_managed_rooms_supported(state: &Arc<AppState>) -> Result<(), String> {
+    if !state.is_connected() {
+        return Err("Not connected to server".to_string());
+    }
+    if state.client_state.get_server_version().is_none() {
+        return Err("Server login is not complete".to_string());
+    }
+    if !state.server_features.lock().managed_rooms {
+        return Err("Managed rooms are not supported by this server".to_string());
+    }
+    Ok(())
+}
+
+fn generate_control_password() -> String {
+    let mut rng = rand::thread_rng();
+    let first = rng.gen_range(b'A'..=b'Z') as char;
+    let second = rng.gen_range(b'A'..=b'Z') as char;
+    let first_number = rng.gen_range(0..=999);
+    let second_number = rng.gen_range(0..=999);
+    format!("{first}{second}-{first_number:03}-{second_number:03}")
+}
+
 fn send_to_server(
     state: &State<'_, Arc<AppState>>,
     message: ProtocolMessage,
@@ -121,4 +183,24 @@ fn send_to_server(
     connection
         .send(message)
         .map_err(|e| format!("Failed to send message: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_control_password_matches_reference_format() {
+        for _ in 0..32 {
+            let password = generate_control_password();
+            let bytes = password.as_bytes();
+            assert_eq!(bytes.len(), 10);
+            assert!(bytes[0].is_ascii_uppercase());
+            assert!(bytes[1].is_ascii_uppercase());
+            assert_eq!(bytes[2], b'-');
+            assert!(bytes[3..6].iter().all(u8::is_ascii_digit));
+            assert_eq!(bytes[6], b'-');
+            assert!(bytes[7..10].iter().all(u8::is_ascii_digit));
+        }
+    }
 }

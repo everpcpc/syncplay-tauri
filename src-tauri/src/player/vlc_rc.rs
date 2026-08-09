@@ -33,6 +33,7 @@ impl VlcBackend {
             player_path, args, initial_file
         );
         let mut cmd = Command::new(player_path);
+        cmd.kill_on_drop(true);
         cmd.args(VLC_ARGS);
         cmd.args(args);
         if let Some(path) = initial_file {

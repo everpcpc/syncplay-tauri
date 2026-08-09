@@ -87,13 +87,14 @@ fn detect_mpc_be() -> Option<DetectedPlayer> {
 
 #[cfg(target_os = "macos")]
 fn detect_iina() -> Option<DetectedPlayer> {
-    let paths = vec![
-        PathBuf::from("/Applications/IINA.app/Contents/MacOS/IINA"),
-        PathBuf::from("/Applications/IINA.app/Contents/MacOS/iina-cli"),
+    let paths = [
+        "/Applications/IINA.app/Contents/MacOS/IINA",
+        "/Applications/IINA.app/Contents/MacOS/iina-cli",
     ];
 
     for path in paths {
-        if path.exists() {
+        let path = PathBuf::from(normalize_iina_player_path(path));
+        if is_runnable_file(&path) {
             return Some(DetectedPlayer {
                 name: "IINA".to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -103,6 +104,27 @@ fn detect_iina() -> Option<DetectedPlayer> {
     }
 
     None
+}
+
+pub(crate) fn normalize_iina_player_path(player_path: &str) -> String {
+    let path = Path::new(player_path);
+    let is_iina_app_binary = path.file_name().and_then(|name| name.to_str()) == Some("IINA")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("MacOS")
+        && path.ancestors().any(|ancestor| {
+            ancestor.file_name().and_then(|name| name.to_str()) == Some("IINA.app")
+        });
+
+    if is_iina_app_binary {
+        path.with_file_name("iina-cli")
+            .to_string_lossy()
+            .to_string()
+    } else {
+        player_path.to_string()
+    }
 }
 
 fn base_mpv_paths() -> Vec<PathBuf> {
@@ -423,5 +445,23 @@ mod tests {
         assert_eq!(detected.name, "MPV");
         assert_eq!(detected.path, player_path.to_string_lossy());
         assert_eq!(detected.version, None);
+    }
+
+    #[test]
+    fn iina_app_binary_is_normalized_to_sibling_cli() {
+        let app_binary = "/Applications/IINA.app/Contents/MacOS/IINA";
+        let normalized = normalize_iina_player_path(app_binary);
+        let normalized = Path::new(&normalized);
+
+        assert_eq!(normalized.parent(), Path::new(app_binary).parent());
+        assert_eq!(
+            normalized.file_name().and_then(|name| name.to_str()),
+            Some("iina-cli")
+        );
+        assert_eq!(
+            normalize_iina_player_path("/Applications/IINA.app/Contents/MacOS/iina-cli"),
+            "/Applications/IINA.app/Contents/MacOS/iina-cli"
+        );
+        assert_eq!(normalize_iina_player_path("IINA"), "IINA");
     }
 }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SyncplayConfig } from "../../types/config";
+import { useSyncplayStore } from "../../store";
 import { useNotificationStore } from "../../store/notifications";
 import { AppDialogPortal } from "../common/AppDialogPortal";
 
@@ -10,11 +11,18 @@ interface RoomManagerDialogProps {
 }
 
 export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
+  const connection = useSyncplayStore((state) => state.connection);
+  const users = useSyncplayStore((state) => state.users);
+  const serverRooms = useSyncplayStore((state) => state.rooms);
+  const serverRoomFeatures = useSyncplayStore((state) => state.serverRoomFeatures);
   const [config, setConfig] = useState<SyncplayConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [roomNameInput, setRoomNameInput] = useState("");
   const [roomListInput, setRoomListInput] = useState("");
+  const [managedRoomName, setManagedRoomName] = useState("");
+  const [controllerPassword, setControllerPassword] = useState("");
+  const [managedRoomPending, setManagedRoomPending] = useState(false);
   const addNotification = useNotificationStore((state) => state.addNotification);
 
   useEffect(() => {
@@ -22,6 +30,8 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
       setConfig(null);
       setRoomNameInput("");
       setRoomListInput("");
+      setManagedRoomName("");
+      setControllerPassword("");
       return;
     }
 
@@ -31,6 +41,10 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
         const loaded = await invoke<SyncplayConfig>("get_config");
         setConfig(loaded);
         setRoomNameInput(loaded.user.default_room);
+        const liveRoom = useSyncplayStore
+          .getState()
+          .users.find((user) => user.username === loaded.user.username)?.room;
+        setManagedRoomName(stripManagedRoomName(liveRoom ?? loaded.user.default_room));
       } catch (error) {
         addNotification({
           type: "error",
@@ -56,12 +70,13 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
     }
   };
 
-  const connectToRoom = async () => {
-    const trimmed = roomNameInput.trim();
-    if (!trimmed) return;
+  const connectToRoom = async (room?: string) => {
+    const targetRoom = room ?? roomNameInput.trim();
+    if (!targetRoom) return;
+    setRoomNameInput(targetRoom);
     setConnecting(true);
     try {
-      await invoke("change_room", { room: trimmed });
+      await invoke("change_room", { room: targetRoom });
     } catch (error) {
       addNotification({
         type: "error",
@@ -69,6 +84,37 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
       });
     } finally {
       setConnecting(false);
+    }
+  };
+
+  const createManagedRoom = async () => {
+    if (!managedRoomName) return;
+    setManagedRoomPending(true);
+    try {
+      await invoke("create_managed_room", { room: managedRoomName });
+    } catch (error) {
+      addNotification({
+        type: "error",
+        message: `Failed to create managed room: ${formatError(error)}`,
+      });
+    } finally {
+      setManagedRoomPending(false);
+    }
+  };
+
+  const identifyAsController = async () => {
+    if (!controllerPassword) return;
+    setManagedRoomPending(true);
+    try {
+      await invoke("identify_as_controller", { password: controllerPassword });
+      setControllerPassword("");
+    } catch (error) {
+      addNotification({
+        type: "error",
+        message: `Failed to authenticate as room operator: ${formatError(error)}`,
+      });
+    } finally {
+      setManagedRoomPending(false);
     }
   };
 
@@ -119,6 +165,12 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
     await saveConfig(nextConfig);
   };
 
+  const currentUsername = config?.user.username;
+  const currentRoom =
+    users.find((user) => user.username === currentUsername)?.room ??
+    config?.user.default_room ??
+    "";
+
   if (!isOpen) return null;
 
   return (
@@ -166,6 +218,99 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
                 </button>
               </div>
             </div>
+
+            {connection.connected && (
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <label className="block text-sm font-medium">Server Rooms</label>
+                  {serverRoomFeatures.persistentRooms && (
+                    <span className="text-xs app-tag-accent px-2 py-0.5 rounded">Persistent</span>
+                  )}
+                </div>
+                {serverRooms.length === 0 ? (
+                  <p className="text-xs app-text-muted">No rooms advertised by the server.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {serverRooms.map((room) => (
+                      <div
+                        key={room}
+                        className="flex items-center justify-between gap-3 app-panel-muted px-3 py-2 rounded"
+                      >
+                        <span className="text-sm truncate">{room}</span>
+                        <button
+                          type="button"
+                          onClick={() => void connectToRoom(room)}
+                          className="btn-neutral px-3 py-1 rounded text-xs shrink-0"
+                          disabled={connecting || room === currentRoom}
+                        >
+                          {room === currentRoom ? "Current" : "Join"}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {connection.connected && serverRoomFeatures.managedRooms && (
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-sm font-medium mb-1">Create Managed Room</label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={managedRoomName}
+                      onChange={(event) => setManagedRoomName(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void createManagedRoom();
+                        }
+                      }}
+                      className="flex-1 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      placeholder="Room name"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void createManagedRoom()}
+                      className="btn-primary px-3 py-2 rounded text-sm"
+                      disabled={managedRoomPending || !managedRoomName}
+                    >
+                      Create
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">
+                    Authenticate as Room Operator
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={controllerPassword}
+                      onChange={(event) => setControllerPassword(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void identifyAsController();
+                        }
+                      }}
+                      className="flex-1 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      placeholder="AA-000-000"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void identifyAsController()}
+                      className="btn-primary px-3 py-2 rounded text-sm"
+                      disabled={managedRoomPending || !controllerPassword}
+                    >
+                      Authenticate
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div>
               <label className="block text-sm font-medium mb-1">Saved Rooms</label>
@@ -239,4 +384,14 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
       </div>
     </AppDialogPortal>
   );
+}
+
+function stripManagedRoomName(room: string) {
+  const match = /^\+(.*):\w{12}$/.exec(room);
+  return match?.[1] ?? room;
+}
+
+function formatError(error: unknown) {
+  if (typeof error === "string") return error;
+  return (error as { message?: string })?.message ?? "Unknown error";
 }

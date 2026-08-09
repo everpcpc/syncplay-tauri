@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { SyncplayConfig } from "../types/config";
+import { ServerRoomFeatures, SyncplayUser, UserListEventPayload } from "../types/syncplay";
 
 // Type definitions matching backend events
 interface ConnectionState {
@@ -18,16 +19,6 @@ type TlsStatus =
   | "rejected"
   | "certificate-invalid"
   | "closed";
-
-interface User {
-  username: string;
-  room: string;
-  file: string | null;
-  fileSize?: number | string | null;
-  fileDuration?: number | null;
-  isReady: boolean;
-  isController: boolean;
-}
 
 interface ChatMessage {
   timestamp: string;
@@ -53,7 +44,9 @@ interface SyncplayStore {
   // State
   connection: ConnectionState;
   tlsStatus: TlsStatus;
-  users: User[];
+  users: SyncplayUser[];
+  rooms: string[];
+  serverRoomFeatures: ServerRoomFeatures;
   messages: ChatMessage[];
   playlist: PlaylistState;
   player: PlayerState;
@@ -66,7 +59,7 @@ interface SyncplayStore {
   // Actions
   setConnectionStatus: (status: ConnectionState) => void;
   setTlsStatus: (status: TlsStatus) => void;
-  setUsers: (users: User[]) => void;
+  setUsers: (users: SyncplayUser[]) => void;
   addMessage: (message: ChatMessage) => void;
   setPlaylist: (playlist: PlaylistState) => void;
   setPlayerState: (state: PlayerState) => void;
@@ -94,6 +87,11 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
   },
   tlsStatus: "unknown",
   users: [],
+  rooms: [],
+  serverRoomFeatures: {
+    managedRooms: false,
+    persistentRooms: false,
+  },
   messages: [],
   playlist: {
     items: [],
@@ -197,9 +195,16 @@ export const useSyncplayStore = create<SyncplayStore>((set) => ({
     });
 
     // User list updates
-    listenSafe<{ users: User[] }>("user-list-updated", (event) => {
-      set(() => ({
+    listenSafe<UserListEventPayload>("user-list-updated", (event) => {
+      set((state) => ({
         users: event.payload.users,
+        rooms: event.payload.rooms ?? state.rooms,
+      }));
+    });
+
+    listenSafe<ServerRoomFeatures>("server-features-updated", (event) => {
+      set(() => ({
+        serverRoomFeatures: event.payload,
       }));
     });
 

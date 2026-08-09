@@ -1,7 +1,7 @@
 use crate::app_state::AppState;
 use crate::commands::connection::emit_error_message;
 use crate::config::DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS;
-use crate::utils::{hash_filename, same_filename, strip_filename, PRIVACY_HIDDEN_FILENAME};
+use crate::utils::PRIVACY_HIDDEN_FILENAME;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,22 +12,15 @@ use tokio::time::{sleep, Duration};
 
 #[derive(Default)]
 struct MediaIndexCache {
-    by_lower: HashMap<String, Vec<PathBuf>>,
-    by_stripped: HashMap<String, Vec<PathBuf>>,
-    by_hash: HashMap<String, Vec<PathBuf>>,
+    by_name: HashMap<String, Vec<PathBuf>>,
 }
 
 impl MediaIndexCache {
     fn insert(&mut self, filename: &str, path: PathBuf) {
-        let lower = filename.to_ascii_lowercase();
-        self.by_lower.entry(lower).or_default().push(path.clone());
-        let stripped = strip_filename(filename, false);
-        self.by_stripped
-            .entry(stripped)
+        self.by_name
+            .entry(filename.to_string())
             .or_default()
-            .push(path.clone());
-        let hash = hash_filename(filename, false);
-        self.by_hash.entry(hash).or_default().push(path);
+            .push(path);
     }
 
     fn insert_override(&mut self, filename: &str, path: PathBuf) {
@@ -38,43 +31,11 @@ impl MediaIndexCache {
             vec.insert(0, path.clone());
         }
 
-        let lower = filename.to_ascii_lowercase();
-        let stripped = strip_filename(filename, false);
-        let hash = hash_filename(filename, false);
-
-        insert_front(self.by_lower.entry(lower).or_default(), &path);
-        insert_front(self.by_stripped.entry(stripped).or_default(), &path);
-        insert_front(self.by_hash.entry(hash).or_default(), &path);
+        insert_front(self.by_name.entry(filename.to_string()).or_default(), &path);
     }
 
     fn resolve(&self, filename: &str) -> Option<PathBuf> {
-        if let Some(path) = self.resolve_by_name(filename) {
-            return Some(path);
-        }
-        let base = Path::new(filename)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(filename);
-        if base != filename {
-            return self.resolve_by_name(base);
-        }
-        None
-    }
-
-    fn resolve_by_name(&self, filename: &str) -> Option<PathBuf> {
-        let lower = filename.to_ascii_lowercase();
-        if let Some(path) = self.find_existing(self.by_lower.get(&lower)) {
-            return Some(path);
-        }
-        let stripped = strip_filename(filename, false);
-        if let Some(path) = self.find_existing(self.by_stripped.get(&stripped)) {
-            return Some(path);
-        }
-        let hash = hash_filename(filename, false);
-        if let Some(path) = self.find_existing(self.by_hash.get(&hash)) {
-            return Some(path);
-        }
-        None
+        self.find_existing(self.by_name.get(filename))
     }
 
     fn find_existing(&self, paths: Option<&Vec<PathBuf>>) -> Option<PathBuf> {
@@ -92,7 +53,6 @@ pub struct MediaIndex {
     cache: RwLock<MediaIndexCache>,
     directories: RwLock<Vec<String>>,
     timeout_seconds: RwLock<u64>,
-    last_resolved_directory: RwLock<Option<PathBuf>>,
     updating: AtomicBool,
     disabled: AtomicBool,
 }
@@ -103,7 +63,6 @@ impl MediaIndex {
             cache: RwLock::new(MediaIndexCache::default()),
             directories: RwLock::new(Vec::new()),
             timeout_seconds: RwLock::new(DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS),
-            last_resolved_directory: RwLock::new(None),
             updating: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
         })
@@ -135,14 +94,10 @@ impl MediaIndex {
         if path.is_absolute() && path.is_file() {
             return Some(path.to_path_buf());
         }
-        if let Some(path) = self.resolve_from_last_directory(filename) {
-            return Some(path);
-        }
         self.cache.read().resolve(filename)
     }
 
     pub fn add_override_path(&self, filename: &str, path: PathBuf) {
-        self.remember_resolved_path(&path);
         self.cache.write().insert_override(filename, path);
     }
 
@@ -157,18 +112,6 @@ impl MediaIndex {
     #[cfg(test)]
     pub(crate) fn set_refreshing_for_test(&self, refreshing: bool) {
         self.updating.store(refreshing, Ordering::SeqCst);
-    }
-
-    fn resolve_from_last_directory(&self, filename: &str) -> Option<PathBuf> {
-        let directory = self.last_resolved_directory.read().clone()?;
-        resolve_in_directory(&directory, filename)
-    }
-
-    pub fn remember_resolved_path(&self, path: &Path) {
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        *self.last_resolved_directory.write() = Some(parent.to_path_buf());
     }
 
     pub fn spawn_indexer(self: Arc<Self>, state: Arc<AppState>) {
@@ -243,42 +186,13 @@ impl MediaIndex {
     }
 }
 
-pub(crate) fn resolve_in_directory(directory: &Path, filename: &str) -> Option<PathBuf> {
-    resolve_exact_in_directory(directory, filename)
-        .or_else(|| resolve_similar_in_directory(directory, filename))
-}
-
 pub(crate) fn resolve_exact_in_directory(directory: &Path, filename: &str) -> Option<PathBuf> {
-    let target = Path::new(filename)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(filename);
-    let candidate = directory.join(target);
+    let candidate = directory.join(filename);
     if candidate.is_file() {
         Some(candidate)
     } else {
         None
     }
-}
-
-pub(crate) fn resolve_similar_in_directory(directory: &Path, filename: &str) -> Option<PathBuf> {
-    let target = Path::new(filename)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(filename);
-    let entries = std::fs::read_dir(directory).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let candidate_name = path.file_name()?.to_string_lossy();
-        if same_filename(Some(target), Some(candidate_name.as_ref())) {
-            return Some(path);
-        }
-    }
-
-    None
 }
 
 #[allow(dead_code)]
@@ -336,13 +250,14 @@ fn scan_directories(
                 Ok(entries) => entries,
                 Err(_) => continue,
             };
+            let mut child_directories = Vec::new();
             for entry in entries.flatten() {
                 if start.elapsed() > timeout {
                     return Err(ScanError::ScanTimeout(directory.to_string()));
                 }
                 let path = entry.path();
                 if path.is_dir() {
-                    stack.push(path);
+                    child_directories.push(path);
                     continue;
                 }
                 if !path.is_file() {
@@ -355,6 +270,7 @@ fn scan_directories(
                 };
                 cache.insert(filename, path);
             }
+            stack.extend(child_directories.into_iter().rev());
         }
     }
 
@@ -369,7 +285,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn resolve_path_prefers_last_resolved_directory() {
+    fn resolve_path_preserves_index_order_instead_of_preferring_the_previous_directory() {
         let previous_dir = TempDir::new().unwrap();
         let media_dir = TempDir::new().unwrap();
         let previous_file = previous_dir.path().join("episode-01.mkv");
@@ -380,10 +296,44 @@ mod tests {
         fs::write(&indexed_file, b"indexed").unwrap();
 
         let index = MediaIndex::new();
-        index.add_override_path("episode-02.mkv", indexed_file);
+        index.add_override_path("episode-02.mkv", indexed_file.clone());
         index.add_override_path("episode-01.mkv", previous_file);
 
-        assert_eq!(index.resolve_path("episode-02.mkv"), Some(next_file));
+        assert_eq!(index.resolve_path("episode-02.mkv"), Some(indexed_file));
+        assert!(next_file.is_file());
+    }
+
+    #[test]
+    fn resolve_path_does_not_fuzzy_match_a_different_filename() {
+        let media_dir = TempDir::new().unwrap();
+        let similar_file = media_dir.path().join("A_B.mkv");
+        fs::write(&similar_file, b"similar").unwrap();
+
+        let cache = scan_directories(
+            &[media_dir.path().to_string_lossy().to_string()],
+            DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS,
+        )
+        .unwrap();
+
+        assert_eq!(cache.resolve("A_B.mkv"), Some(similar_file));
+        assert_eq!(cache.resolve("A-B.mkv"), None);
+    }
+
+    #[test]
+    fn resolve_path_does_not_drop_relative_directory_components() {
+        let media_dir = TempDir::new().unwrap();
+        let nested_dir = media_dir.path().join("nested");
+        fs::create_dir(&nested_dir).unwrap();
+        let nested_file = nested_dir.join("movie.mkv");
+        fs::write(&nested_file, b"nested").unwrap();
+
+        let cache = scan_directories(
+            &[media_dir.path().to_string_lossy().to_string()],
+            DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS,
+        )
+        .unwrap();
+
+        assert_eq!(cache.resolve("nested/movie.mkv"), None);
     }
 
     #[test]
@@ -402,5 +352,30 @@ mod tests {
         let cache = scan_directories(&directories, DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS).unwrap();
 
         assert_eq!(cache.resolve("movie.mp4"), Some(second_file));
+    }
+
+    #[test]
+    fn scan_directories_preserves_sibling_enumeration_order() {
+        let root = TempDir::new().unwrap();
+        for directory in ["first", "second"] {
+            let directory = root.path().join(directory);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("movie.mp4"), b"movie").unwrap();
+        }
+        let expected = fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir())
+            .unwrap()
+            .join("movie.mp4");
+
+        let cache = scan_directories(
+            &[root.path().to_string_lossy().to_string()],
+            DEFAULT_MEDIA_INDEX_TIMEOUT_SECONDS,
+        )
+        .unwrap();
+
+        assert_eq!(cache.resolve("movie.mp4"), Some(expected));
     }
 }

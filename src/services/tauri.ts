@@ -36,6 +36,14 @@ export const tauriApi = {
     return invoke("set_ready", { isReady });
   },
 
+  async createManagedRoom(room: string): Promise<void> {
+    return invoke("create_managed_room", { room });
+  },
+
+  async identifyAsController(password: string): Promise<void> {
+    return invoke("identify_as_controller", { password });
+  },
+
   // Playlist commands
   async updatePlaylist(action: string, filename?: string): Promise<void> {
     return invoke("update_playlist", { action, filename });
