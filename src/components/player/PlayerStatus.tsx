@@ -53,7 +53,9 @@ export function PlayerStatus() {
       {/* Playback happens in the external player, so this is a read-only
           status indicator rather than a clickable button. */}
       <div
-        className="app-tooltip flex items-center justify-center w-8 h-8 shrink-0"
+        className={`app-tooltip flex items-center justify-center w-7 h-7 shrink-0 rounded-lg ${
+          player.paused ? "app-tag-muted" : "app-tag-accent"
+        }`}
         role="status"
         aria-label={`${playbackStateLabel} (controlled in the external player)`}
       >
@@ -64,8 +66,9 @@ export function PlayerStatus() {
         )}
       </div>
       {player.position !== null && player.duration !== null && (
-        <span className="font-mono text-xs shrink-0">
-          {formatTime(player.position)}/{formatTime(player.duration)}
+        <span className="font-mono app-tnum text-[13px] shrink-0 leading-none">
+          <span className="font-semibold">{formatTime(player.position)}</span>
+          <span className="app-text-muted"> / {formatTime(player.duration)}</span>
         </span>
       )}
       <span

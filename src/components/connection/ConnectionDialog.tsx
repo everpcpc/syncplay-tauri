@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { LuSettings } from "react-icons/lu";
+import { LuChevronDown, LuSettings } from "react-icons/lu";
 import { useSyncplayStore } from "../../store";
 import { useNotificationStore } from "../../store/notifications";
 import { invoke } from "@tauri-apps/api/core";
@@ -99,7 +99,7 @@ function ComboBox({
               setIsOpen(false);
             }
           }}
-          className="w-full app-input px-3 py-2 rounded-md focus:outline-none focus:border-blue-500 pr-10"
+          className="w-full app-input px-3 py-2 rounded-md focus:outline-none pr-10"
           placeholder={placeholder}
         />
         <button
@@ -108,10 +108,10 @@ function ComboBox({
             event.preventDefault();
             setIsOpen((prev) => !prev);
           }}
-          className="absolute right-2 top-1/2 -translate-y-1/2 app-input-addon rounded px-1.5 py-1 text-xs"
+          className="absolute right-2 top-1/2 -translate-y-1/2 app-input-addon rounded px-1.5 py-1"
           aria-label="Options"
         >
-          v
+          <LuChevronDown className="app-icon" />
         </button>
         {isOpen && (
           <div className="absolute z-20 mt-2 w-full app-dropdown rounded-lg p-2">
@@ -457,7 +457,7 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
       className="fixed inset-0 app-overlay app-dialog-overlay flex items-center justify-center"
       data-tauri-drag-region="false"
     >
-      <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl shadow-xl">
+      <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl app-dialog-panel">
         <h2 className="text-xl font-bold mb-4">
           {connection.connected ? "Connected" : "Connect to Server"}
         </h2>
@@ -522,7 +522,7 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
                     type="text"
                     value={formData.username}
                     onChange={(e) => setFormData({ ...formData, username: e.target.value })}
-                    className="w-full app-input px-3 py-2 rounded-md focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded-md focus:outline-none"
                     placeholder="Your username"
                     required
                   />
@@ -542,7 +542,7 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
                     type="password"
                     value={formData.password}
                     onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-                    className="w-full app-input px-3 py-2 rounded-md focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded-md focus:outline-none"
                     placeholder="Server password"
                   />
                 </div>
@@ -568,7 +568,7 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
                         onChange={(e) =>
                           updateUserConfig({ autosave_joins_to_list: e.target.checked })
                         }
-                        className="w-4 h-4"
+                        className="app-checkbox"
                       />
                       Auto-save joined rooms
                     </label>
@@ -577,7 +577,7 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
                         type="checkbox"
                         checked={config.user.auto_connect}
                         onChange={(e) => updateUserConfig({ auto_connect: e.target.checked })}
-                        className="w-4 h-4"
+                        className="app-checkbox"
                       />
                       Auto-connect on startup
                     </label>
@@ -586,7 +586,7 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
                         type="checkbox"
                         checked={config.user.force_gui_prompt}
                         onChange={(e) => updateUserConfig({ force_gui_prompt: e.target.checked })}
-                        className="w-4 h-4"
+                        className="app-checkbox"
                       />
                       Always show connect dialog on startup
                     </label>
@@ -636,7 +636,7 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
                               player: { ...config.player, player_path: e.target.value },
                             })
                           }
-                          className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                          className="w-full app-input px-3 py-2 rounded focus:outline-none"
                         >
                           <option value="">Select a player...</option>
                           {detectedPlayers.map((player, index) => (
@@ -672,7 +672,7 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
                               player: { ...config.player, player_path: e.target.value },
                             })
                           }
-                          className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                          className="w-full app-input px-3 py-2 rounded focus:outline-none"
                           placeholder="/usr/local/bin/mpv"
                         />
                         <p className="text-xs app-text-muted mt-1">
@@ -690,7 +690,7 @@ export function ConnectionDialog({ isOpen, onClose }: ConnectionDialogProps) {
                           setPlayerArgsInput(e.target.value);
                           updatePlayerArguments(e.target.value);
                         }}
-                        className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                        className="w-full app-input px-3 py-2 rounded focus:outline-none"
                         placeholder="--fullscreen --no-border"
                       />
                       <p className="text-xs app-text-muted mt-1">

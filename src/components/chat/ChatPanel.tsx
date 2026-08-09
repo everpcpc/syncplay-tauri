@@ -150,7 +150,7 @@ export function ChatPanel() {
   const getMessageStyle = (messageType: string) => {
     switch (messageType) {
       case "system":
-        return "app-text-warning italic";
+        return "app-text-muted";
       case "error":
         return "app-text-danger";
       default:
@@ -209,13 +209,20 @@ export function ChatPanel() {
           displayMessages.map((msg, index) => {
             // Strip accidental leading/trailing whitespace without affecting internal spacing/newlines.
             const displayMessage = msg.message.trim();
+            // Seek ("jumped") events are the noisiest sync noise; render them
+            // dimmer than pauses and chat so the eye skips over them.
+            const isTrivialEvent = msg.collapseKey?.endsWith(":jumped") ?? false;
 
             return (
               <div
                 key={`${msg.timestamp}-${msg.username ?? "system"}-${msg.messageType}-${index}`}
-                className="text-sm app-message"
+                className={`app-message ${msg.messageType === "system" ? "text-[13px]" : "text-sm"} ${
+                  isTrivialEvent ? "opacity-55" : ""
+                }`}
               >
-                <span className="app-text-muted text-xs">{formatTimestamp(msg.timestamp)}</span>
+                <span className="app-text-muted text-xs app-tnum">
+                  {formatTimestamp(msg.timestamp)}
+                </span>
                 {msg.username && (
                   <span className="app-text-accent font-medium ml-2">{msg.username}:</span>
                 )}
@@ -258,7 +265,7 @@ export function ChatPanel() {
                 ? "Type a message... (or /help for commands)"
                 : "Chat input disabled"
           }
-          className="w-full h-8 app-input px-3 py-0 leading-4 rounded-md focus:outline-none focus:border-blue-500"
+          className="w-full h-8 app-input px-3 py-0 leading-4 rounded-md focus:outline-none"
           disabled={!connection.connected || !chatInputEnabled}
         />
       </div>

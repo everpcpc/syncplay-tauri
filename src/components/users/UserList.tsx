@@ -5,6 +5,16 @@ import { useSyncplayStore } from "../../store";
 import { useNotificationStore } from "../../store/notifications";
 import { RoomManagerDialog } from "./RoomManagerDialog";
 
+// Stable per-user avatar hue, derived from the username so every
+// participant gets a recognizable color chip without a server avatar.
+const avatarHueFor = (username: string) => {
+  let hash = 0;
+  for (let i = 0; i < username.length; i += 1) {
+    hash = (hash * 31 + username.charCodeAt(i)) >>> 0;
+  }
+  return hash % 360;
+};
+
 export function UserList() {
   const users = useSyncplayStore((state) => state.users);
   const connection = useSyncplayStore((state) => state.connection);
@@ -155,6 +165,13 @@ export function UserList() {
             <div key={user.username} className="app-panel-muted rounded-md p-3 text-sm">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2 min-w-0">
+                  <span
+                    className="app-avatar"
+                    style={{ backgroundColor: `hsl(${avatarHueFor(user.username)} 62% 46%)` }}
+                    aria-hidden="true"
+                  >
+                    {(user.username.trim()[0] ?? "?") as string}
+                  </span>
                   <span className="font-medium truncate flex-1 min-w-0">{user.username}</span>
                   <span
                     className={`text-[10px] px-2 py-0 rounded-full ${

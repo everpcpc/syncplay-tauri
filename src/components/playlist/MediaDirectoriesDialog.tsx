@@ -175,7 +175,7 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
 
   return (
     <AppDialogPortal className="fixed inset-0 app-overlay app-dialog-overlay flex items-center justify-center">
-      <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl max-h-[80vh] overflow-auto shadow-xl">
+      <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl max-h-[80vh] overflow-auto app-dialog-panel">
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
           <div>
             <h2 className="text-xl font-bold">Media Directories</h2>
@@ -208,7 +208,7 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
                       e.currentTarget.blur();
                     }
                   }}
-                  className="w-full sm:w-32 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                  className="w-full sm:w-32 app-input px-3 py-2 rounded focus:outline-none"
                 />
                 <span className="text-xs app-text-muted">
                   Seconds allowed for media directory scanning.
@@ -229,7 +229,7 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
                       addMediaDirectory();
                     }
                   }}
-                  className="flex-1 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                  className="flex-1 app-input px-3 py-2 rounded focus:outline-none"
                   placeholder="/path/to/media"
                 />
                 <button
@@ -258,7 +258,7 @@ export function MediaDirectoriesDialog({ isOpen, onClose }: MediaDirectoriesDial
                   {config.player.media_directories.map((dir, index) => (
                     <div
                       key={dir}
-                      className="flex items-center justify-between gap-2 app-panel-muted px-3 py-2 rounded"
+                      className="flex items-center justify-between gap-2 app-panel-muted px-3 py-2 rounded-lg"
                     >
                       <span className="text-sm truncate min-w-0 flex-1">{dir}</span>
                       <div className="flex items-center gap-1 shrink-0">

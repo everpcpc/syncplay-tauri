@@ -92,6 +92,12 @@ function AppHeader({
   onOpenConnection,
   onOpenSettings,
 }: AppHeaderProps) {
+  const playerPosition = useSyncplayStore((state) => state.player.position);
+  const playerDuration = useSyncplayStore((state) => state.player.duration);
+  const progress =
+    playerPosition !== null && playerDuration !== null && playerDuration > 0
+      ? Math.min(1, Math.max(0, playerPosition / playerDuration))
+      : null;
   return (
     <header
       className="app-header relative"
@@ -209,6 +215,11 @@ function AppHeader({
           </div>
         </div>
       </div>
+      {progress !== null && (
+        <div className="app-header-progress" aria-hidden="true">
+          <div style={{ width: `${progress * 100}%` }} />
+        </div>
+      )}
     </header>
   );
 }

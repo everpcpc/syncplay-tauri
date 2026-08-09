@@ -175,7 +175,7 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
 
   return (
     <AppDialogPortal className="fixed inset-0 app-overlay app-dialog-overlay flex items-center justify-center">
-      <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl max-h-[80vh] overflow-auto shadow-xl">
+      <div className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-2xl max-h-[80vh] overflow-auto app-dialog-panel">
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
           <div>
             <h2 className="text-xl font-bold">Rooms</h2>
@@ -205,7 +205,7 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
                       void connectToRoom();
                     }
                   }}
-                  className="flex-1 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                  className="flex-1 app-input px-3 py-2 rounded focus:outline-none"
                   placeholder="Room name"
                 />
                 <button
@@ -234,7 +234,7 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
                     {serverRooms.map((room) => (
                       <div
                         key={room}
-                        className="flex items-center justify-between gap-3 app-panel-muted px-3 py-2 rounded"
+                        className="flex items-center justify-between gap-3 app-panel-muted px-3 py-2 rounded-lg"
                       >
                         <span className="text-sm truncate">{room}</span>
                         <button
@@ -267,7 +267,7 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
                           void createManagedRoom();
                         }
                       }}
-                      className="flex-1 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="flex-1 app-input px-3 py-2 rounded focus:outline-none"
                       placeholder="Room name"
                     />
                     <button
@@ -296,7 +296,7 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
                           void identifyAsController();
                         }
                       }}
-                      className="flex-1 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="flex-1 app-input px-3 py-2 rounded focus:outline-none"
                       placeholder="AA-000-000"
                     />
                     <button
@@ -325,7 +325,7 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
                       addRoomEntry();
                     }
                   }}
-                  className="flex-1 app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                  className="flex-1 app-input px-3 py-2 rounded focus:outline-none"
                   placeholder="Add a room"
                 />
                 <button
@@ -345,7 +345,7 @@ export function RoomManagerDialog({ isOpen, onClose }: RoomManagerDialogProps) {
                     return (
                       <div
                         key={room}
-                        className="flex items-center justify-between app-panel-muted px-3 py-2 rounded"
+                        className="flex items-center justify-between app-panel-muted px-3 py-2 rounded-lg"
                       >
                         <div className="flex items-center gap-2 min-w-0">
                           <span className="text-sm truncate">{room}</span>

@@ -139,16 +139,17 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
       data-tauri-drag-region="false"
     >
       <div
-        className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-4xl max-h-[85vh] overflow-auto shadow-xl"
+        className="app-panel app-panel-glass rounded-xl p-6 w-full max-w-4xl max-h-[85vh] overflow-auto app-dialog-panel"
         data-tauri-drag-region="false"
       >
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
           <div>
             <h2 className="text-xl font-bold">Settings</h2>
-            <p className="text-xs app-text-muted">
-              Changes are saved automatically. {saveStatus === "saving" && "Saving..."}
-              {saveStatus === "saved" && "Saved."}
-              {saveStatus === "failed" && "Save failed."}
+            <p className="text-xs app-text-muted app-tnum">
+              Changes are saved automatically.{" "}
+              {saveStatus === "saving" && "Saving..."}
+              {saveStatus === "saved" && <span className="app-text-success">Saved.</span>}
+              {saveStatus === "failed" && <span className="app-text-danger">Save failed.</span>}
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -205,7 +206,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   />
                 </div>
 
@@ -229,7 +230,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   />
                 </div>
 
@@ -253,7 +254,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   />
                 </div>
 
@@ -277,7 +278,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   />
                 </div>
 
@@ -301,7 +302,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   />
                 </div>
 
@@ -316,7 +317,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, slow_on_desync: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Slow down on desync
                   </label>
@@ -330,7 +331,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, rewind_on_desync: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Rewind on desync
                   </label>
@@ -344,7 +345,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, fastforward_on_desync: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Fast-forward on desync
                   </label>
@@ -358,7 +359,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, dont_slow_down_with_me: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Do not slow down with me
                   </label>
@@ -379,7 +380,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, ready_at_start: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Ready at startup
                   </label>
@@ -393,7 +394,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, pause_on_leave: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Pause when someone leaves the room
                   </label>
@@ -409,7 +410,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         user: { ...config.user, unpause_action: e.target.value as UnpauseAction },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   >
                     {unpauseOptions.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -430,7 +431,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, autoplay_enabled: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Enable auto-play when all ready
                   </label>
@@ -447,7 +448,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Require same filenames for auto-play
                   </label>
@@ -470,7 +471,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   />
                   <p className="text-xs app-text-muted mt-1">Use -1 to disable minimum.</p>
                 </div>
@@ -492,7 +493,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   >
                     {privacyOptions.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -515,7 +516,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   >
                     {privacyOptions.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -540,7 +541,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, chat_input_enabled: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Enable chat input
                   </label>
@@ -554,7 +555,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, chat_direct_input: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Direct input mode
                   </label>
@@ -573,7 +574,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   >
                     {chatInputPositions.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -595,7 +596,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, chat_input_font_family: e.target.value },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -615,7 +616,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -635,7 +636,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -649,7 +650,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, chat_input_font_color: e.target.value },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                 </div>
@@ -664,7 +665,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         user: { ...config.user, chat_input_font_underline: e.target.checked },
                       })
                     }
-                    className="w-4 h-4"
+                    className="app-checkbox"
                   />
                   Underline chat input
                 </label>
@@ -680,7 +681,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, chat_output_enabled: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Enable chat output
                   </label>
@@ -699,7 +700,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   >
                     {chatOutputModes.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -721,7 +722,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, chat_output_font_family: e.target.value },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -741,7 +742,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -761,7 +762,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -781,7 +782,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                 </div>
@@ -796,7 +797,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         user: { ...config.user, chat_output_font_underline: e.target.checked },
                       })
                     }
-                    className="w-4 h-4"
+                    className="app-checkbox"
                   />
                   Underline chat output
                 </label>
@@ -819,7 +820,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -839,7 +840,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -859,7 +860,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                 </div>
@@ -875,7 +876,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, chat_move_osd: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Move OSD for chat
                   </label>
@@ -898,7 +899,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   />
                 </div>
 
@@ -920,7 +921,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -940,7 +941,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                   <div>
@@ -960,7 +961,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           },
                         })
                       }
-                      className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                      className="w-full app-input px-3 py-2 rounded focus:outline-none"
                     />
                   </div>
                 </div>
@@ -983,7 +984,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         },
                       })
                     }
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   />
                 </div>
 
@@ -998,7 +999,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, show_osd: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Show OSD
                   </label>
@@ -1012,7 +1013,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, show_osd_warnings: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Show OSD warnings
                   </label>
@@ -1026,7 +1027,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, show_slowdown_osd: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Show slowdown OSD
                   </label>
@@ -1040,7 +1041,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, show_same_room_osd: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Show same room OSD
                   </label>
@@ -1054,7 +1055,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, show_different_room_osd: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Show different room OSD
                   </label>
@@ -1068,7 +1069,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, show_non_controller_osd: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Show non-controller OSD
                   </label>
@@ -1082,7 +1083,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                           user: { ...config.user, show_duration_notification: e.target.checked },
                         })
                       }
-                      className="w-4 h-4"
+                      className="app-checkbox"
                     />
                     Show duration notification
                   </label>
@@ -1112,7 +1113,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         user: { ...config.user, check_for_updates_automatically: resolved },
                       });
                     }}
-                    className="w-full app-input px-3 py-2 rounded focus:outline-none focus:border-blue-500"
+                    className="w-full app-input px-3 py-2 rounded focus:outline-none"
                   >
                     <option value="auto">Use default</option>
                     <option value="enabled">Enabled</option>
@@ -1130,7 +1131,7 @@ export function SettingsDialog({ isOpen, onClose, initialTab }: SettingsDialogPr
                         user: { ...config.user, debug: e.target.checked },
                       })
                     }
-                    className="w-4 h-4"
+                    className="app-checkbox"
                   />
                   Enable debug logging
                 </label>
