@@ -22,16 +22,32 @@ pub enum ConnectionState {
     Authenticated,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum TerminalConnectionError {
+    Protocol(String),
+    TlsCertificate(String),
+}
+
+impl TerminalConnectionError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Protocol(message) | Self::TlsCertificate(message) => message,
+        }
+    }
+}
+
 enum ConnectionCommand {
     Send(Box<ProtocolMessage>),
     UpgradeTls {
         domain: String,
+        timeout: Duration,
         response: oneshot::Sender<Result<TlsInfo>>,
     },
     #[cfg(test)]
     UpgradeTlsWithExtraRoots {
         domain: String,
         extra_roots: Vec<rustls::Certificate>,
+        timeout: Duration,
         response: oneshot::Sender<Result<TlsInfo>>,
     },
     Disconnect,
@@ -121,6 +137,7 @@ pub struct Connection {
     host: Mutex<String>,
     port: Mutex<u16>,
     tx: std::sync::Arc<Mutex<Option<mpsc::UnboundedSender<ConnectionCommand>>>>,
+    terminal_error: std::sync::Arc<Mutex<Option<TerminalConnectionError>>>,
 }
 
 impl Connection {
@@ -130,6 +147,7 @@ impl Connection {
             host: Mutex::new(String::new()),
             port: Mutex::new(0),
             tx: std::sync::Arc::new(Mutex::new(None)),
+            terminal_error: std::sync::Arc::new(Mutex::new(None)),
         }
     }
 
@@ -147,6 +165,7 @@ impl Connection {
         *self.state.lock() = ConnectionState::Connecting;
         *self.host.lock() = host.clone();
         *self.port.lock() = port;
+        *self.terminal_error.lock() = None;
 
         // Connect TCP stream
         let address = format!("{}:{}", host, port);
@@ -175,6 +194,7 @@ impl Connection {
 
         let state_ref = self.state.clone();
         let tx_ref = self.tx.clone();
+        let terminal_error_ref = self.terminal_error.clone();
         tokio::spawn(async move {
             info!("Connection loop started");
             let mut idle_tick = tokio::time::interval(Duration::from_secs(10));
@@ -189,14 +209,32 @@ impl Connection {
                                     break;
                                 }
                             }
-                            ConnectionCommand::UpgradeTls { domain, response } => {
-                                let result = transport.upgrade_tls(&domain).await;
+                            ConnectionCommand::UpgradeTls { domain, timeout, response } => {
+                                let result = tokio::time::timeout(timeout, transport.upgrade_tls(&domain)).await;
+                                let timed_out = result.is_err();
+                                let result = result
+                                    .context("TLS upgrade timed out")
+                                    .and_then(std::convert::identity);
                                 let _ = response.send(result);
+                                if timed_out {
+                                    break;
+                                }
                             }
                             #[cfg(test)]
-                            ConnectionCommand::UpgradeTlsWithExtraRoots { domain, extra_roots, response } => {
-                                let result = transport.upgrade_tls_with_extra_roots(&domain, extra_roots).await;
+                            ConnectionCommand::UpgradeTlsWithExtraRoots { domain, extra_roots, timeout, response } => {
+                                let result = tokio::time::timeout(
+                                    timeout,
+                                    transport.upgrade_tls_with_extra_roots(&domain, extra_roots),
+                                )
+                                .await;
+                                let timed_out = result.is_err();
+                                let result = result
+                                    .context("TLS upgrade timed out")
+                                    .and_then(std::convert::identity);
                                 let _ = response.send(result);
+                                if timed_out {
+                                    break;
+                                }
                             }
                             ConnectionCommand::Disconnect => {
                                 break;
@@ -214,6 +252,8 @@ impl Connection {
                             }
                             Some(Err(e)) => {
                                 error!("Failed to receive message: {}", e);
+                                *terminal_error_ref.lock() =
+                                    Some(TerminalConnectionError::Protocol(e.to_string()));
                                 break;
                             }
                             None => {
@@ -248,14 +288,22 @@ impl Connection {
         }
     }
 
-    /// Upgrade connection to TLS
-    pub async fn upgrade_tls(&self) -> Result<TlsInfo> {
+    #[cfg(not(test))]
+    async fn upgrade_tls_with_timeout_and_extra_roots<I>(
+        &self,
+        timeout_duration: Duration,
+        _extra_roots: I,
+    ) -> Result<TlsInfo>
+    where
+        I: IntoIterator<Item = rustls::Certificate> + Send + 'static,
+    {
         let (tx, rx) = oneshot::channel();
         let domain = self.host.lock().clone();
         if let Some(cmd_tx) = self.tx.lock().as_ref() {
             cmd_tx
                 .send(ConnectionCommand::UpgradeTls {
                     domain,
+                    timeout: timeout_duration,
                     response: tx,
                 })
                 .context("Failed to send upgrade TLS command")?;
@@ -290,6 +338,7 @@ impl Connection {
                 .send(ConnectionCommand::UpgradeTlsWithExtraRoots {
                     domain,
                     extra_roots: extra_roots.into_iter().collect(),
+                    timeout: timeout_duration,
                     response: tx,
                 })
                 .context("Failed to send upgrade TLS command")?;
@@ -297,37 +346,7 @@ impl Connection {
             anyhow::bail!("Not connected");
         }
 
-        tokio::time::timeout(timeout_duration, rx)
-            .await
-            .context("TLS upgrade timed out")?
-            .context("TLS upgrade response dropped")?
-    }
-
-    #[cfg(not(test))]
-    async fn upgrade_tls_with_timeout_and_extra_roots<I>(
-        &self,
-        timeout_duration: Duration,
-        _extra_roots: I,
-    ) -> Result<TlsInfo>
-    where
-        I: IntoIterator<Item = rustls::Certificate> + Send + 'static,
-    {
-        tokio::time::timeout(timeout_duration, self.upgrade_tls())
-            .await
-            .context("TLS upgrade timed out")?
-    }
-
-    #[cfg(test)]
-    async fn test_timeout_tls_future<Fut>(
-        future: Fut,
-        timeout_duration: Duration,
-    ) -> Result<TlsInfo>
-    where
-        Fut: std::future::Future<Output = Result<TlsInfo>>,
-    {
-        tokio::time::timeout(timeout_duration, future)
-            .await
-            .context("TLS upgrade timed out")?
+        rx.await.context("TLS upgrade response dropped")?
     }
     /// Disconnect from the server
     pub fn disconnect(&self) {
@@ -347,6 +366,22 @@ impl Connection {
         )
     }
 
+    pub fn take_terminal_error(&self) -> Option<TerminalConnectionError> {
+        self.terminal_error.lock().take()
+    }
+
+    pub fn has_terminal_error(&self) -> bool {
+        self.terminal_error.lock().is_some()
+    }
+
+    pub fn mark_protocol_error(&self, error: impl Into<String>) {
+        *self.terminal_error.lock() = Some(TerminalConnectionError::Protocol(error.into()));
+    }
+
+    pub fn mark_tls_certificate_error(&self, error: impl Into<String>) {
+        *self.terminal_error.lock() = Some(TerminalConnectionError::TlsCertificate(error.into()));
+    }
+
     /// Mark as authenticated
     pub fn set_authenticated(&self) {
         *self.state.lock() = ConnectionState::Authenticated;
@@ -355,7 +390,7 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::Connection;
+    use super::{Connection, TerminalConnectionError};
     use crate::network::fake_server::tls_fixture::FakeTlsSyncplayServer;
     use crate::network::fake_server::FakeSyncplayServer;
     use crate::network::messages::{HelloMessage, ProtocolMessage, RoomInfo};
@@ -363,18 +398,55 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     #[tokio::test]
-    async fn tls_upgrade_helper_times_out_instead_of_hanging() {
-        let result = Connection::test_timeout_tls_future(
-            async {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                Ok(crate::network::tls::TlsInfo { protocol: None })
-            },
-            Duration::from_millis(25),
-        )
-        .await;
+    async fn tls_upgrade_timeout_aborts_worker_and_closes_receiver() {
+        let server = FakeSyncplayServer::start().await.unwrap();
+        let connection = Connection::new();
+        let (mut receiver, _) = connection
+            .connect(server.host(), server.port())
+            .await
+            .unwrap();
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let result = timeout(
+            Duration::from_secs(2),
+            connection.upgrade_tls_with_timeout(Duration::from_millis(25)),
+        )
+        .await
+        .expect("TLS timeout must settle")
+        .unwrap_err();
+
+        assert!(result.to_string().contains("timed out"));
+        assert!(timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("connection worker must close its receiver")
+            .is_none());
+        assert_eq!(connection.state(), super::ConnectionState::Disconnected);
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn malformed_server_command_records_terminal_protocol_error() {
+        let server = FakeSyncplayServer::start().await.unwrap();
+        let connection = Connection::new();
+        let (mut receiver, _) = connection
+            .connect(server.host(), server.port())
+            .await
+            .unwrap();
+
+        server.send_raw_line(r#"{"Unknown":{"value":1}}"#).unwrap();
+        assert!(timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .is_none());
+
+        let error = connection
+            .take_terminal_error()
+            .expect("decoder failure must be retained for lifecycle handling");
+        assert!(matches!(
+            error,
+            TerminalConnectionError::Protocol(message)
+                if message.contains("Unknown protocol message: Unknown")
+        ));
+        server.close();
     }
 
     #[tokio::test]

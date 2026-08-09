@@ -1,7 +1,8 @@
-//! Transactional boundary between requested loads and confirmed player media.
+//! Transactional boundaries for player media metadata.
 //!
-//! Callers must propagate the load ID that produced an update. Unattributed
-//! snapshots use `None` and cannot complete while an explicit load is pending.
+//! Tagged loads propagate the load ID that produced an update. Players without
+//! response IDs serialize each metadata query sequence through
+//! [`OrderedMediaRefresh`] so fields from adjacent media cannot be combined.
 
 use crate::utils::is_url;
 
@@ -11,7 +12,14 @@ pub type LoadId = u64;
 pub struct PendingMediaLoad {
     pub id: LoadId,
     pub target: String,
-    cancelled: bool,
+    status: PendingMediaLoadStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingMediaLoadStatus {
+    Active,
+    Cancelled,
+    ExternallySuperseded,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +28,148 @@ pub struct MediaSnapshot {
     pub path: Option<String>,
     pub duration: Option<f64>,
     pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaMetadataField {
+    Filename,
+    Path,
+    Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum MediaRefreshOutcome {
+    Ignored,
+    Pending,
+    Committed(MediaSnapshot),
+    Restarted,
+}
+
+#[derive(Debug)]
+pub struct OrderedMediaRefresh {
+    order: [MediaMetadataField; 3],
+    active: Option<MediaRefreshCycle>,
+}
+
+#[derive(Debug)]
+struct MediaRefreshCycle {
+    next_field: usize,
+    filename: Option<Option<String>>,
+    path: Option<Option<String>>,
+    duration: Option<Option<f64>>,
+    invalidated: bool,
+}
+
+impl MediaRefreshCycle {
+    fn new() -> Self {
+        Self {
+            next_field: 0,
+            filename: None,
+            path: None,
+            duration: None,
+            invalidated: false,
+        }
+    }
+
+    fn into_snapshot(self) -> MediaSnapshot {
+        MediaSnapshot {
+            filename: self.filename.flatten(),
+            path: self.path.flatten(),
+            duration: self.duration.flatten(),
+            size: None,
+        }
+    }
+}
+
+impl OrderedMediaRefresh {
+    pub fn new(order: [MediaMetadataField; 3]) -> Self {
+        assert!(order.contains(&MediaMetadataField::Filename));
+        assert!(order.contains(&MediaMetadataField::Path));
+        assert!(order.contains(&MediaMetadataField::Duration));
+        Self {
+            order,
+            active: None,
+        }
+    }
+
+    /// Starts a refresh only when no response sequence is already in flight.
+    pub fn start_if_idle(&mut self) -> bool {
+        if self.active.is_some() {
+            return false;
+        }
+        self.active = Some(MediaRefreshCycle::new());
+        true
+    }
+
+    /// Invalidates the in-flight sequence and schedules a fresh one after it drains.
+    ///
+    /// These player protocols do not attach request IDs to responses. Starting the
+    /// replacement immediately would make late responses from the old sequence
+    /// indistinguishable from responses to the new one.
+    pub fn restart_after_active(&mut self) -> bool {
+        let Some(active) = self.active.as_mut() else {
+            self.active = Some(MediaRefreshCycle::new());
+            return true;
+        };
+        active.invalidated = true;
+        false
+    }
+
+    pub fn invalidate_active(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            active.invalidated = true;
+        }
+    }
+
+    pub fn abort(&mut self) {
+        self.active = None;
+    }
+
+    pub fn push_filename(&mut self, value: Option<String>) -> MediaRefreshOutcome {
+        self.push(MediaMetadataField::Filename, |cycle| {
+            cycle.filename = Some(value);
+        })
+    }
+
+    pub fn push_path(&mut self, value: Option<String>) -> MediaRefreshOutcome {
+        self.push(MediaMetadataField::Path, |cycle| {
+            cycle.path = Some(value);
+        })
+    }
+
+    pub fn push_duration(&mut self, value: Option<f64>) -> MediaRefreshOutcome {
+        self.push(MediaMetadataField::Duration, |cycle| {
+            cycle.duration = Some(value);
+        })
+    }
+
+    fn push(
+        &mut self,
+        field: MediaMetadataField,
+        store: impl FnOnce(&mut MediaRefreshCycle),
+    ) -> MediaRefreshOutcome {
+        let Some(active) = self.active.as_mut() else {
+            return MediaRefreshOutcome::Ignored;
+        };
+        if self.order.get(active.next_field) != Some(&field) {
+            return MediaRefreshOutcome::Ignored;
+        }
+
+        store(active);
+        active.next_field += 1;
+        if active.next_field != self.order.len() {
+            return MediaRefreshOutcome::Pending;
+        }
+
+        let completed = self.active.take().expect("active refresh disappeared");
+        if completed.invalidated {
+            self.active = Some(MediaRefreshCycle::new());
+            MediaRefreshOutcome::Restarted
+        } else {
+            MediaRefreshOutcome::Committed(completed.into_snapshot())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +217,13 @@ impl MediaUpdateTransaction {
         self.load_id
     }
 
+    pub(crate) fn filename(&self) -> Option<&str> {
+        match &self.filename {
+            Collected::Value(Some(filename)) => Some(filename.as_str()),
+            Collected::Missing | Collected::Value(None) => None,
+        }
+    }
+
     pub fn set_filename(&mut self, filename: Option<String>) {
         self.filename = Collected::Value(filename);
     }
@@ -87,7 +244,7 @@ impl MediaUpdateTransaction {
         self.size = Collected::Value(size);
     }
 
-    fn missing_fields(&self) -> Vec<MediaField> {
+    pub(crate) fn missing_fields(&self) -> Vec<MediaField> {
         let mut missing = Vec::new();
         if self.filename.is_missing() {
             missing.push(MediaField::Filename);
@@ -153,8 +310,20 @@ impl MediaUpdateState {
         self.latest_load.replace(PendingMediaLoad {
             id: load_id,
             target: target.into(),
-            cancelled: false,
+            status: PendingMediaLoadStatus::Active,
         })
+    }
+
+    pub fn retarget_load(&mut self, load_id: LoadId, target: impl Into<String>) -> bool {
+        let Some(load) = self
+            .latest_load
+            .as_mut()
+            .filter(|load| load.id == load_id && load.status != PendingMediaLoadStatus::Cancelled)
+        else {
+            return false;
+        };
+        load.target = target.into();
+        true
     }
 
     pub fn begin_update(&self, load_id: Option<LoadId>) -> MediaUpdateTransaction {
@@ -172,7 +341,9 @@ impl MediaUpdateState {
             return false;
         }
         if let Some(load) = self.latest_load.as_mut() {
-            load.cancelled = true;
+            if load.status == PendingMediaLoadStatus::Active {
+                load.status = PendingMediaLoadStatus::Cancelled;
+            }
         }
         true
     }
@@ -181,7 +352,7 @@ impl MediaUpdateState {
     pub fn is_loading(&self) -> bool {
         self.latest_load
             .as_ref()
-            .is_some_and(|load| !load.cancelled)
+            .is_some_and(|load| load.status == PendingMediaLoadStatus::Active)
     }
 
     #[cfg(test)]
@@ -191,7 +362,9 @@ impl MediaUpdateState {
 
     #[cfg(test)]
     pub fn active_load(&self) -> Option<&PendingMediaLoad> {
-        self.latest_load.as_ref().filter(|load| !load.cancelled)
+        self.latest_load
+            .as_ref()
+            .filter(|load| load.status == PendingMediaLoadStatus::Active)
     }
 
     #[cfg(test)]
@@ -211,7 +384,10 @@ impl MediaUpdateState {
     pub fn commit(&mut self, update: MediaUpdateTransaction) -> MediaCommit {
         let completed_load_id = update.load_id;
         if completed_load_id.is_none()
-            && self.latest_load.as_ref().is_some_and(|load| load.cancelled)
+            && self
+                .latest_load
+                .as_ref()
+                .is_some_and(|load| load.status == PendingMediaLoadStatus::Cancelled)
         {
             self.latest_load = None;
         }
@@ -222,7 +398,11 @@ impl MediaUpdateState {
                 latest_load_id,
             };
         }
-        if self.latest_load.as_ref().is_some_and(|load| load.cancelled) {
+        if self
+            .latest_load
+            .as_ref()
+            .is_some_and(|load| load.status == PendingMediaLoadStatus::Cancelled)
+        {
             self.latest_load = None;
             return MediaCommit::Stale {
                 completed_load_id,
@@ -257,6 +437,37 @@ impl MediaUpdateState {
 
         self.confirmed = Some(snapshot.clone());
         self.latest_load = None;
+        MediaCommit::Committed(snapshot)
+    }
+
+    pub fn commit_external(&mut self, update: MediaUpdateTransaction) -> MediaCommit {
+        let load_id = update.load_id;
+        if load_id.is_some() {
+            return MediaCommit::Stale {
+                completed_load_id: load_id,
+                latest_load_id: self.latest_load.as_ref().map(|load| load.id),
+            };
+        }
+
+        let missing = update.missing_fields();
+        if !missing.is_empty() {
+            return MediaCommit::Incomplete { load_id, missing };
+        }
+        let snapshot = update.into_snapshot();
+        if snapshot.filename.is_none() && snapshot.path.is_none() {
+            return MediaCommit::MissingIdentity { load_id };
+        }
+
+        match self.latest_load.as_mut() {
+            Some(load) if load.status == PendingMediaLoadStatus::Cancelled => {
+                self.latest_load = None;
+            }
+            Some(load) => {
+                load.status = PendingMediaLoadStatus::ExternallySuperseded;
+            }
+            None => {}
+        }
+        self.confirmed = Some(snapshot.clone());
         MediaCommit::Committed(snapshot)
     }
 }
@@ -472,6 +683,48 @@ mod tests {
     }
 
     #[test]
+    fn explicit_external_media_supersedes_an_active_load_without_losing_a_written_marker() {
+        let mut state = MediaUpdateState::new();
+        state.begin_load(7, "/media/requested.mkv");
+        let requested = complete_update(
+            &state,
+            Some(7),
+            "requested.mkv",
+            "/media/requested.mkv",
+            100.0,
+            1_000,
+        );
+        let external = complete_update(
+            &state,
+            None,
+            "manual.mkv",
+            "/media/manual.mkv",
+            200.0,
+            2_000,
+        );
+
+        assert!(matches!(
+            state.commit_external(external),
+            MediaCommit::Committed(_)
+        ));
+        assert!(state.cancel_load(7));
+        assert_eq!(
+            state
+                .last_confirmed()
+                .and_then(|media| media.filename.as_deref()),
+            Some("manual.mkv")
+        );
+
+        assert!(matches!(state.commit(requested), MediaCommit::Committed(_)));
+        assert_eq!(
+            state
+                .last_confirmed()
+                .and_then(|media| media.filename.as_deref()),
+            Some("requested.mkv")
+        );
+    }
+
+    #[test]
     fn target_matching_uses_the_resolved_media_identity() {
         let mut state = MediaUpdateState::new();
         state.begin_load(1, "/media/Movie-Name_1080p.mkv");
@@ -485,6 +738,72 @@ mod tests {
         );
 
         assert!(matches!(state.commit(update), MediaCommit::Committed(_)));
+    }
+
+    #[test]
+    fn exact_generation_can_retarget_to_a_redirect_child() {
+        let mut state = MediaUpdateState::new();
+        state.begin_load(7, "/media/playlist.m3u");
+
+        assert!(state.retarget_load(7, "/media/child.mkv"));
+        let update = complete_update(
+            &state,
+            Some(7),
+            "child.mkv",
+            "/media/child.mkv",
+            100.0,
+            1_000,
+        );
+
+        assert!(matches!(state.commit(update), MediaCommit::Committed(_)));
+    }
+
+    #[test]
+    fn stale_generation_cannot_retarget_the_current_load() {
+        let mut state = MediaUpdateState::new();
+        state.begin_load(8, "/media/current.mkv");
+
+        assert!(!state.retarget_load(7, "/media/stale-child.mkv"));
+        let update = complete_update(
+            &state,
+            Some(8),
+            "stale-child.mkv",
+            "/media/stale-child.mkv",
+            100.0,
+            1_000,
+        );
+
+        assert!(matches!(
+            state.commit(update),
+            MediaCommit::TargetMismatch { load_id: 8, .. }
+        ));
+
+        state.begin_load(9, "/media/cancelled.m3u");
+        assert!(state.cancel_load(9));
+        assert!(!state.retarget_load(9, "/media/cancelled-child.mkv"));
+    }
+
+    #[test]
+    fn externally_superseded_generation_can_retarget_before_its_exact_marker() {
+        let mut state = MediaUpdateState::new();
+        state.begin_load(7, "/media/playlist.m3u");
+        let external = complete_update(&state, None, "manual.mkv", "/media/manual.mkv", 50.0, 500);
+        assert!(matches!(
+            state.commit_external(external),
+            MediaCommit::Committed(_)
+        ));
+
+        assert!(state.retarget_load(7, "/media/redirect-child.mkv"));
+        let child = complete_update(
+            &state,
+            Some(7),
+            "redirect-child.mkv",
+            "/media/redirect-child.mkv",
+            100.0,
+            1_000,
+        );
+
+        assert!(matches!(state.commit(child), MediaCommit::Committed(_)));
     }
 
     #[test]

@@ -32,6 +32,36 @@ pub enum ProtocolMessage {
     },
 }
 
+impl ProtocolMessage {
+    pub(crate) fn from_command(key: &str, value: Value) -> Result<Self, String> {
+        match key {
+            "Hello" => serde_json::from_value(value)
+                .map(|hello| Self::Hello { Hello: hello })
+                .map_err(|error| error.to_string()),
+            "Set" => serde_json::from_value(value)
+                .map(|set| Self::Set { Set: Box::new(set) })
+                .map_err(|error| error.to_string()),
+            "State" => serde_json::from_value(value)
+                .map(|state| Self::State { State: state })
+                .map_err(|error| error.to_string()),
+            "Chat" => serde_json::from_value(value)
+                .map(|chat| Self::Chat { Chat: chat })
+                .map_err(|error| error.to_string()),
+            "Error" => serde_json::from_value(value)
+                .map(|error| Self::Error { Error: error })
+                .map_err(|error| error.to_string()),
+            "TLS" => serde_json::from_value(value)
+                .map(|tls| Self::TLS { TLS: tls })
+                .map_err(|error| error.to_string()),
+            "List" if value.is_null() => Ok(Self::List { List: None }),
+            "List" => serde_json::from_value(value)
+                .map(|list| Self::List { List: Some(list) })
+                .map_err(|error| error.to_string()),
+            _ => Err(format!("Unknown protocol message: {key}")),
+        }
+    }
+}
+
 impl Serialize for ProtocolMessage {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -68,46 +98,7 @@ impl<'de> Deserialize<'de> for ProtocolMessage {
         }
 
         let (key, val) = obj.iter().next().unwrap();
-        match key.as_str() {
-            "Hello" => {
-                let message = serde_json::from_value(val.clone()).map_err(de::Error::custom)?;
-                Ok(ProtocolMessage::Hello { Hello: message })
-            }
-            "Set" => {
-                let message = serde_json::from_value(val.clone()).map_err(de::Error::custom)?;
-                Ok(ProtocolMessage::Set {
-                    Set: Box::new(message),
-                })
-            }
-            "State" => {
-                let message = serde_json::from_value(val.clone()).map_err(de::Error::custom)?;
-                Ok(ProtocolMessage::State { State: message })
-            }
-            "Chat" => {
-                let message = serde_json::from_value(val.clone()).map_err(de::Error::custom)?;
-                Ok(ProtocolMessage::Chat { Chat: message })
-            }
-            "Error" => {
-                let message = serde_json::from_value(val.clone()).map_err(de::Error::custom)?;
-                Ok(ProtocolMessage::Error { Error: message })
-            }
-            "TLS" => {
-                let message = serde_json::from_value(val.clone()).map_err(de::Error::custom)?;
-                Ok(ProtocolMessage::TLS { TLS: message })
-            }
-            "List" => {
-                if val.is_null() {
-                    Ok(ProtocolMessage::List { List: None })
-                } else {
-                    let list = serde_json::from_value(val.clone()).map_err(de::Error::custom)?;
-                    Ok(ProtocolMessage::List { List: Some(list) })
-                }
-            }
-            _ => Err(de::Error::custom(format!(
-                "Unknown protocol message: {}",
-                key
-            ))),
-        }
+        Self::from_command(key, val.clone()).map_err(de::Error::custom)
     }
 }
 
@@ -435,5 +426,59 @@ mod tests {
             }
             _ => panic!("Unexpected message type"),
         }
+    }
+
+    #[test]
+    fn controller_auth_request_matches_reference_wire_envelope() {
+        let message = ProtocolMessage::Set {
+            Set: Box::new(SetMessage {
+                room: None,
+                file: None,
+                user: None,
+                ready: None,
+                playlist_index: None,
+                playlist_change: None,
+                controller_auth: Some(ControllerAuth {
+                    room: Some("room".to_string()),
+                    password: Some("AB-123-456".to_string()),
+                    user: None,
+                    success: None,
+                }),
+                new_controlled_room: None,
+                features: None,
+            }),
+        };
+
+        assert_eq!(
+            serde_json::to_value(message).unwrap(),
+            serde_json::json!({
+                "Set": {
+                    "controllerAuth": {
+                        "room": "room",
+                        "password": "AB-123-456"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn new_controlled_room_response_matches_reference_wire_envelope() {
+        let json = r#"{"Set":{"newControlledRoom":{"password":"AB-123-456","roomName":"+room:123456789ABC"}}}"#;
+        let message: ProtocolMessage = serde_json::from_str(json).unwrap();
+
+        let ProtocolMessage::Set { Set } = &message else {
+            panic!("expected Set.newControlledRoom");
+        };
+        let room = Set
+            .new_controlled_room
+            .as_ref()
+            .expect("newControlledRoom payload missing");
+        assert_eq!(room.password.as_deref(), Some("AB-123-456"));
+        assert_eq!(room.room_name.as_deref(), Some("+room:123456789ABC"));
+        assert_eq!(
+            serde_json::to_value(message).unwrap(),
+            serde_json::from_str::<Value>(json).unwrap()
+        );
     }
 }

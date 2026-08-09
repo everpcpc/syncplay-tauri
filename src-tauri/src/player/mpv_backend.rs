@@ -8,13 +8,12 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStdout;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use super::backend::{next_player_instance_id, PlayerBackend, PlayerKind};
 use super::commands::{LoadfileOptionsSyntax, MpvCommand};
 use super::events::{EndFileReason, MpvPlayerEvent};
-use super::media_update::{MediaCommit, MediaUpdateState, MediaUpdateTransaction};
+use super::media_update::{MediaCommit, MediaField, MediaUpdateState, MediaUpdateTransaction};
 use super::mpv_ipc::MpvIpc;
 use super::properties::PlayerState;
 use crate::app_state::AppState;
@@ -22,8 +21,8 @@ use crate::client::playback::LoadId;
 use crate::client::playback_runtime;
 use crate::commands::chat::send_chat_message_from_player;
 use crate::commands::connection::emit_error_message;
-use crate::player::controller::commit_player_state;
 use crate::player::controller::report_end_of_file;
+use crate::player::controller::{commit_external_player_state, commit_player_state};
 
 pub struct MpvBackend {
     instance_id: u64,
@@ -41,6 +40,17 @@ pub struct MpvBackend {
 struct MpvMediaUpdates {
     state: MediaUpdateState,
     transaction: Option<MediaUpdateTransaction>,
+    transaction_started_loaded: bool,
+    marker_epoch: Option<u64>,
+    marker_load_id: Option<u64>,
+    retry_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MpvMetadataField {
+    Filename,
+    Duration,
+    Path,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,12 +62,12 @@ enum MpvLineSource {
 #[derive(Clone)]
 struct MpvLineContext {
     instance_id: u64,
+    kind: PlayerKind,
     ipc: Arc<MpvIpc>,
     state: Weak<AppState>,
     file_loaded: Arc<AtomicBool>,
     media_updates: Arc<Mutex<MpvMediaUpdates>>,
     reset_ignore_until: Arc<Mutex<Option<Instant>>>,
-    generation_tagged_loads: bool,
     osc_visibility_change_compatible: bool,
 }
 
@@ -65,7 +75,7 @@ const MPV_NEWFILE_IGNORE_TIME: Duration = Duration::from_secs(1);
 const STREAM_ADDITIONAL_IGNORE_TIME: Duration = Duration::from_secs(10);
 const PLAYER_ASK_DELAY: Duration = Duration::from_millis(100);
 const MPV_UNRESPONSIVE_THRESHOLD: Duration = Duration::from_secs(60);
-const MPV_SCRIPT_MESSAGE_TIMEOUT: Duration = Duration::from_millis(250);
+const MPV_METADATA_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DO_NOT_RESET_POSITION_THRESHOLD: f64 = 1.0;
 const MPV_INPUT_BACKSLASH_SUBSTITUTE: &str = "＼";
 const MPV_ERROR_MESSAGES_TO_REPEAT: [&str; 4] = [
@@ -113,21 +123,34 @@ impl MpvBackend {
                     break;
                 }
                 match event {
-                    MpvPlayerEvent::StartFile { playlist_entry_id }
-                        if !context.generation_tagged_loads =>
-                    {
-                        context.ipc.start_untagged_load(playlist_entry_id);
-                    }
-                    MpvPlayerEvent::EndFile {
-                        reason,
-                        playlist_entry_id,
-                    } => {
-                        handle_untagged_end_file(&context, &reason, playlist_entry_id).await;
+                    MpvPlayerEvent::StartFile { .. } => {}
+                    MpvPlayerEvent::EndFile { reason, .. } => {
                         if matches!(reason, EndFileReason::Quit) {
                             stop_player_from_weak(&context.state, context.instance_id).await;
                             break;
                         }
                     }
+                    MpvPlayerEvent::GenerationLoadStarted {
+                        load_id: Some(load_id),
+                        target,
+                    } => {
+                        handle_generation_start(&context, load_id, target);
+                    }
+                    MpvPlayerEvent::GenerationLoadStarted { load_id: None, .. } => {}
+                    MpvPlayerEvent::GenerationLoadEnded {
+                        load_id: Some(load_id),
+                        reason,
+                        propagated,
+                    } => {
+                        handle_end_file(&context, &reason, load_id, propagated).await;
+                    }
+                    MpvPlayerEvent::GenerationLoadEnded { load_id: None, .. } => {}
+                    MpvPlayerEvent::GenerationLoadRejected { load_id, error } => {
+                        warn!(load_id, "MPV rejected generation load: {error}");
+                        context.ipc.end_load(load_id, false);
+                        fail_media_load(&context, load_id).await;
+                    }
+                    MpvPlayerEvent::GenerationLoadProtocolReady => {}
                     MpvPlayerEvent::Quit | MpvPlayerEvent::SocketDisconnected => {
                         stop_player_from_weak(&context.state, context.instance_id).await;
                         break;
@@ -156,12 +179,12 @@ impl MpvBackend {
     fn line_context(&self) -> MpvLineContext {
         MpvLineContext {
             instance_id: self.instance_id,
+            kind: self.kind,
             ipc: self.ipc.clone(),
             state: self.state.clone(),
             file_loaded: self.file_loaded.clone(),
             media_updates: self.media_updates.clone(),
             reset_ignore_until: self.reset_ignore_until.clone(),
-            generation_tagged_loads: self.loadfile_options_syntax.is_some(),
             osc_visibility_change_compatible: self.osc_visibility_change_compatible,
         }
     }
@@ -194,13 +217,13 @@ impl PlayerBackend for MpvBackend {
         let is_loaded = self.file_loaded.load(Ordering::SeqCst);
         if let Some(app_state) = self.state.upgrade() {
             if self.recently_reset() {
-                let global = app_state.client_state.get_global_state();
+                let global = app_state.effective_global_state();
                 state.position = Some(0.0);
                 state.paused = Some(global.paused);
                 return state;
             }
             if !is_loaded {
-                let global = app_state.client_state.get_global_state();
+                let global = app_state.effective_global_state();
                 state.position = Some(global.position);
                 state.paused = Some(global.paused);
                 return state;
@@ -209,30 +232,28 @@ impl PlayerBackend for MpvBackend {
 
         if let Some(last_update) = self.ipc.last_position_update() {
             let paused = state.paused.unwrap_or(true);
-            if !paused {
-                let diff = last_update.elapsed();
-                if diff > PLAYER_ASK_DELAY {
-                    if let Some(position) = state.position {
-                        state.position = Some(position + diff.as_secs_f64());
-                    }
+            let diff = last_update.elapsed();
+            if diff > MPV_UNRESPONSIVE_THRESHOLD {
+                if let Some(app_state) = self.state.upgrade() {
+                    let message = format!(
+                        "mpv has not responded for {} seconds so appears to have malfunctioned. Please restart Syncplay.",
+                        diff.as_secs()
+                    );
+                    emit_error_message(&app_state, &message);
+                    let app_state_clone = app_state.clone();
+                    let instance_id = self.instance_id;
+                    tokio::spawn(async move {
+                        let _ = crate::player::controller::stop_player_instance(
+                            &app_state_clone,
+                            instance_id,
+                        )
+                        .await;
+                    });
                 }
-                if diff > MPV_UNRESPONSIVE_THRESHOLD {
-                    if let Some(app_state) = self.state.upgrade() {
-                        let message = format!(
-                            "mpv has not responded for {} seconds so appears to have malfunctioned. Please restart Syncplay.",
-                            diff.as_secs()
-                        );
-                        emit_error_message(&app_state, &message);
-                        let app_state_clone = app_state.clone();
-                        let instance_id = self.instance_id;
-                        tokio::spawn(async move {
-                            let _ = crate::player::controller::stop_player_instance(
-                                &app_state_clone,
-                                instance_id,
-                            )
-                            .await;
-                        });
-                    }
+            }
+            if !paused && diff > PLAYER_ASK_DELAY {
+                if let Some(position) = state.position {
+                    state.position = Some(position + diff.as_secs_f64());
                 }
             }
         }
@@ -241,26 +262,15 @@ impl PlayerBackend for MpvBackend {
     }
 
     async fn poll_state(&self) -> anyhow::Result<()> {
-        if !self.file_loaded.load(Ordering::SeqCst) {
+        if !self.ipc.is_ready_for_send() {
             return Ok(());
         }
-        let cmd =
-            MpvCommand::script_message_to("syncplayintf", "get_paused_and_position", Vec::new());
-        let _ = timeout(MPV_SCRIPT_MESSAGE_TIMEOUT, self.ipc.send_command_async(cmd)).await;
-        if !self.file_loaded.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        match timeout(
-            Duration::from_millis(1200),
-            self.ipc.refresh_playback_state(),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => warn!("Failed to refresh mpv properties: {}", err),
-            Err(err) => warn!("Timed out refreshing mpv properties: {}", err),
-        }
+        self.ipc.schedule_playback_refresh();
         Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.ipc.is_healthy()
     }
 
     async fn set_position(&self, position: f64) -> anyhow::Result<()> {
@@ -279,15 +289,24 @@ impl PlayerBackend for MpvBackend {
     }
 
     fn begin_file_load(&self, load_id: u64, target: &str) {
+        let mut media = self.media_updates.lock();
+        media.retry_epoch = media.retry_epoch.wrapping_add(1);
+        media.transaction = None;
+        media.transaction_started_loaded = false;
+        media.state.begin_load(load_id, target);
         self.ipc.prepare_load(load_id);
-        self.media_updates.lock().state.begin_load(load_id, target);
+        drop(media);
         self.file_loaded.store(false, Ordering::SeqCst);
         *self.reset_ignore_until.lock() = None;
     }
 
     fn cancel_file_load(&self, load_id: u64) {
+        let mut media = self.media_updates.lock();
+        media.retry_epoch = media.retry_epoch.wrapping_add(1);
+        media.transaction = None;
+        media.transaction_started_loaded = false;
+        media.state.cancel_load(load_id);
         self.ipc.cancel_load(load_id);
-        self.media_updates.lock().state.cancel_load(load_id);
     }
 
     async fn load_file(&self, path: &str) -> anyhow::Result<()> {
@@ -296,6 +315,7 @@ impl PlayerBackend for MpvBackend {
     }
 
     async fn load_file_generation(&self, path: &str, load_id: u64) -> anyhow::Result<()> {
+        self.ipc.ensure_load_protocol_ready().await?;
         if let Some(syntax) = self.loadfile_options_syntax {
             self.ipc.load_file_generation(path, load_id, syntax).await?;
         } else {
@@ -387,11 +407,7 @@ fn is_current_player_context(context: &MpvLineContext) -> bool {
 
 async fn stop_player_from_weak(state: &Weak<AppState>, instance_id: u64) {
     if let Some(app_state) = state.upgrade() {
-        let app_state_clone = app_state.clone();
-        tokio::spawn(async move {
-            let _ = crate::player::controller::stop_player_instance(&app_state_clone, instance_id)
-                .await;
-        });
+        let _ = crate::player::controller::stop_player_instance(&app_state, instance_id).await;
     }
 }
 
@@ -429,7 +445,6 @@ async fn handle_syncplayintf_line(
     let state = &context.state;
     let file_loaded = &context.file_loaded;
     let media_updates = &context.media_updates;
-    let generation_tagged_loads = context.generation_tagged_loads;
     let osc_visibility_change_compatible = context.osc_visibility_change_compatible;
     let mut line = line.trim().to_string();
     line = line
@@ -468,12 +483,8 @@ async fn handle_syncplayintf_line(
     if line.contains("Failed to get value of property")
         || (!line.starts_with("ANS_") && line.contains("=(unavailable)"))
     {
-        let ipc = ipc.clone();
-        tokio::spawn(async move {
-            if let Err(err) = ipc.refresh_playback_state().await {
-                warn!("Failed to refresh mpv properties: {}", err);
-            }
-        });
+        // The marker transaction keeps unavailable media fields missing. They
+        // are retried after the closing marker, when the command gate reopens.
         return;
     }
     if line.contains("<chat>") {
@@ -498,96 +509,76 @@ async fn handle_syncplayintf_line(
         return;
     }
     if line.contains("<SyncplayUpdateFile>") || line.contains("Playing:") {
-        if !generation_tagged_loads {
-            file_loaded.store(false, Ordering::SeqCst);
-            ipc.set_ready(false);
-        }
         let mut media = media_updates.lock();
-        if media.transaction.is_some() {
+        media.retry_epoch = media.retry_epoch.wrapping_add(1);
+        let transaction_started_loaded = file_loaded.swap(false, Ordering::SeqCst);
+        if media.transaction.is_some() || media.marker_epoch.is_some() {
             return;
         }
-        let load_id = (!generation_tagged_loads)
-            .then(|| ipc.begin_untagged_marker())
-            .flatten();
+        let load_id = None;
+        let marker_epoch = media.retry_epoch;
+        media.transaction_started_loaded = transaction_started_loaded;
+        media.marker_epoch = Some(marker_epoch);
+        media.marker_load_id = load_id;
         media.transaction = Some(media.state.begin_update(load_id));
+        ipc.start_media_marker(marker_epoch, load_id);
         return;
     }
     if line.contains("</SyncplayUpdateFile>") {
-        let app_state = state.upgrade();
-        let transition_guard = match app_state.as_ref() {
-            Some(app_state) if is_current_player_context(context) => {
-                Some(app_state.playback.media_transition.lock().await)
-            }
-            _ => None,
-        };
-        let (load_id, commit) = {
+        let closing = {
             let mut media = media_updates.lock();
-            let Some(transaction) = media.transaction.take() else {
-                return;
-            };
-            let load_id = transaction.load_id();
-            let commit = media.state.commit(transaction);
-            (load_id, commit)
+            let marker_epoch = media.marker_epoch.take();
+            let marker_load_id = media.marker_load_id.take();
+            let transaction = media.transaction.take();
+            let transaction_started_loaded = media.transaction_started_loaded;
+            media.transaction_started_loaded = false;
+            if transaction
+                .as_ref()
+                .is_some_and(|transaction| transaction.load_id().is_none())
+            {
+                media.retry_epoch = media.retry_epoch.wrapping_add(1);
+            }
+            (
+                marker_epoch,
+                marker_load_id,
+                transaction,
+                transaction_started_loaded,
+                media.retry_epoch,
+            )
         };
-        let mut failed_load = None;
-        if !generation_tagged_loads {
-            ipc.set_ready(true);
+        let (marker_epoch, marker_load_id, transaction, transaction_started_loaded, retry_epoch) =
+            closing;
+        if let Some(marker_epoch) = marker_epoch {
+            let load_id = transaction
+                .as_ref()
+                .and_then(MediaUpdateTransaction::load_id)
+                .or(marker_load_id);
+            ipc.finish_media_marker(marker_epoch, load_id);
         }
-        match commit {
-            MediaCommit::Committed(snapshot) => {
-                ipc.commit_media_snapshot(&snapshot);
-                file_loaded.store(true, Ordering::SeqCst);
-                ipc.set_ready(true);
-                if let Some(app_state) = app_state.as_ref() {
-                    if transition_guard.is_none() || !is_current_player_context(context) {
-                        return;
-                    }
-                    let stable = ipc.get_state();
-                    let commit = {
-                        let _lifecycle_guard = app_state.player_lifecycle.lock().await;
-                        if !is_current_player_context(context) {
-                            return;
-                        }
-                        let player = app_state.player.lock().clone();
-                        commit_player_state(
-                            app_state,
-                            player.as_ref(),
-                            &stable,
-                            load_id.map(LoadId),
-                        )
-                        .await
-                    };
-                    if let Err(error) = commit {
-                        warn!("Failed to commit mpv media: {}", error);
-                    }
-                }
-            }
-            MediaCommit::Incomplete { load_id, missing } => {
-                file_loaded.store(false, Ordering::SeqCst);
-                ipc.set_ready(true);
-                warn!(
-                    "Ignoring incomplete mpv media update; missing: {:?}",
-                    missing
-                );
-                failed_load = load_id;
-            }
-            MediaCommit::MissingIdentity { load_id } => {
-                file_loaded.store(false, Ordering::SeqCst);
-                ipc.set_ready(true);
-                warn!("Ignoring mpv media update without filename or path");
-                failed_load = load_id;
-            }
-            result @ MediaCommit::Stale { .. } => {
-                debug!("Ignoring stale mpv media update: {:?}", result);
-            }
-            result @ MediaCommit::TargetMismatch { load_id, .. } => {
-                debug!("Ignoring stale mpv media update: {:?}", result);
-                failed_load = Some(load_id);
-            }
-        }
-        drop(transition_guard);
-        if let Some(load_id) = failed_load {
-            fail_media_load(context, load_id).await;
+        let Some(transaction) = transaction else {
+            return;
+        };
+        let missing = metadata_fields_to_retry(&transaction);
+        if missing.is_empty() {
+            finish_media_transaction(
+                context,
+                transaction,
+                transaction_started_loaded,
+                retry_epoch,
+            )
+            .await;
+        } else {
+            let context = context.clone();
+            tokio::spawn(async move {
+                retry_media_metadata(
+                    context,
+                    transaction,
+                    missing,
+                    transaction_started_loaded,
+                    retry_epoch,
+                )
+                .await;
+            });
         }
         return;
     }
@@ -595,6 +586,23 @@ async fn handle_syncplayintf_line(
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim_start_matches("ANS_").to_ascii_lowercase();
             let value = value.trim();
+            if key == "syncplay_load_id" {
+                if let Ok(load_id) = value.parse::<u64>() {
+                    ipc.mark_load_marker(load_id);
+                    let marker_epoch = {
+                        let mut media = media_updates.lock();
+                        media.marker_load_id = Some(load_id);
+                        if let Some(transaction) = media.transaction.as_mut() {
+                            update_media_transaction(transaction, &key, value);
+                        }
+                        media.marker_epoch
+                    };
+                    if let Some(marker_epoch) = marker_epoch {
+                        ipc.bind_media_marker(marker_epoch, load_id);
+                    }
+                    return;
+                }
+            }
             if let Some(transaction) = media_updates.lock().transaction.as_mut() {
                 update_media_transaction(transaction, &key, value);
             }
@@ -602,7 +610,14 @@ async fn handle_syncplayintf_line(
         return;
     }
     if line.contains("<paused=") && line.contains(", pos=") {
-        if let Some((paused, position)) = parse_pause_position(line) {
+        if let Some((mut paused, mut position)) = parse_pause_position(line) {
+            if paused.is_none() || position.is_none() {
+                if let Some(app_state) = state.upgrade() {
+                    let global = app_state.effective_global_state();
+                    paused = paused.or(Some(global.paused));
+                    position = position.or(Some(global.position));
+                }
+            }
             ipc.update_pause_and_position(paused, position);
         }
         return;
@@ -635,28 +650,312 @@ async fn handle_syncplayintf_line(
     }
 }
 
+fn metadata_fields_to_retry(transaction: &MediaUpdateTransaction) -> Vec<MpvMetadataField> {
+    transaction
+        .missing_fields()
+        .into_iter()
+        .filter_map(|field| match field {
+            MediaField::Filename => Some(MpvMetadataField::Filename),
+            MediaField::Duration => Some(MpvMetadataField::Duration),
+            MediaField::Path => Some(MpvMetadataField::Path),
+            MediaField::Size => None,
+        })
+        .collect()
+}
+
+fn media_retry_is_current(
+    context: &MpvLineContext,
+    load_id: Option<u64>,
+    retry_epoch: u64,
+) -> bool {
+    if !is_current_player_context(context)
+        || context.media_updates.lock().retry_epoch != retry_epoch
+    {
+        return false;
+    }
+    load_id.is_none_or(|load_id| context.ipc.is_load_active(load_id))
+}
+
+async fn retry_media_metadata(
+    context: MpvLineContext,
+    mut transaction: MediaUpdateTransaction,
+    mut missing: Vec<MpvMetadataField>,
+    transaction_started_loaded: bool,
+    retry_epoch: u64,
+) {
+    let load_id = transaction.load_id();
+    loop {
+        if !media_retry_is_current(&context, load_id, retry_epoch) {
+            debug!(?load_id, "Cancelling superseded mpv metadata retry");
+            return;
+        }
+
+        let mut unresolved = Vec::new();
+        for field in missing {
+            if !media_retry_is_current(&context, load_id, retry_epoch) {
+                return;
+            }
+            let Some(result) = refresh_media_field_while_current(
+                &context,
+                &mut transaction,
+                field,
+                load_id,
+                retry_epoch,
+            )
+            .await
+            else {
+                return;
+            };
+            match result {
+                Ok(true) => {}
+                Ok(false) => unresolved.push(field),
+                Err(error) => {
+                    context
+                        .ipc
+                        .mark_unhealthy(format!("MPV media metadata refresh failed: {error}"));
+                    return;
+                }
+            }
+        }
+
+        if unresolved.is_empty() {
+            if media_retry_is_current(&context, load_id, retry_epoch) {
+                finish_media_transaction(
+                    &context,
+                    transaction,
+                    transaction_started_loaded,
+                    retry_epoch,
+                )
+                .await;
+            }
+            return;
+        }
+        missing = unresolved;
+        tokio::time::sleep(MPV_METADATA_RETRY_DELAY).await;
+    }
+}
+
+async fn refresh_media_field_while_current(
+    context: &MpvLineContext,
+    transaction: &mut MediaUpdateTransaction,
+    field: MpvMetadataField,
+    load_id: Option<u64>,
+    retry_epoch: u64,
+) -> Option<anyhow::Result<bool>> {
+    let refresh = refresh_media_field(&context.ipc, transaction, field);
+    tokio::pin!(refresh);
+    loop {
+        tokio::select! {
+            result = &mut refresh => return Some(result),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                if !media_retry_is_current(context, load_id, retry_epoch) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+async fn refresh_media_field(
+    ipc: &Arc<MpvIpc>,
+    transaction: &mut MediaUpdateTransaction,
+    field: MpvMetadataField,
+) -> anyhow::Result<bool> {
+    match field {
+        MpvMetadataField::Filename => {
+            let value = ipc.get_property_value("filename").await?;
+            let Some(value) = value
+                .as_ref()
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(false);
+            };
+            transaction.set_filename(Some(value.to_string()));
+        }
+        MpvMetadataField::Duration => {
+            let mut value = ipc.get_property_value("duration").await?;
+            if value.as_ref().and_then(Value::as_f64).is_none() {
+                value = ipc.get_property_value("length").await?;
+            }
+            let Some(value) = value.as_ref().and_then(Value::as_f64) else {
+                return Ok(false);
+            };
+            transaction.set_duration(Some(value));
+        }
+        MpvMetadataField::Path => {
+            let value = ipc.get_property_value("path").await?;
+            let Some(value) = value
+                .as_ref()
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(false);
+            };
+            transaction.set_path(Some(value.to_string()));
+            transaction.set_size(None);
+        }
+    }
+    Ok(true)
+}
+
+async fn finish_media_transaction(
+    context: &MpvLineContext,
+    transaction: MediaUpdateTransaction,
+    transaction_started_loaded: bool,
+    retry_epoch: u64,
+) {
+    let app_state = context.state.upgrade();
+    let transition_guard = match app_state.as_ref() {
+        Some(app_state) if is_current_player_context(context) => {
+            Some(app_state.playback.media_transition.lock().await)
+        }
+        _ => None,
+    };
+    if !is_current_player_context(context) {
+        return;
+    }
+    let load_id = transaction.load_id();
+    let explicit_external = load_id.is_none();
+    let commit = {
+        let mut media = context.media_updates.lock();
+        if media.retry_epoch != retry_epoch {
+            debug!(
+                expected = retry_epoch,
+                actual = media.retry_epoch,
+                "Ignoring superseded mpv media transaction"
+            );
+            return;
+        }
+        if context.kind == PlayerKind::Iina
+            && explicit_external
+            && transaction.filename() == Some("iina-bkg.png")
+        {
+            context.file_loaded.store(false, Ordering::SeqCst);
+            return;
+        }
+        if explicit_external {
+            media.state.commit_external(transaction)
+        } else {
+            media.state.commit(transaction)
+        }
+    };
+    let mut failed_load = None;
+    match commit {
+        MediaCommit::Committed(snapshot) => {
+            context.ipc.commit_media_snapshot(&snapshot);
+            context.file_loaded.store(true, Ordering::SeqCst);
+            if let Some(app_state) = app_state.as_ref() {
+                if transition_guard.is_none() || !is_current_player_context(context) {
+                    return;
+                }
+                let stable = context.ipc.get_state();
+                let commit = {
+                    let _lifecycle_guard = app_state.player_lifecycle.lock().await;
+                    if !is_current_player_context(context) {
+                        return;
+                    }
+                    let player = app_state.player.lock().clone();
+                    match (explicit_external, player.as_ref()) {
+                        (true, Some(player)) => {
+                            commit_external_player_state(app_state, player, &stable).await
+                        }
+                        _ => {
+                            commit_player_state(
+                                app_state,
+                                player.as_ref(),
+                                &stable,
+                                load_id.map(LoadId),
+                            )
+                            .await
+                        }
+                    }
+                };
+                if let Err(error) = commit {
+                    warn!("Failed to commit mpv media: {}", error);
+                }
+            }
+        }
+        MediaCommit::Incomplete { load_id, missing } => {
+            context.file_loaded.store(false, Ordering::SeqCst);
+            warn!(
+                "Ignoring incomplete mpv media update; missing: {:?}",
+                missing
+            );
+            failed_load = load_id;
+        }
+        MediaCommit::MissingIdentity { load_id } => {
+            context.file_loaded.store(false, Ordering::SeqCst);
+            warn!("Ignoring mpv media update without filename or path");
+            failed_load = load_id;
+        }
+        result @ MediaCommit::Stale { .. } => {
+            debug!("Ignoring stale mpv media update: {:?}", result);
+            context
+                .file_loaded
+                .store(transaction_started_loaded, Ordering::SeqCst);
+        }
+        result @ MediaCommit::TargetMismatch { load_id, .. } => {
+            debug!("Ignoring stale mpv media update: {:?}", result);
+            failed_load = Some(load_id);
+        }
+    }
+    drop(transition_guard);
+    if let Some(load_id) = failed_load {
+        fail_media_load(context, load_id).await;
+    }
+}
+
 async fn fail_media_load(context: &MpvLineContext, load_id: u64) {
-    context.media_updates.lock().state.cancel_load(load_id);
+    let cancelled_current_load = {
+        let mut media = context.media_updates.lock();
+        media.retry_epoch = media.retry_epoch.wrapping_add(1);
+        media.transaction = None;
+        media.transaction_started_loaded = false;
+        media.state.cancel_load(load_id)
+    };
+    context.ipc.finish_generation_gate(load_id);
+    if !cancelled_current_load {
+        debug!(load_id, "Ignoring failure from a superseded mpv load");
+        return;
+    }
     context.file_loaded.store(false, Ordering::SeqCst);
-    context.ipc.set_ready(true);
     if let Some(state) = context.state.upgrade() {
         playback_runtime::fail_load(&state, LoadId(load_id)).await;
     }
 }
 
-async fn handle_untagged_end_file(
-    context: &MpvLineContext,
-    reason: &EndFileReason,
-    playlist_entry_id: Option<i64>,
-) {
-    if context.generation_tagged_loads || matches!(reason, EndFileReason::Quit) {
+fn handle_generation_start(context: &MpvLineContext, load_id: u64, target: Option<String>) {
+    if !context.ipc.start_load(load_id) {
+        debug!(load_id, "Ignoring unprepared mpv generation start");
         return;
     }
-    let redirected = matches!(reason, EndFileReason::Redirect);
-    let Some((load_id, marker_seen)) = context.ipc.end_untagged_load(playlist_entry_id, redirected)
-    else {
+    if let Some(target) = target {
+        context
+            .media_updates
+            .lock()
+            .state
+            .retarget_load(load_id, target);
+    }
+}
+
+async fn handle_end_file(
+    context: &MpvLineContext,
+    reason: &EndFileReason,
+    load_id: u64,
+    propagated: bool,
+) {
+    if matches!(reason, EndFileReason::Quit) {
+        return;
+    }
+    let Some((load_id, marker_seen)) = context.ipc.end_load(load_id, propagated) else {
         return;
     };
+    if matches!(reason, EndFileReason::Redirect) {
+        context.ipc.retire_active_load(load_id);
+        context.ipc.finish_generation_gate(load_id);
+        return;
+    }
     if !marker_seen {
         fail_media_load(context, load_id).await;
     }
@@ -664,17 +963,20 @@ async fn handle_untagged_end_file(
 
 fn update_media_transaction(transaction: &mut MediaUpdateTransaction, key: &str, value: &str) {
     let available = !value.is_empty() && value != "(unavailable)" && value != "nil";
+    if !available {
+        return;
+    }
     match key {
-        "syncplay_load_id" => {
-            transaction.set_load_id(available.then(|| value.parse::<u64>().ok()).flatten())
-        }
-        "filename" => transaction.set_filename(available.then(|| value.to_string())),
+        "syncplay_load_id" => transaction.set_load_id(value.parse::<u64>().ok()),
+        "filename" => transaction.set_filename(Some(value.to_string())),
         "path" => {
-            transaction.set_path(available.then(|| value.to_string()));
+            transaction.set_path(Some(value.to_string()));
             transaction.set_size(None);
         }
         "length" | "duration" => {
-            transaction.set_duration(available.then(|| value.parse::<f64>().ok()).flatten());
+            if let Ok(duration) = value.parse::<f64>() {
+                transaction.set_duration(Some(duration));
+            }
         }
         _ => {}
     }
@@ -869,7 +1171,35 @@ mod tests {
     use crate::network::connection::Connection;
     use crate::network::fake_server::FakeSyncplayServer;
     use crate::network::messages::{FileInfo, FileSizeInfo, ProtocolMessage};
+    use crate::player::backend::FakePlayerBackend;
+    #[cfg(unix)]
+    use tokio::io::AsyncWriteExt;
     use tokio::time::timeout;
+
+    fn start_server_load(
+        playback: &mut crate::client::playback::PlaybackState,
+        index: usize,
+        reset_position: bool,
+    ) -> LoadId {
+        assert_eq!(
+            playback.reduce(PlaybackEvent::LocalSelect {
+                index,
+                reset_position,
+            }),
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index,
+                reset_position,
+            }]
+        );
+        let effects = playback.reduce(PlaybackEvent::ServerIndex {
+            index: Some(index),
+            reset_position,
+        });
+        let [PlaybackEffect::Load { load_id, .. }] = effects.as_slice() else {
+            panic!("expected one load effect, got {effects:?}");
+        };
+        *load_id
+    }
 
     #[test]
     fn syncplay_load_id_is_collected_inside_the_media_transaction() {
@@ -879,6 +1209,202 @@ mod tests {
         update_media_transaction(&mut transaction, "syncplay_load_id", "42");
 
         assert_eq!(transaction.load_id(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn tagged_external_marker_clears_loaded_state_and_closes_the_gate() {
+        let app_state = AppState::new();
+        let ipc = Arc::new(MpvIpc::new("unused"));
+        let file_loaded = Arc::new(AtomicBool::new(true));
+        let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+        let reset_ignore_until = Arc::new(Mutex::new(None));
+        let context = test_line_context(
+            &app_state,
+            &ipc,
+            &file_loaded,
+            &media_updates,
+            &reset_ignore_until,
+        );
+
+        feed_test_line(&context, MpvLineSource::IpcLog, "<SyncplayUpdateFile>").await;
+
+        assert!(!file_loaded.load(Ordering::SeqCst));
+        assert!(!ipc.is_ready_for_send());
+    }
+
+    #[tokio::test]
+    async fn duplicate_marker_start_keeps_the_existing_transaction_and_gate_epoch() {
+        let app_state = AppState::new();
+        let ipc = Arc::new(MpvIpc::new("unused"));
+        let file_loaded = Arc::new(AtomicBool::new(true));
+        let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+        let reset_ignore_until = Arc::new(Mutex::new(None));
+        let context = test_line_context(
+            &app_state,
+            &ipc,
+            &file_loaded,
+            &media_updates,
+            &reset_ignore_until,
+        );
+
+        feed_test_line(&context, MpvLineSource::IpcLog, "<SyncplayUpdateFile>").await;
+        let first_epoch = media_updates
+            .lock()
+            .marker_epoch
+            .expect("first marker epoch missing");
+
+        feed_test_line(&context, MpvLineSource::IpcLog, "<SyncplayUpdateFile>").await;
+
+        let media = media_updates.lock();
+        assert_eq!(media.marker_epoch, Some(first_epoch));
+        assert!(media.transaction.is_some());
+        assert_eq!(media.retry_epoch, first_epoch.wrapping_add(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_generation_load_waits_for_an_external_marker_to_close() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("mpv.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let (load_tx, mut load_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut lines = BufReader::new(read_half).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let message: Value = serde_json::from_str(&line).unwrap();
+                let command = message["command"][0].as_str().unwrap();
+                if let Some(request_id) = message["request_id"].as_u64() {
+                    let response = serde_json::json!({
+                        "request_id": request_id,
+                        "error": "success"
+                    });
+                    write_half
+                        .write_all(format!("{}\n", response).as_bytes())
+                        .await
+                        .unwrap();
+                }
+                if command == "script-message-to" && message["command"][2] == "syncplay-load-file" {
+                    load_tx
+                        .send(message["command"][4].as_str().unwrap().to_string())
+                        .unwrap();
+                    break;
+                }
+            }
+        });
+
+        let mut ipc = MpvIpc::new(socket_path.to_string_lossy());
+        let _events = ipc.connect().await.unwrap();
+        let ipc = Arc::new(ipc);
+        let app_state = AppState::new();
+        let file_loaded = Arc::new(AtomicBool::new(true));
+        let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+        let reset_ignore_until = Arc::new(Mutex::new(None));
+        let context = test_line_context(
+            &app_state,
+            &ipc,
+            &file_loaded,
+            &media_updates,
+            &reset_ignore_until,
+        );
+
+        feed_test_line(&context, MpvLineSource::IpcLog, "<SyncplayUpdateFile>").await;
+        ipc.prepare_load(7);
+        ipc.load_file_generation("queued.mkv", 7, LoadfileOptionsSyntax::Legacy)
+            .await
+            .unwrap();
+
+        assert!(timeout(Duration::from_millis(100), load_rx.recv())
+            .await
+            .is_err());
+        for line in [
+            "ANS_filename=external.mkv",
+            "ANS_duration=100",
+            "ANS_path=/tmp/external.mkv",
+            "</SyncplayUpdateFile>",
+        ] {
+            feed_test_line(&context, MpvLineSource::IpcLog, line).await;
+        }
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), load_rx.recv())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("queued.mkv")
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn poll_without_a_loaded_file_uses_only_the_ready_lua_status_command() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("mpv.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut lines = BufReader::new(read_half).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let message: Value = serde_json::from_str(&line).unwrap();
+                if let Some(request_id) = message["request_id"].as_u64() {
+                    let response = serde_json::json!({
+                        "request_id": request_id,
+                        "error": "success"
+                    });
+                    write_half
+                        .write_all(format!("{}\n", response).as_bytes())
+                        .await
+                        .unwrap();
+                }
+                if message["command"][0] == "script-message-to" {
+                    status_tx.send(message["command"].clone()).unwrap();
+                }
+            }
+        });
+
+        let mut ipc = MpvIpc::new(socket_path.to_string_lossy());
+        let _events = ipc.connect().await.unwrap();
+        let app_state = AppState::new();
+        let backend = MpvBackend::new(
+            PlayerKind::Mpv,
+            ipc,
+            Arc::downgrade(&app_state),
+            Some(LoadfileOptionsSyntax::Legacy),
+            true,
+            None,
+        );
+        assert!(!backend.file_loaded.load(Ordering::SeqCst));
+
+        backend.poll_state().await.unwrap();
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), status_rx.recv())
+                .await
+                .unwrap(),
+            Some(serde_json::json!([
+                "script-message-to",
+                "syncplayintf",
+                "get_paused_and_position"
+            ]))
+        );
+        timeout(Duration::from_secs(1), async {
+            while backend.ipc.pending_request_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        backend.ipc.set_ready(false);
+        backend.poll_state().await.unwrap();
+        assert!(timeout(Duration::from_millis(100), status_rx.recv())
+            .await
+            .is_err());
+        server.abort();
     }
 
     async fn assert_mpv_lifecycle_event_clears_player_state(event: MpvPlayerEvent) {
@@ -914,6 +1440,7 @@ mod tests {
             .connect(server.host(), server.port())
             .await
             .unwrap();
+        connection.set_authenticated();
         *app_state.connection.lock() = Some(connection);
         server
     }
@@ -927,12 +1454,12 @@ mod tests {
     ) -> MpvLineContext {
         MpvLineContext {
             instance_id: 0,
+            kind: PlayerKind::Mpv,
             ipc: ipc.clone(),
             state: Arc::downgrade(app_state),
             file_loaded: file_loaded.clone(),
             media_updates: media_updates.clone(),
             reset_ignore_until: reset_ignore_until.clone(),
-            generation_tagged_loads: false,
             osc_visibility_change_compatible: true,
         }
     }
@@ -972,6 +1499,67 @@ mod tests {
         feed_test_line(&context, MpvLineSource::IpcLog, "</SyncplayUpdateFile>").await;
     }
 
+    #[cfg(unix)]
+    async fn connect_metadata_test_ipc(
+        delay_first_filename: bool,
+    ) -> (
+        Arc<MpvIpc>,
+        mpsc::UnboundedReceiver<MpvPlayerEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("mpv.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let _temp_dir = temp_dir;
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut lines = BufReader::new(read_half).lines();
+            let mut filename_requests = 0usize;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let message: Value = serde_json::from_str(&line).unwrap();
+                let command = message["command"][0].as_str().unwrap();
+                let Some(request_id) = message["request_id"].as_u64() else {
+                    continue;
+                };
+                let mut response = serde_json::json!({
+                    "request_id": request_id,
+                    "error": "success"
+                });
+                if command == "get_property" {
+                    match message["command"][1].as_str().unwrap() {
+                        "filename" => {
+                            filename_requests += 1;
+                            if delay_first_filename && filename_requests == 1 {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                response["data"] = Value::String("a.mkv".to_string());
+                            } else if filename_requests == 1 {
+                                response["error"] = Value::String("property unavailable".into());
+                            } else {
+                                response["data"] = Value::String("restored.mkv".to_string());
+                            }
+                        }
+                        "duration" | "length" => {
+                            response["data"] = serde_json::json!(123.5);
+                        }
+                        "path" => {
+                            response["data"] = Value::String("/tmp/restored.mkv".to_string());
+                        }
+                        property => panic!("unexpected metadata property: {property}"),
+                    }
+                }
+                write_half
+                    .write_all(format!("{}\n", response).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut ipc = MpvIpc::new(socket_path.to_string_lossy());
+        let events = ipc.connect().await.unwrap();
+        (Arc::new(ipc), events, server)
+    }
+
     #[test]
     fn get_state_reports_zero_position_while_recently_reset() {
         let app_state = AppState::new();
@@ -997,6 +1585,41 @@ mod tests {
 
         assert_eq!(state.position, Some(0.0));
         assert_eq!(state.paused, Some(true));
+    }
+
+    #[tokio::test]
+    async fn paused_player_without_lua_markers_triggers_the_unresponsive_watchdog() {
+        let app_state = AppState::new();
+        let backend = Arc::new(MpvBackend::new(
+            PlayerKind::Mpv,
+            MpvIpc::new("unused"),
+            Arc::downgrade(&app_state),
+            None,
+            true,
+            None,
+        ));
+        backend.file_loaded.store(true, Ordering::SeqCst);
+        backend
+            .ipc
+            .update_pause_and_position(Some(true), Some(12.0));
+        backend.ipc.set_last_position_update_for_test(
+            Instant::now() - MPV_UNRESPONSIVE_THRESHOLD - Duration::from_secs(1),
+        );
+        *app_state.player.lock() = Some(backend.clone());
+
+        let _ = backend.get_state();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if app_state.player.lock().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(app_state.player.lock().is_none());
     }
 
     #[test]
@@ -1049,6 +1672,170 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unavailable_media_metadata_retries_until_the_same_snapshot_is_complete() {
+        let app_state = AppState::new();
+        let (ipc, _events, server) = connect_metadata_test_ipc(false).await;
+        let file_loaded = Arc::new(AtomicBool::new(false));
+        let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+        let reset_ignore_until = Arc::new(Mutex::new(None));
+        let context = test_line_context(
+            &app_state,
+            &ipc,
+            &file_loaded,
+            &media_updates,
+            &reset_ignore_until,
+        );
+
+        for line in [
+            "<SyncplayUpdateFile>",
+            "ANS_filename=(unavailable)",
+            "ANS_duration=(unavailable)",
+            "ANS_path=(unavailable)",
+            "</SyncplayUpdateFile>",
+        ] {
+            feed_test_line(&context, MpvLineSource::IpcLog, line).await;
+        }
+        assert!(!file_loaded.load(Ordering::SeqCst));
+
+        timeout(Duration::from_secs(2), async {
+            while !file_loaded.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let player_state = ipc.get_state();
+        assert_eq!(player_state.filename.as_deref(), Some("restored.mkv"));
+        assert_eq!(player_state.duration, Some(123.5));
+        assert_eq!(player_state.path.as_deref(), Some("/tmp/restored.mkv"));
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_external_marker_cancels_the_previous_metadata_retry() {
+        let app_state = AppState::new();
+        let (ipc, _events, server) = connect_metadata_test_ipc(true).await;
+        let file_loaded = Arc::new(AtomicBool::new(false));
+        let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+        let reset_ignore_until = Arc::new(Mutex::new(None));
+        let context = test_line_context(
+            &app_state,
+            &ipc,
+            &file_loaded,
+            &media_updates,
+            &reset_ignore_until,
+        );
+
+        for line in [
+            "<SyncplayUpdateFile>",
+            "ANS_filename=(unavailable)",
+            "ANS_duration=100",
+            "ANS_path=/tmp/a.mkv",
+            "</SyncplayUpdateFile>",
+        ] {
+            feed_test_line(&context, MpvLineSource::IpcLog, line).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(ipc.pending_request_count(), 1);
+
+        for line in [
+            "<SyncplayUpdateFile>",
+            "ANS_filename=b.mkv",
+            "ANS_duration=200",
+            "ANS_path=/tmp/b.mkv",
+            "</SyncplayUpdateFile>",
+        ] {
+            feed_test_line(&context, MpvLineSource::IpcLog, line).await;
+        }
+        timeout(Duration::from_secs(1), async {
+            while ipc.pending_request_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ipc.get_state().filename.as_deref(), Some("b.mkv"));
+
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        let player_state = ipc.get_state();
+        assert!(file_loaded.load(Ordering::SeqCst));
+        assert_eq!(player_state.filename.as_deref(), Some("b.mkv"));
+        assert_eq!(player_state.path.as_deref(), Some("/tmp/b.mkv"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn closing_marker_epoch_is_rechecked_after_waiting_for_transition_lock() {
+        let app_state = AppState::new();
+        let ipc = Arc::new(MpvIpc::new("unused"));
+        let file_loaded = Arc::new(AtomicBool::new(false));
+        let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+        let reset_ignore_until = Arc::new(Mutex::new(None));
+        let context = test_line_context(
+            &app_state,
+            &ipc,
+            &file_loaded,
+            &media_updates,
+            &reset_ignore_until,
+        );
+        let mut transaction = media_updates.lock().state.begin_update(None);
+        transaction.set_filename(Some("a.mkv".to_string()));
+        transaction.set_duration(Some(100.0));
+        transaction.set_path(Some("/tmp/a.mkv".to_string()));
+        transaction.set_size(None);
+
+        let transition_guard = app_state.playback.media_transition.lock().await;
+        let finish_context = context.clone();
+        let finish = tokio::spawn(async move {
+            finish_media_transaction(&finish_context, transaction, false, 0).await;
+        });
+        feed_test_line(&context, MpvLineSource::IpcLog, "<SyncplayUpdateFile>").await;
+        drop(transition_guard);
+        finish.await.unwrap();
+
+        assert!(!file_loaded.load(Ordering::SeqCst));
+        assert!(ipc.get_state().filename.is_none());
+    }
+
+    #[tokio::test]
+    async fn iina_startup_placeholder_is_ignored_without_generalizing_the_filename() {
+        async fn feed_snapshot(kind: PlayerKind) -> (bool, Option<String>) {
+            let app_state = AppState::new();
+            let ipc = Arc::new(MpvIpc::new("unused"));
+            let file_loaded = Arc::new(AtomicBool::new(false));
+            let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+            let reset_ignore_until = Arc::new(Mutex::new(None));
+            let mut context = test_line_context(
+                &app_state,
+                &ipc,
+                &file_loaded,
+                &media_updates,
+                &reset_ignore_until,
+            );
+            context.kind = kind;
+            for line in [
+                "<SyncplayUpdateFile>",
+                "ANS_filename=iina-bkg.png",
+                "ANS_duration=0",
+                "ANS_path=/resources/iina-bkg.png",
+                "</SyncplayUpdateFile>",
+            ] {
+                feed_test_line(&context, MpvLineSource::IpcLog, line).await;
+            }
+            (file_loaded.load(Ordering::SeqCst), ipc.get_state().filename)
+        }
+
+        assert_eq!(feed_snapshot(PlayerKind::Iina).await, (false, None));
+        assert_eq!(
+            feed_snapshot(PlayerKind::Mpv).await,
+            (true, Some("iina-bkg.png".to_string()))
+        );
+    }
+
     #[test]
     fn stdout_cannot_duplicate_ipc_control_or_media_lines() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1093,6 +1880,113 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn nil_pause_and_position_fall_back_to_the_global_state() {
+        let app_state = AppState::new();
+        app_state
+            .client_state
+            .set_global_state(23.5, true, Some("remote".to_string()));
+        let ipc = Arc::new(MpvIpc::new("unused"));
+        let file_loaded = Arc::new(AtomicBool::new(true));
+        let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+        let reset_ignore_until = Arc::new(Mutex::new(None));
+        let context = test_line_context(
+            &app_state,
+            &ipc,
+            &file_loaded,
+            &media_updates,
+            &reset_ignore_until,
+        );
+
+        feed_test_line(&context, MpvLineSource::IpcLog, "<paused=nil, pos=nil>").await;
+
+        let state = ipc.get_state();
+        assert_eq!(state.paused, Some(true));
+        assert_eq!(state.position, Some(23.5));
+    }
+
+    #[tokio::test]
+    async fn manual_open_supersedes_a_pending_load_without_discarding_a_written_marker() {
+        let app_state = AppState::new();
+        let player: Arc<dyn PlayerBackend> = Arc::new(FakePlayerBackend::new(PlayerKind::Mpv));
+        *app_state.player.lock() = Some(player.clone());
+        let load_id = {
+            let mut playback = app_state.playback.state.lock();
+            playback.reduce(PlaybackEvent::ServerPlaylist {
+                items: vec!["requested.mkv".into(), "manual.mkv".into()],
+            });
+            start_server_load(&mut playback, 0, true)
+        };
+        let lease = playback_runtime::claim_load_for_issue(
+            &app_state,
+            load_id,
+            "requested.mkv",
+            "/media/requested.mkv",
+            player,
+        )
+        .unwrap();
+
+        let ipc = Arc::new(MpvIpc::new("unused"));
+        let file_loaded = Arc::new(AtomicBool::new(false));
+        let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+        media_updates
+            .lock()
+            .state
+            .begin_load(load_id.0, "/media/requested.mkv");
+        let reset_ignore_until = Arc::new(Mutex::new(None));
+        let context = test_line_context(
+            &app_state,
+            &ipc,
+            &file_loaded,
+            &media_updates,
+            &reset_ignore_until,
+        );
+
+        for line in [
+            "<SyncplayUpdateFile>",
+            "ANS_filename=manual.mkv",
+            "ANS_duration=200",
+            "ANS_path=/media/manual.mkv",
+            "</SyncplayUpdateFile>",
+        ] {
+            feed_test_line(&context, MpvLineSource::IpcLog, line).await;
+        }
+        assert!(lease.is_cancelled());
+        let playback = app_state.playback.snapshot();
+        assert_eq!(
+            playback
+                .confirmed_media
+                .as_ref()
+                .map(|media| media.name.as_str()),
+            Some("manual.mkv")
+        );
+        assert!(playback.pending_load.is_none());
+        assert_eq!(
+            playback.interrupted_load.as_ref().map(|load| load.id),
+            Some(load_id)
+        );
+
+        for line in [
+            "<SyncplayUpdateFile>".to_string(),
+            format!("ANS_syncplay_load_id={}", load_id.0),
+            "ANS_filename=requested.mkv".to_string(),
+            "ANS_duration=100".to_string(),
+            "ANS_path=/media/requested.mkv".to_string(),
+            "</SyncplayUpdateFile>".to_string(),
+        ] {
+            feed_test_line(&context, MpvLineSource::IpcLog, &line).await;
+        }
+        let playback = app_state.playback.snapshot();
+        assert_eq!(
+            playback
+                .confirmed_media
+                .as_ref()
+                .map(|media| media.name.as_str()),
+            Some("requested.mkv")
+        );
+        assert!(playback.interrupted_load.is_none());
+    }
+
     #[test]
     fn stale_generation_marker_preserves_the_current_media_gate() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1103,14 +1997,13 @@ mod tests {
             let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
             let reset_ignore_until = Arc::new(Mutex::new(None));
             media_updates.lock().state.begin_load(2, "b.mkv");
-            let mut context = test_line_context(
+            let context = test_line_context(
                 &app_state,
                 &ipc,
                 &file_loaded,
                 &media_updates,
                 &reset_ignore_until,
             );
-            context.generation_tagged_loads = true;
 
             for line in [
                 "<SyncplayUpdateFile>",
@@ -1159,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn untagged_markers_follow_socket_write_order_instead_of_active_generation() {
+    fn explicit_markers_do_not_commit_a_superseded_generation() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let app_state = AppState::new();
@@ -1173,8 +2066,8 @@ mod tests {
                 media.state.cancel_load(1);
                 media.state.begin_load(2, "b.mkv");
             }
-            ipc.record_untagged_load_for_test(1);
-            ipc.start_untagged_load(Some(11));
+            ipc.record_load_for_test(1);
+            ipc.start_load(1);
             let context = test_line_context(
                 &app_state,
                 &ipc,
@@ -1185,6 +2078,7 @@ mod tests {
 
             for line in [
                 "<SyncplayUpdateFile>",
+                "ANS_syncplay_load_id=1",
                 "Playing: /tmp/a.mkv",
                 "ANS_filename=a.mkv",
                 "ANS_duration=100",
@@ -1199,11 +2093,12 @@ mod tests {
                 Some(2)
             );
 
-            ipc.record_untagged_load_for_test(2);
-            ipc.start_untagged_load(Some(12));
-            handle_untagged_end_file(&context, &EndFileReason::Error, Some(11)).await;
+            ipc.record_load_for_test(2);
+            ipc.start_load(2);
+            handle_end_file(&context, &EndFileReason::Error, 1, false).await;
             for line in [
                 "<SyncplayUpdateFile>",
+                "ANS_syncplay_load_id=2",
                 "ANS_filename=b.mkv",
                 "ANS_duration=120",
                 "ANS_path=/tmp/b.mkv",
@@ -1218,7 +2113,7 @@ mod tests {
     }
 
     #[test]
-    fn untagged_end_file_error_retires_orphan_before_next_marker() {
+    fn explicit_end_file_error_retires_orphan_before_next_marker() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let app_state = AppState::new();
@@ -1232,8 +2127,8 @@ mod tests {
                 media.state.cancel_load(1);
                 media.state.begin_load(2, "working.mkv");
             }
-            ipc.record_untagged_load_for_test(1);
-            ipc.start_untagged_load(Some(11));
+            ipc.record_load_for_test(1);
+            ipc.start_load(1);
             let context = test_line_context(
                 &app_state,
                 &ipc,
@@ -1242,11 +2137,12 @@ mod tests {
                 &reset_ignore_until,
             );
 
-            handle_untagged_end_file(&context, &EndFileReason::Error, Some(11)).await;
-            ipc.record_untagged_load_for_test(2);
-            ipc.start_untagged_load(Some(12));
+            handle_end_file(&context, &EndFileReason::Error, 1, false).await;
+            ipc.record_load_for_test(2);
+            ipc.start_load(2);
             for line in [
                 "<SyncplayUpdateFile>",
+                "ANS_syncplay_load_id=2",
                 "ANS_filename=working.mkv",
                 "ANS_duration=120",
                 "ANS_path=/tmp/working.mkv",
@@ -1334,7 +2230,7 @@ mod tests {
             assert_eq!(state.paused, Some(true));
             assert_eq!(
                 app_state.client_state.get_file().as_deref(),
-                Some("delayed-file.mkv")
+                Some("**Hidden filename**")
             );
             assert_eq!(app_state.client_state.get_file_duration(), Some(123.5));
             assert_eq!(outbound.name.as_deref(), Some("**Hidden filename**"));
@@ -1390,14 +2286,7 @@ mod tests {
             let load_id = {
                 let mut playback = app_state.playback.state.lock();
                 playback.playlist_items = vec!["broken.mkv".to_string()];
-                let effects = playback.reduce(PlaybackEvent::LocalSelect {
-                    index: 0,
-                    reset_position: true,
-                });
-                let [PlaybackEffect::Load { load_id, .. }] = effects.as_slice() else {
-                    panic!("expected one load effect");
-                };
-                let load_id = *load_id;
+                let load_id = start_server_load(&mut playback, 0, true);
                 playback.reduce(PlaybackEvent::LoadStarted { load_id });
                 load_id
             };
@@ -1422,6 +2311,162 @@ mod tests {
             );
             assert!(backend.media_updates.lock().state.is_loading());
         });
+    }
+
+    #[test]
+    fn superseded_end_file_cannot_clear_the_committed_media_gate() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let app_state = AppState::new();
+            let ipc = Arc::new(MpvIpc::new("unused"));
+            let file_loaded = Arc::new(AtomicBool::new(true));
+            let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+            let reset_ignore_until = Arc::new(Mutex::new(None));
+            {
+                let mut media = media_updates.lock();
+                media.state.begin_load(1, "old.mkv");
+                media.state.cancel_load(1);
+                media.state.begin_load(2, "current.mkv");
+                let mut update = media.state.begin_update(Some(2));
+                update.set_filename(Some("current.mkv".to_string()));
+                update.set_path(Some("/media/current.mkv".to_string()));
+                update.set_duration(Some(90.0));
+                update.set_size(Some(1));
+                assert!(matches!(
+                    media.state.commit(update),
+                    MediaCommit::Committed(_)
+                ));
+            }
+            let context = test_line_context(
+                &app_state,
+                &ipc,
+                &file_loaded,
+                &media_updates,
+                &reset_ignore_until,
+            );
+
+            fail_media_load(&context, 1).await;
+
+            assert!(file_loaded.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn tagged_end_file_failure_settles_only_the_matching_load() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for reason in [EndFileReason::Error, EndFileReason::Stop] {
+                let app_state = AppState::new();
+                let backend = Arc::new(MpvBackend::new(
+                    PlayerKind::Mpv,
+                    MpvIpc::new("unused"),
+                    Arc::downgrade(&app_state),
+                    Some(LoadfileOptionsSyntax::Legacy),
+                    true,
+                    None,
+                ));
+                *app_state.player.lock() = Some(backend.clone() as Arc<dyn PlayerBackend>);
+                let load_id = {
+                    let mut playback = app_state.playback.state.lock();
+                    playback.playlist_items = vec!["broken.mkv".to_string()];
+                    let load_id = start_server_load(&mut playback, 0, true);
+                    playback.reduce(PlaybackEvent::LoadStarted { load_id });
+                    load_id
+                };
+                backend.begin_file_load(load_id.0, "broken.mkv");
+                backend.ipc.record_load_for_test(load_id.0);
+
+                let (tx, rx) = mpsc::unbounded_channel();
+                backend.spawn_event_loop(rx);
+                tx.send(MpvPlayerEvent::GenerationLoadStarted {
+                    load_id: Some(load_id.0),
+                    target: Some("broken.mkv".to_string()),
+                })
+                .unwrap();
+                tx.send(MpvPlayerEvent::GenerationLoadEnded {
+                    load_id: Some(load_id.0),
+                    reason,
+                    propagated: false,
+                })
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                assert!(app_state.playback.snapshot().pending_load.is_none());
+                assert!(!backend.media_updates.lock().state.is_loading());
+            }
+        });
+    }
+
+    #[test]
+    fn legacy_redirect_retires_attribution_without_failing_the_load() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let app_state = AppState::new();
+            let backend = Arc::new(MpvBackend::new(
+                PlayerKind::Mpv,
+                MpvIpc::new("unused"),
+                Arc::downgrade(&app_state),
+                Some(LoadfileOptionsSyntax::Legacy),
+                true,
+                None,
+            ));
+            let load_id = 7;
+            backend.begin_file_load(load_id, "playlist.m3u");
+            assert!(backend.ipc.start_load(load_id));
+
+            let context = backend.line_context();
+            handle_end_file(&context, &EndFileReason::Redirect, load_id, false).await;
+
+            assert!(backend.media_updates.lock().state.is_loading());
+            assert!(!backend.ipc.has_tracked_load_for_test(load_id));
+            assert!(!backend.ipc.is_load_active(load_id));
+        });
+    }
+
+    #[test]
+    fn structured_start_retargets_only_the_matching_active_generation() {
+        let app_state = AppState::new();
+        let ipc = Arc::new(MpvIpc::new("unused"));
+        let file_loaded = Arc::new(AtomicBool::new(false));
+        let media_updates = Arc::new(Mutex::new(MpvMediaUpdates::default()));
+        let reset_ignore_until = Arc::new(Mutex::new(None));
+        let context = test_line_context(
+            &app_state,
+            &ipc,
+            &file_loaded,
+            &media_updates,
+            &reset_ignore_until,
+        );
+
+        media_updates
+            .lock()
+            .state
+            .begin_load(7, "/media/playlist.m3u");
+        ipc.prepare_load(7);
+        handle_generation_start(&context, 7, Some("/media/redirect-child.mkv".to_string()));
+        assert_eq!(
+            media_updates
+                .lock()
+                .state
+                .latest_load()
+                .map(|load| load.target.as_str()),
+            Some("/media/redirect-child.mkv")
+        );
+
+        media_updates
+            .lock()
+            .state
+            .begin_load(8, "/media/current.mkv");
+        ipc.prepare_load(9);
+        handle_generation_start(&context, 9, Some("/media/stale-child.mkv".to_string()));
+        assert_eq!(
+            media_updates
+                .lock()
+                .state
+                .latest_load()
+                .map(|load| load.target.as_str()),
+            Some("/media/current.mkv")
+        );
     }
 
     #[test]

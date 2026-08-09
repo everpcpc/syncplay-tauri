@@ -98,6 +98,10 @@ pub trait PlayerBackend: Send + Sync {
     async fn load_file_generation(&self, path: &str, _load_id: u64) -> anyhow::Result<()> {
         self.load_file(path).await
     }
+    async fn settle_media_change(&self, paused: bool, position: f64) -> anyhow::Result<()> {
+        self.set_paused(paused).await?;
+        self.set_position(position).await
+    }
     fn reports_atomic_media_commits(&self) -> bool {
         false
     }
@@ -142,6 +146,8 @@ struct FakePlayerInner {
     connected: bool,
     load_delay: Option<std::time::Duration>,
     poll_delay: Option<std::time::Duration>,
+    settle_delay: Option<std::time::Duration>,
+    settle_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -162,6 +168,8 @@ impl FakePlayerBackend {
                 connected: true,
                 load_delay: None,
                 poll_delay: None,
+                settle_delay: None,
+                settle_error: None,
             })),
         }
     }
@@ -176,6 +184,8 @@ impl FakePlayerBackend {
                 connected: true,
                 load_delay: None,
                 poll_delay: None,
+                settle_delay: None,
+                settle_error: None,
             })),
         }
     }
@@ -202,6 +212,14 @@ impl FakePlayerBackend {
 
     pub fn set_poll_delay(&self, delay: std::time::Duration) {
         self.inner.lock().poll_delay = Some(delay);
+    }
+
+    pub fn set_settle_delay(&self, delay: std::time::Duration) {
+        self.inner.lock().settle_delay = Some(delay);
+    }
+
+    pub fn set_settle_error(&self, error: impl Into<String>) {
+        self.inner.lock().settle_error = Some(error.into());
     }
 }
 
@@ -299,6 +317,25 @@ impl PlayerBackend for FakePlayerBackend {
             .map(|name| name.to_string())
             .or_else(|| Some(path.to_string()));
         Ok(())
+    }
+
+    async fn settle_media_change(&self, paused: bool, position: f64) -> anyhow::Result<()> {
+        if matches!(self.kind(), PlayerKind::MpcHc | PlayerKind::MpcBe) {
+            self.set_paused(true).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        self.set_paused(paused).await?;
+        let (delay, error) = {
+            let inner = self.inner.lock();
+            (inner.settle_delay, inner.settle_error.clone())
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(error) = error {
+            anyhow::bail!(error);
+        }
+        self.set_position(position).await
     }
 
     fn set_features(&self) -> anyhow::Result<()> {

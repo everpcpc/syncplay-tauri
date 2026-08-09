@@ -102,6 +102,8 @@ fn main() {
             commands::chat::send_chat_message,
             commands::room::change_room,
             commands::room::set_ready,
+            commands::room::create_managed_room,
+            commands::room::identify_as_controller,
             commands::playlist::update_playlist,
             commands::playlist::check_playlist_items,
             commands::config::get_config,

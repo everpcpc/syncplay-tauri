@@ -180,6 +180,14 @@ pub(crate) struct LoadLease {
     cancelled: CancellationToken,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MediaLoadStartupLease {
+    load_id: LoadId,
+    target: String,
+    media_action_epoch: u64,
+    connection_generation: u64,
+}
+
 impl LoadLease {
     pub(crate) fn cancelled(&self) -> impl Future<Output = ()> + '_ {
         self.cancelled.cancelled()
@@ -267,10 +275,11 @@ pub(crate) async fn dispatch_all_outcome(
     events: impl IntoIterator<Item = PlaybackEvent>,
 ) -> DispatchOutcome {
     let _dispatch_guard = state.playback.dispatch.lock().await;
-    dispatch_locked(state, events)
+    dispatch_all_outcome_locked(state, events)
 }
 
-fn dispatch_locked(
+/// Dispatch events while the caller holds `state.playback.dispatch`.
+pub(crate) fn dispatch_all_outcome_locked(
     state: &Arc<AppState>,
     events: impl IntoIterator<Item = PlaybackEvent>,
 ) -> DispatchOutcome {
@@ -281,6 +290,7 @@ fn dispatch_locked(
     let mut effects = Vec::new();
     let mut result = DispatchResult::default();
     let mut cancel_active = false;
+    let mut preserve_superseded_load = false;
     let mut playlist_replaced = false;
     let mut clear_latest_generation = false;
     let mut invalidate_media_actions = false;
@@ -290,11 +300,17 @@ fn dispatch_locked(
             let external_media = matches!(
                 &event,
                 PlaybackEvent::PlayerMediaCommitted { load_id: None, .. }
+                    | PlaybackEvent::PlayerMediaOpenedExternally { .. }
             );
+            let explicit_external_media =
+                matches!(&event, PlaybackEvent::PlayerMediaOpenedExternally { .. });
             cancel_active |= matches!(
                 &event,
-                PlaybackEvent::PlayerDisconnected | PlaybackEvent::Reset
+                PlaybackEvent::PlayerDisconnected
+                    | PlaybackEvent::Reset
+                    | PlaybackEvent::PlayerMediaOpenedExternally { .. }
             );
+            preserve_superseded_load |= explicit_external_media;
             invalidate_media_actions |= matches!(&event, PlaybackEvent::Reconnect);
             playlist_replaced |= matches!(&event, PlaybackEvent::ServerPlaylist { .. });
             #[cfg(test)]
@@ -305,55 +321,10 @@ fn dispatch_locked(
                 let room = state.client_state.get_room();
                 state.playlist.update_previous_playlist(items, &room);
             }
-            let committed_media = match &event {
-                PlaybackEvent::PlayerMediaCommitted { load_id, media } => {
-                    let recognized_load = load_id.filter(|load_id| {
-                        playback
-                            .pending_load
-                            .as_ref()
-                            .filter(|pending| pending.id == *load_id)
-                            .or_else(|| {
-                                playback
-                                    .interrupted_load
-                                    .as_ref()
-                                    .filter(|pending| pending.id == *load_id)
-                            })
-                            .is_some()
-                    });
-                    let reset_position = recognized_load.and_then(|load_id| {
-                        playback
-                            .pending_load
-                            .as_ref()
-                            .filter(|pending| pending.id == load_id)
-                            .or_else(|| {
-                                playback
-                                    .interrupted_load
-                                    .as_ref()
-                                    .filter(|pending| pending.id == load_id)
-                            })
-                            .map(|pending| pending.reset_position)
-                    });
-                    Some((media.clone(), recognized_load, reset_position))
-                }
-                _ => None,
-            };
-            let event_effects = playback.reduce(event);
-            if let Some((media, recognized_load, reset_position)) = committed_media {
-                let accepted = event_effects
-                    .iter()
-                    .any(|effect| matches!(effect, PlaybackEffect::SendFile { .. }));
-                result.media_accepted |= accepted;
-                clear_latest_generation |= accepted && external_media;
-                invalidate_media_actions |= accepted && external_media;
-                result.media_reset |= accepted && reset_position.unwrap_or(false);
-                result.media_settled |= recognized_load.is_some()
-                    || accepted
-                    || (playback.pending_load.is_none()
-                        && playback.confirmed_media.as_ref() == Some(&media));
-                if recognized_load.is_some() {
-                    result.completed_load = recognized_load;
-                }
-            }
+            let (event_effects, event_result) = reduce_playback_event(&mut playback, event);
+            result.merge(event_result);
+            clear_latest_generation |= event_result.media_accepted && external_media;
+            invalidate_media_actions |= event_result.media_accepted && external_media;
             effects.extend(event_effects);
         }
 
@@ -371,8 +342,10 @@ fn dispatch_locked(
                 .filter(|load| !playback.playlist_items.contains(&load.target))
                 .and_then(|_| state.playback.cancel_active_load())
         };
-        if let Some(load) = &superseded {
-            playback.reduce(PlaybackEvent::LoadFailed { load_id: load.id });
+        if !preserve_superseded_load {
+            if let Some(load) = &superseded {
+                playback.reduce(PlaybackEvent::LoadFailed { load_id: load.id });
+            }
         }
         if !shared_playlists {
             playback.proposed_index = None;
@@ -422,6 +395,86 @@ fn dispatch_locked(
     }
 }
 
+impl DispatchResult {
+    fn merge(&mut self, other: Self) {
+        self.media_accepted |= other.media_accepted;
+        self.media_settled |= other.media_settled;
+        self.media_reset |= other.media_reset;
+        if other.completed_load.is_some() {
+            self.completed_load = other.completed_load;
+        }
+    }
+}
+
+fn reduce_playback_event(
+    playback: &mut PlaybackState,
+    event: PlaybackEvent,
+) -> (Vec<PlaybackEffect>, DispatchResult) {
+    let committed_media = match &event {
+        PlaybackEvent::PlayerMediaCommitted { load_id, media } => {
+            let recognized_load = load_id.filter(|load_id| {
+                playback
+                    .pending_load
+                    .as_ref()
+                    .filter(|pending| pending.id == *load_id)
+                    .or_else(|| {
+                        playback
+                            .interrupted_load
+                            .as_ref()
+                            .filter(|pending| pending.id == *load_id)
+                    })
+                    .is_some()
+            });
+            let reset_position = recognized_load.and_then(|load_id| {
+                playback
+                    .pending_load
+                    .as_ref()
+                    .filter(|pending| pending.id == load_id)
+                    .or_else(|| {
+                        playback
+                            .interrupted_load
+                            .as_ref()
+                            .filter(|pending| pending.id == load_id)
+                    })
+                    .map(|pending| pending.reset_position)
+            });
+            Some((media.clone(), recognized_load, reset_position))
+        }
+        PlaybackEvent::PlayerMediaOpenedExternally { media } => Some((media.clone(), None, None)),
+        _ => None,
+    };
+    let effects = playback.reduce(event);
+    let Some((media, recognized_load, reset_position)) = committed_media else {
+        return (effects, DispatchResult::default());
+    };
+    let accepted = effects
+        .iter()
+        .any(|effect| matches!(effect, PlaybackEffect::SendFile { .. }));
+    (
+        effects,
+        DispatchResult {
+            media_accepted: accepted,
+            media_settled: recognized_load.is_some()
+                || accepted
+                || (playback.pending_load.is_none()
+                    && playback.confirmed_media.as_ref() == Some(&media)),
+            media_reset: accepted && reset_position.unwrap_or(false),
+            completed_load: recognized_load,
+        },
+    )
+}
+
+/// Preview an event against a cloned reducer state without executing effects.
+/// The caller must hold `state.playback.dispatch` until the matching dispatch.
+pub(crate) fn preview_playback_event(
+    state: &Arc<AppState>,
+    event: PlaybackEvent,
+) -> DispatchResult {
+    let mut playback = state.playback.state.lock().clone();
+    let (_, result) = reduce_playback_event(&mut playback, event);
+    result
+}
+
 pub async fn local_select(
     state: &Arc<AppState>,
     index: usize,
@@ -431,7 +484,7 @@ pub async fn local_select(
     if index >= state.playback.state.lock().playlist_items.len() {
         return Err("Invalid playlist index".to_string());
     }
-    let outcome = dispatch_locked(
+    let outcome = dispatch_all_outcome_locked(
         state,
         [PlaybackEvent::LocalSelect {
             index,
@@ -478,7 +531,7 @@ pub async fn local_step(
             },
         }
     };
-    let outcome = dispatch_locked(
+    let outcome = dispatch_all_outcome_locked(
         state,
         [PlaybackEvent::LocalSelect {
             index,
@@ -518,6 +571,9 @@ pub async fn advance_after_eof(
                 .confirmed_media
                 .as_ref()
                 .is_none_or(|media| media.name != expected_media)
+            || playback.pending_load.is_some()
+            || playback.interrupted_load.is_some()
+            || playback.media_uncertain
         {
             return Ok(EofAction::None);
         }
@@ -545,13 +601,7 @@ pub async fn advance_after_eof(
         }
         Decision::Load(index) => index,
     };
-    let outcome = dispatch_locked(
-        state,
-        [PlaybackEvent::LocalSelect {
-            index,
-            reset_position: true,
-        }],
-    );
+    let outcome = dispatch_all_outcome_locked(state, [PlaybackEvent::EofAdvance { index }]);
     if let Some(error) = outcome.effect_error {
         return Err(error);
     }
@@ -723,7 +773,7 @@ pub fn confirmed_media(state: &Arc<AppState>) -> Option<CommittedMedia> {
 pub(crate) async fn media_index_refresh_finished(state: &Arc<AppState>) {
     let _dispatch_guard = state.playback.dispatch.lock().await;
     state.media_index.finish_refresh();
-    let outcome = dispatch_locked(state, [PlaybackEvent::RetryPending]);
+    let outcome = dispatch_all_outcome_locked(state, [PlaybackEvent::RetryPending]);
     if let Some(error) = outcome.effect_error {
         tracing::warn!("Failed to retry pending media after index refresh: {error}");
     }
@@ -746,8 +796,9 @@ async fn execute_load(
     load_id: crate::client::playback::LoadId,
     target: &str,
     reset_position: bool,
+    startup_lease: &MediaLoadStartupLease,
 ) -> Result<(), String> {
-    match load_media_by_name(state, target, reset_position, load_id).await {
+    match load_media_by_name(state, target, reset_position, load_id, startup_lease).await {
         Ok(started) => {
             let duration = if started.is_stream {
                 Duration::from_secs(120)
@@ -790,7 +841,7 @@ async fn settle_missing_media_load(state: &Arc<AppState>, load_id: LoadId, targe
     } else {
         vec![PlaybackEvent::LoadFailed { load_id }]
     };
-    let outcome = dispatch_locked(state, events);
+    let outcome = dispatch_all_outcome_locked(state, events);
     if let Some(error) = outcome.effect_error {
         tracing::warn!("Failed to settle unavailable media load: {error}");
     }
@@ -867,6 +918,34 @@ pub(crate) fn is_current_load(state: &Arc<AppState>, load_id: LoadId, target: &s
         .is_some_and(|pending| pending.id == load_id && pending.target == target)
 }
 
+fn capture_media_load_startup(
+    state: &Arc<AppState>,
+    load_id: LoadId,
+    target: &str,
+) -> Option<MediaLoadStartupLease> {
+    if !state.is_connected() || !is_current_load(state, load_id, target) {
+        return None;
+    }
+    let lease = MediaLoadStartupLease {
+        load_id,
+        target: target.to_string(),
+        media_action_epoch: state.playback.media_action_epoch.load(Ordering::SeqCst),
+        connection_generation: state.connection_session_generation.load(Ordering::Acquire),
+    };
+    is_current_media_load_startup(state, &lease).then_some(lease)
+}
+
+pub(crate) fn is_current_media_load_startup(
+    state: &Arc<AppState>,
+    lease: &MediaLoadStartupLease,
+) -> bool {
+    state.is_connected()
+        && state.connection_session_generation.load(Ordering::Acquire)
+            == lease.connection_generation
+        && state.playback.media_action_epoch.load(Ordering::SeqCst) == lease.media_action_epoch
+        && is_current_load(state, lease.load_id, &lease.target)
+}
+
 pub(crate) async fn fail_load(state: &Arc<AppState>, load_id: LoadId) {
     let _transition_guard = state.playback.media_transition.lock().await;
     let _dispatch_guard = state.playback.dispatch.lock().await;
@@ -908,7 +987,12 @@ fn spawn_load_effect(state: &Arc<AppState>, effect: PlaybackEffect) {
         if !is_current_load(&state, load_id, &target) {
             return;
         }
-        if let Err(error) = execute_load(&state, load_id, &target, reset_position).await {
+        let Some(startup_lease) = capture_media_load_startup(&state, load_id, &target) else {
+            return;
+        };
+        if let Err(error) =
+            execute_load(&state, load_id, &target, reset_position, &startup_lease).await
+        {
             tracing::warn!(
                 load_id = load_id.0,
                 "Failed to execute player load: {}",
@@ -942,7 +1026,9 @@ mod tests {
     use crate::network::connection::Connection;
     use crate::network::fake_server::FakeSyncplayServer;
     use crate::network::messages::ProtocolMessage;
-    use crate::player::backend::{FakePlayerBackend, FakePlayerCommand, PlayerBackend, PlayerKind};
+    use crate::player::backend::{
+        FakePlayerBackend, FakePlayerCommand, FakePlayerFactory, PlayerBackend, PlayerKind,
+    };
     use crate::player::properties::PlayerState;
     use std::time::Duration;
     use tokio::time::timeout;
@@ -970,6 +1056,7 @@ mod tests {
             .connect(server.host(), server.port())
             .await
             .unwrap();
+        connection.set_authenticated();
         *state.connection.lock() = Some(connection);
 
         replace_playlist(
@@ -979,7 +1066,15 @@ mod tests {
         )
         .await
         .unwrap();
+        state.playback.state.lock().received_server_index = true;
         (state, player, server, directory)
+    }
+
+    async fn local_select_and_echo(state: &Arc<AppState>, index: usize, reset_position: bool) {
+        local_select(state, index, reset_position).await.unwrap();
+        server_playlist_and_index(state, None, Some((Some(index), reset_position)))
+            .await
+            .unwrap();
     }
 
     async fn wait_for_load_count(player: &FakePlayerBackend, expected: usize) {
@@ -998,6 +1093,174 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    async fn wait_for_media_transition_to_be_held(state: &Arc<AppState>) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if state.playback.media_transition.try_lock().is_err() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("load task did not acquire the media transition lock");
+    }
+
+    #[tokio::test]
+    async fn stale_mplayer_load_cannot_restart_player_after_manual_disconnect() {
+        let (state, _player, server, _directory) = fixture().await;
+        state.config.lock().player.player_path = "mplayer".to_string();
+        state.player.lock().take();
+        let factory = Arc::new(FakePlayerFactory::default());
+        *state.fake_player_factory.lock() = Some(factory.clone());
+        let startup_blocker = state.player_lifecycle.lock().await;
+
+        local_select_and_echo(&state, 1, true).await;
+        assert_eq!(
+            state
+                .playback
+                .snapshot()
+                .pending_load
+                .as_ref()
+                .map(|load| load.target.as_str()),
+            Some("b.mkv")
+        );
+        wait_for_media_transition_to_be_held(&state).await;
+        let dispatch_probe = state
+            .playback
+            .dispatch
+            .try_lock()
+            .expect("a lifecycle-blocked load must not hold the dispatch lock");
+        drop(dispatch_probe);
+
+        let disconnect_state = state.clone();
+        let disconnect = tokio::spawn(async move {
+            crate::commands::connection::disconnect_from_server_state(&disconnect_state).await
+        });
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state.connection.lock().is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(startup_blocker);
+        disconnect.await.unwrap().unwrap();
+
+        assert_eq!(factory.launch_count(), 0);
+        assert!(state.player.lock().is_none());
+        assert!(!*state.player_connecting.lock());
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn superseded_mplayer_startup_cannot_launch_with_the_old_pending_media() {
+        let (state, _player, server, _directory) = fixture().await;
+        state.config.lock().player.player_path = "mplayer".to_string();
+        state.player.lock().take();
+        let factory = Arc::new(FakePlayerFactory::default());
+        *state.fake_player_factory.lock() = Some(factory.clone());
+        let startup_blocker = state.player_lifecycle.lock().await;
+
+        local_select_and_echo(&state, 1, true).await;
+        wait_for_media_transition_to_be_held(&state).await;
+        let dispatch_probe = state
+            .playback
+            .dispatch
+            .try_lock()
+            .expect("a lifecycle-blocked load must not hold the dispatch lock");
+        drop(dispatch_probe);
+        timeout(
+            Duration::from_secs(1),
+            local_select_and_echo(&state, 2, true),
+        )
+        .await
+        .expect("superseding dispatch was blocked behind player startup");
+        assert_eq!(
+            state
+                .playback
+                .snapshot()
+                .pending_load
+                .as_ref()
+                .map(|load| load.target.as_str()),
+            Some("c.mkv")
+        );
+        drop(startup_blocker);
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if factory.launch_count() == 1 && state.is_player_connected() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("current MPlayer load did not launch");
+        assert_eq!(factory.launch_count(), 1);
+        assert_eq!(
+            state
+                .playback
+                .snapshot()
+                .pending_load
+                .as_ref()
+                .map(|load| load.target.as_str()),
+            Some("c.mkv")
+        );
+
+        crate::commands::connection::disconnect_from_server_state(&state)
+            .await
+            .unwrap();
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn media_commit_preview_is_pure_and_matches_the_locked_dispatch_result() {
+        let state = AppState::new();
+        let media = CommittedMedia::new("movie.mkv", Some(12), Some(42.0));
+        let before = state.playback.snapshot();
+        let _dispatch_guard = state.playback.dispatch.lock().await;
+
+        let event = PlaybackEvent::PlayerMediaCommitted {
+            load_id: None,
+            media,
+        };
+        let preview = preview_playback_event(&state, event.clone());
+
+        assert!(preview.media_accepted);
+        assert_eq!(state.playback.snapshot(), before);
+        assert!(state.client_state.get_file().is_none());
+
+        let outcome = dispatch_all_outcome_locked(&state, [event]);
+        assert_eq!(outcome.result, preview);
+    }
+
+    #[tokio::test]
+    async fn explicit_external_preview_matches_its_superseding_dispatch() {
+        let state = AppState::new();
+        let mut playback = PlaybackState::new(vec!["requested.mkv".to_string()]);
+        playback.reduce(PlaybackEvent::LocalSelect {
+            index: 0,
+            reset_position: true,
+        });
+        *state.playback.state.lock() = playback;
+        let before = state.playback.snapshot();
+        let event = PlaybackEvent::PlayerMediaOpenedExternally {
+            media: CommittedMedia::new("manual.mkv", Some(12), Some(42.0)),
+        };
+        let _dispatch_guard = state.playback.dispatch.lock().await;
+
+        let preview = preview_playback_event(&state, event.clone());
+
+        assert!(preview.media_accepted);
+        assert_eq!(state.playback.snapshot(), before);
+        let outcome = dispatch_all_outcome_locked(&state, [event]);
+        assert_eq!(outcome.result, preview);
     }
 
     async fn wait_for_pending_status(state: &Arc<AppState>, expected: PendingLoadStatus) {
@@ -1033,10 +1296,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_selection_loads_once_and_announces_only_after_commit() {
+    async fn local_selection_announces_then_server_echo_loads_and_commit_sends_only_file() {
         let (state, player, mut server, _directory) = fixture().await;
 
         local_select(&state, 1, true).await.unwrap();
+        assert!(state.playback.snapshot().pending_load.is_none());
+        assert!(!player
+            .commands()
+            .iter()
+            .any(|command| matches!(command, FakePlayerCommand::LoadFile(_))));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::Set { Set }
+                if Set.playlist_index.as_ref().and_then(|update| update.index) == Some(1)
+                    && Set.file.is_none()
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::State { State }
+                if State.playstate.as_ref().is_some_and(|playstate| {
+                    playstate.position == 0.0 && playstate.paused
+                })
+        ));
+
+        server_playlist_and_index(&state, None, Some((Some(1), true)))
+            .await
+            .unwrap();
         wait_for_load_count(&player, 1).await;
         let pending = state.playback.snapshot().pending_load.unwrap();
         assert_eq!(pending.target, "b.mkv");
@@ -1075,24 +1366,24 @@ mod tests {
         assert!(commit.media_accepted);
         assert!(commit.media_reset);
 
-        let mut saw_file = false;
-        let mut saw_index = false;
-        while !saw_index {
-            let message = timeout(Duration::from_secs(1), server.next_received())
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server.next_received())
                 .await
                 .unwrap()
-                .unwrap();
-            if let ProtocolMessage::Set { Set } = message {
-                if Set.file.is_some() {
-                    assert!(!saw_index, "file must be announced before playlist index");
-                    saw_file = true;
-                }
-                if Set.playlist_index.is_some() {
-                    assert!(saw_file, "playlist index must wait for confirmed media");
-                    saw_index = true;
-                }
-            }
-        }
+                .unwrap(),
+            ProtocolMessage::Set { Set }
+                if Set.file.is_some() && Set.playlist_index.is_none()
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::List { .. }
+        ));
+        assert!(timeout(Duration::from_millis(50), server.next_received())
+            .await
+            .is_err());
         assert_eq!(state.client_state.get_file().as_deref(), Some("b.mkv"));
 
         server_playlist_and_index(&state, None, Some((Some(1), true)))
@@ -1107,6 +1398,73 @@ mod tests {
             1,
             "server echo must not reload confirmed media"
         );
+    }
+
+    #[tokio::test]
+    async fn eof_advance_loads_before_announcing_file_index_and_reset_state() {
+        let (state, player, mut server, _directory) = fixture().await;
+        state.playback.state.lock().confirmed_media =
+            Some(CommittedMedia::new("a.mkv", Some(5), Some(120.0)));
+
+        assert!(matches!(
+            advance_after_eof(&state, "a.mkv", false, false, -1.0)
+                .await
+                .unwrap(),
+            EofAction::Load
+        ));
+        wait_for_load_count(&player, 1).await;
+        let pending = state.playback.snapshot().pending_load.unwrap();
+        assert_eq!(pending.target, "b.mkv");
+        assert!(timeout(Duration::from_millis(50), server.next_received())
+            .await
+            .is_err());
+
+        let result = dispatch(
+            &state,
+            PlaybackEvent::PlayerMediaCommitted {
+                load_id: Some(pending.id),
+                media: CommittedMedia::new("b.mkv", Some(5), Some(120.0)),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.media_accepted);
+        assert!(result.media_reset);
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::Set { Set }
+                if Set.file.is_some() && Set.playlist_index.is_none()
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::List { .. }
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::Set { Set }
+                if Set.file.is_none()
+                    && Set.playlist_index.as_ref().and_then(|update| update.index) == Some(1)
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::State { State }
+                if State.playstate.as_ref().is_some_and(|playstate| {
+                    playstate.position == 0.0 && playstate.paused
+                })
+        ));
     }
 
     #[tokio::test]
@@ -1153,7 +1511,7 @@ mod tests {
             .await
             .unwrap();
 
-        local_select(&state, 0, true).await.unwrap();
+        local_select_and_echo(&state, 0, true).await;
         wait_for_no_pending_load(&state).await;
 
         assert!(!player
@@ -1179,10 +1537,10 @@ mod tests {
         .unwrap();
         player.set_load_delay(Duration::from_millis(100));
 
-        local_select(&state, 1, true).await.unwrap();
+        local_select_and_echo(&state, 1, true).await;
         wait_for_load_count(&player, 1).await;
         let issued = state.playback.snapshot().pending_load.unwrap().id;
-        local_select(&state, 3, true).await.unwrap();
+        local_select_and_echo(&state, 3, true).await;
         wait_for_no_pending_load(&state).await;
 
         assert_eq!(
@@ -1219,7 +1577,7 @@ mod tests {
             .unwrap();
         state.media_index.set_refreshing_for_test(true);
 
-        local_select(&state, 0, true).await.unwrap();
+        local_select_and_echo(&state, 0, true).await;
         wait_for_pending_status(&state, PendingLoadStatus::WaitingForMedia).await;
         std::fs::write(directory.path().join("later.mkv"), "later").unwrap();
 
@@ -1244,8 +1602,8 @@ mod tests {
             .unwrap();
         let load_id = {
             let mut playback = state.playback.state.lock();
-            let effects = playback.reduce(PlaybackEvent::LocalSelect {
-                index: 0,
+            let effects = playback.reduce(PlaybackEvent::ServerIndex {
+                index: Some(0),
                 reset_position: true,
             });
             let [PlaybackEffect::Load { load_id, .. }] = effects.as_slice() else {
@@ -1274,7 +1632,7 @@ mod tests {
             .unwrap();
         state.media_index.set_refreshing_for_test(true);
 
-        local_select(&state, 0, true).await.unwrap();
+        local_select_and_echo(&state, 0, true).await;
         wait_for_pending_status(&state, PendingLoadStatus::WaitingForMedia).await;
 
         media_index_refresh_finished(&state).await;
@@ -1288,13 +1646,29 @@ mod tests {
 
     #[tokio::test]
     async fn relative_selection_uses_the_coordinator_snapshot() {
-        let (state, player, _server, _directory) = fixture().await;
+        let (state, player, mut server, _directory) = fixture().await;
         state.playlist.set_items_with_index(
             vec!["c.mkv".into(), "b.mkv".into(), "a.mkv".into()],
             Some(2),
         );
 
         local_step(&state, PlaylistStep::Next { loop_at_end: false }, true)
+            .await
+            .unwrap();
+        assert!(state.playback.snapshot().pending_load.is_none());
+        assert!(matches!(
+            timeout(Duration::from_secs(1), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::Set { Set }
+                if Set.playlist_index.as_ref().and_then(|update| update.index) == Some(1)
+        ));
+        let _ = timeout(Duration::from_secs(1), server.next_received())
+            .await
+            .unwrap()
+            .unwrap();
+        server_playlist_and_index(&state, None, Some((Some(1), true)))
             .await
             .unwrap();
         wait_for_load_count(&player, 1).await;
@@ -1315,7 +1689,7 @@ mod tests {
             .client_state
             .set_global_state(42.0, false, Some("peer".to_string()));
 
-        local_select(&state, 1, false).await.unwrap();
+        local_select_and_echo(&state, 1, false).await;
         wait_for_load_count(&player, 1).await;
         let load_b = state.playback.snapshot().pending_load.unwrap().id;
         let player_state = PlayerState {
@@ -1354,7 +1728,7 @@ mod tests {
         .await
         .unwrap();
 
-        local_select(&state, 2, true).await.unwrap();
+        local_select_and_echo(&state, 2, true).await;
         wait_for_load_count(&player, 2).await;
         commit.await.unwrap().unwrap();
 
@@ -1374,9 +1748,9 @@ mod tests {
     async fn stale_completion_cannot_replace_latest_request() {
         let (state, _player, _server, _directory) = fixture().await;
 
-        local_select(&state, 1, true).await.unwrap();
+        local_select_and_echo(&state, 1, true).await;
         let load_b = state.playback.snapshot().pending_load.unwrap().id;
-        local_select(&state, 2, true).await.unwrap();
+        local_select_and_echo(&state, 2, true).await;
         let load_c = state.playback.snapshot().pending_load.unwrap().id;
         assert!(load_c > load_b);
 
@@ -1409,7 +1783,9 @@ mod tests {
         player.set_load_delay(Duration::from_millis(80));
 
         let first_state = state.clone();
-        let first = tokio::spawn(async move { local_select(&first_state, 1, true).await });
+        let first = tokio::spawn(async move {
+            local_select_and_echo(&first_state, 1, true).await;
+        });
         timeout(Duration::from_secs(1), async {
             loop {
                 if player
@@ -1425,7 +1801,9 @@ mod tests {
         .await
         .unwrap();
         let middle_state = state.clone();
-        let middle = tokio::spawn(async move { local_select(&middle_state, 2, true).await });
+        let middle = tokio::spawn(async move {
+            local_select_and_echo(&middle_state, 2, true).await;
+        });
         timeout(Duration::from_secs(1), async {
             loop {
                 if state
@@ -1442,11 +1820,13 @@ mod tests {
         .await
         .unwrap();
         let latest_state = state.clone();
-        let latest = tokio::spawn(async move { local_select(&latest_state, 0, true).await });
+        let latest = tokio::spawn(async move {
+            local_select_and_echo(&latest_state, 0, true).await;
+        });
 
-        first.await.unwrap().unwrap();
-        middle.await.unwrap().unwrap();
-        latest.await.unwrap().unwrap();
+        first.await.unwrap();
+        middle.await.unwrap();
+        latest.await.unwrap();
         let latest_load = state.playback.snapshot().pending_load.unwrap().id;
 
         timeout(Duration::from_secs(1), async {
@@ -1497,14 +1877,34 @@ mod tests {
         .await
         .unwrap();
 
-        local_select(&state, 1, true).await.unwrap();
+        local_select_and_echo(&state, 1, true).await;
         wait_for_load_count(&player, 1).await;
         let load_b = state.playback.snapshot().pending_load.unwrap().id;
-        local_select(&state, 0, true).await.unwrap();
+        local_select_and_echo(&state, 0, true).await;
         let load_a = state.playback.snapshot().pending_load.unwrap().id;
 
         assert!(load_a > load_b);
-        wait_for_load_count(&player, 2).await;
+        assert_eq!(
+            state
+                .playback
+                .snapshot()
+                .pending_load
+                .as_ref()
+                .map(|pending| pending.target.as_str()),
+            Some("a.mkv")
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if player.commands().iter().any(
+                    |command| matches!(command, FakePlayerCommand::LoadFile(path) if path.ends_with("a.mkv")),
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
         let stale = dispatch(
             &state,
@@ -1526,9 +1926,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(loads.len(), 2);
         assert!(loads[0].ends_with("b.mkv"));
-        assert!(loads[1].ends_with("a.mkv"));
+        assert!(loads.last().unwrap().ends_with("a.mkv"));
 
         let latest = dispatch(
             &state,
@@ -1555,7 +1954,7 @@ mod tests {
         )
         .await
         .unwrap();
-        local_select(&state, 1, true).await.unwrap();
+        local_select_and_echo(&state, 1, true).await;
 
         let result = dispatch(
             &state,
@@ -1574,7 +1973,7 @@ mod tests {
     #[tokio::test]
     async fn settled_load_is_not_aborted_during_post_commit_sync() {
         let (state, player, _server, _directory) = fixture().await;
-        local_select(&state, 1, true).await.unwrap();
+        local_select_and_echo(&state, 1, true).await;
         wait_for_load_count(&player, 1).await;
         let load_id = state.playback.snapshot().pending_load.unwrap().id;
 

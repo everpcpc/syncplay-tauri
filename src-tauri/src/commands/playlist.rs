@@ -223,7 +223,6 @@ pub(crate) fn send_playlist_index(
 
     if reset_position {
         *state.last_advance_time.lock() = Some(std::time::Instant::now());
-        *state.last_rewind_time.lock() = Some(std::time::Instant::now());
         let state_message = ProtocolMessage::State {
             State: StateMessage {
                 playstate: Some(PlayState {
@@ -391,5 +390,36 @@ mod tests {
             ));
         }
         assert_eq!(playlist_lengths, vec![4, 5]);
+    }
+
+    #[tokio::test]
+    async fn reset_index_uses_the_advance_window_without_faking_a_rewind() {
+        let (state, mut server) = fixture().await;
+        assert!(state.last_advance_time.lock().is_none());
+        assert!(state.last_rewind_time.lock().is_none());
+
+        send_playlist_index(&state, 2, true).unwrap();
+
+        assert!(state.last_advance_time.lock().is_some());
+        assert!(state.last_rewind_time.lock().is_none());
+        let index = server.next_received().await.unwrap();
+        let playback = server.next_received().await.unwrap();
+        assert!(matches!(
+            index,
+            ProtocolMessage::Set { Set }
+                if Set.playlist_index.as_ref().and_then(|update| update.index) == Some(2)
+        ));
+        assert!(matches!(
+            playback,
+            ProtocolMessage::State { State }
+                if matches!(
+                    State.playstate,
+                    Some(PlayState {
+                        position,
+                        paused: true,
+                        ..
+                    }) if position == 0.0
+                )
+        ));
     }
 }

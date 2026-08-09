@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
@@ -7,8 +8,12 @@ use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::client::{
-    chat::ChatManager, local_state::LocalPlaybackState, media_index::MediaIndex,
-    playback_runtime::PlaybackCoordinator, playlist::Playlist, state::ClientState,
+    chat::ChatManager,
+    local_state::LocalPlaybackState,
+    media_index::MediaIndex,
+    playback_runtime::PlaybackCoordinator,
+    playlist::Playlist,
+    state::{ClientState, GlobalPlayState},
     sync::SyncEngine,
 };
 use crate::config::{SyncplayConfig, UnpauseAction};
@@ -21,6 +26,10 @@ use crate::player::backend::{PlayerBackend, PlayerKind};
 pub struct AppState {
     /// Network connection to Syncplay server
     pub connection: Arc<Mutex<Option<Arc<Connection>>>>,
+    /// Identity of the logical client session across transport reconnects.
+    pub connection_session_generation: AtomicU64,
+    /// Invalidates player startup work before lifecycle teardown waits for it.
+    pub player_startup_epoch: AtomicU64,
     /// Player backend instance
     pub player: Arc<Mutex<Option<Arc<dyn PlayerBackend>>>>,
     /// Player process handle
@@ -49,8 +58,6 @@ pub struct AppState {
     pub autoplay: Arc<Mutex<AutoPlayState>>,
     /// Ping RTT tracking
     pub ping_service: Arc<Mutex<PingService>>,
-    /// Last latency calculation timestamp from server
-    pub last_latency_calculation: Arc<Mutex<Option<f64>>>,
     /// Last time a global playstate was received
     pub last_global_update: Arc<Mutex<Option<Instant>>>,
     /// Last outbound State message, used to avoid flooding servers during seek storms
@@ -157,6 +164,8 @@ impl AppState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             connection: Arc::new(Mutex::new(None)),
+            connection_session_generation: AtomicU64::new(0),
+            player_startup_epoch: AtomicU64::new(0),
             player: Arc::new(Mutex::new(None)),
             player_process: Arc::new(Mutex::new(None)),
             player_lifecycle: Arc::new(AsyncMutex::new(())),
@@ -171,7 +180,6 @@ impl AppState {
             app_handle: Arc::new(Mutex::new(None)),
             autoplay: Arc::new(Mutex::new(AutoPlayState::default())),
             ping_service: Arc::new(Mutex::new(PingService::default())),
-            last_latency_calculation: Arc::new(Mutex::new(None)),
             last_global_update: Arc::new(Mutex::new(None)),
             last_state_message_sent: Arc::new(Mutex::new(None)),
             last_connect_time: Arc::new(Mutex::new(None)),
@@ -213,6 +221,16 @@ impl AppState {
         *self.app_handle.lock() = Some(handle);
     }
 
+    pub fn effective_global_state(&self) -> GlobalPlayState {
+        let mut global = self.client_state.get_global_state();
+        if !global.paused {
+            if let Some(last_update) = *self.last_global_update.lock() {
+                global.position += last_update.elapsed().as_secs_f64();
+            }
+        }
+        global
+    }
+
     /// Emit an event to the frontend
     pub fn emit_event(&self, event: &str, payload: impl serde::Serialize + Clone) {
         if let Some(handle) = self.app_handle.lock().as_ref() {
@@ -224,11 +242,9 @@ impl AppState {
 
     /// Check if connected to server
     pub fn is_connected(&self) -> bool {
-        self.connection
-            .lock()
-            .as_ref()
-            .map(|c| c.is_connected())
-            .unwrap_or(false)
+        self.connection.lock().as_ref().is_some_and(|connection| {
+            connection.state() == crate::network::connection::ConnectionState::Authenticated
+        })
     }
 
     /// Check if player is connected
@@ -245,6 +261,8 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             connection: Arc::new(Mutex::new(None)),
+            connection_session_generation: AtomicU64::new(0),
+            player_startup_epoch: AtomicU64::new(0),
             player: Arc::new(Mutex::new(None)),
             player_process: Arc::new(Mutex::new(None)),
             player_lifecycle: Arc::new(AsyncMutex::new(())),
@@ -259,7 +277,6 @@ impl Default for AppState {
             app_handle: Arc::new(Mutex::new(None)),
             autoplay: Arc::new(Mutex::new(AutoPlayState::default())),
             ping_service: Arc::new(Mutex::new(PingService::default())),
-            last_latency_calculation: Arc::new(Mutex::new(None)),
             last_global_update: Arc::new(Mutex::new(None)),
             last_state_message_sent: Arc::new(Mutex::new(None)),
             last_connect_time: Arc::new(Mutex::new(None)),
@@ -406,4 +423,22 @@ pub struct PlayerStateEvent {
     pub duration: Option<f64>,
     pub paused: Option<bool>,
     pub speed: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_global_position_advances_only_while_playing() {
+        let state = AppState::new();
+        state.client_state.set_global_state(10.0, false, None);
+        *state.last_global_update.lock() = Some(Instant::now() - std::time::Duration::from_secs(2));
+
+        let playing = state.effective_global_state();
+        assert!(playing.position >= 12.0);
+
+        state.client_state.set_global_state(10.0, true, None);
+        assert_eq!(state.effective_global_state().position, 10.0);
+    }
 }

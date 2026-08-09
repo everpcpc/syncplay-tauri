@@ -42,6 +42,7 @@
     "targets": "all",
     "createUpdaterArtifacts": true,
     "resources": [
+      "resources/iina-bkg.png",
       "resources/placeholder.png",
       "resources/syncplay.lua",
       "resources/syncplayintf.lua"

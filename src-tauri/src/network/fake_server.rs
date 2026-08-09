@@ -1,6 +1,7 @@
 use crate::network::messages::{HelloMessage, ProtocolMessage, RoomInfo, TLSMessage};
 use crate::network::protocol::SyncplayCodec;
 use futures::{SinkExt, StreamExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
@@ -13,6 +14,7 @@ use tokio_util::codec::Framed;
 /// public Syncplay servers.
 pub enum FakeServerCommand {
     Message(ProtocolMessage),
+    RawLine(String),
     AbortConnection,
     CloseConnection,
     Close,
@@ -79,6 +81,12 @@ impl FakeSyncplayServer {
 
     pub fn send(&self, message: ProtocolMessage) -> anyhow::Result<()> {
         self.outbound_tx.send(FakeServerCommand::Message(message))?;
+        Ok(())
+    }
+
+    pub fn send_raw_line(&self, line: impl Into<String>) -> anyhow::Result<()> {
+        self.outbound_tx
+            .send(FakeServerCommand::RawLine(line.into()))?;
         Ok(())
     }
 
@@ -189,6 +197,13 @@ async fn run_fake_server_connection(
                 match command {
                     Some(FakeServerCommand::Message(message)) => {
                         if framed.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(FakeServerCommand::RawLine(line)) => {
+                        let mut bytes = line.into_bytes();
+                        bytes.push(b'\n');
+                        if framed.get_mut().write_all(&bytes).await.is_err() {
                             break;
                         }
                     }
@@ -340,6 +355,13 @@ pub mod tls_fixture {
                     match command {
                         Some(FakeServerCommand::Message(message)) => {
                             if framed.send(message).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(FakeServerCommand::RawLine(line)) => {
+                            let mut bytes = line.into_bytes();
+                            bytes.push(b'\n');
+                            if framed.get_mut().write_all(&bytes).await.is_err() {
                                 break;
                             }
                         }

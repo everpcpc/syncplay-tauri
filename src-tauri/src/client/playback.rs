@@ -38,10 +38,10 @@ impl CommittedMedia {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadOrigin {
-    /// A GUI selection or EOF advance. The index is announced after the file commits.
-    Local,
-    /// An authoritative server index. It must never be echoed back to the server.
+    /// The server already selected this index, so the completed load must not echo it.
     Server,
+    /// EOF advancement loads first and announces the observed file after it commits.
+    Eof,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +103,7 @@ impl PlaybackState {
                 index,
                 reset_position,
             } => self.local_select(index, reset_position),
+            PlaybackEvent::EofAdvance { index } => self.eof_advance(index),
             PlaybackEvent::ServerPlaylist { items } => {
                 self.apply_server_playlist(items);
                 Vec::new()
@@ -127,6 +128,9 @@ impl PlaybackState {
             PlaybackEvent::ReconcileSharedPlaylist => self.reconcile_shared_playlist(),
             PlaybackEvent::PlayerMediaCommitted { load_id, media } => {
                 self.commit_player_media(load_id, media)
+            }
+            PlaybackEvent::PlayerMediaOpenedExternally { media } => {
+                self.commit_explicit_external_media(media)
             }
             PlaybackEvent::LoadFailed { load_id } => {
                 if self.pending_load.as_ref().map(|pending| pending.id) == Some(load_id) {
@@ -233,50 +237,32 @@ impl PlaybackState {
     }
 
     pub fn displayed_index(&self) -> Option<usize> {
-        self.pending_load
-            .as_ref()
-            .filter(|pending| pending.origin == LoadOrigin::Local)
-            .map(|pending| pending.playlist_index)
-            .or(self
-                .proposed_index
-                .filter(|index| *index < self.playlist_items.len()))
+        self.proposed_index
+            .filter(|index| *index < self.playlist_items.len())
             .or(self
                 .authoritative_index
                 .filter(|index| *index < self.playlist_items.len()))
     }
 
     fn local_select(&mut self, index: usize, reset_position: bool) -> Vec<PlaybackEffect> {
+        if self.playlist_items.get(index).is_none() {
+            return Vec::new();
+        }
+        self.proposed_index = Some(index);
+        vec![PlaybackEffect::SendPlaylistIndex {
+            index,
+            reset_position,
+        }]
+    }
+
+    fn eof_advance(&mut self, index: usize) -> Vec<PlaybackEffect> {
         let Some(target) = self.playlist_items.get(index).cloned() else {
             return Vec::new();
         };
-
-        if let Some(pending) = self.pending_load.as_ref() {
-            if pending.target == target {
-                if pending.status == PendingLoadStatus::WaitingForMedia {
-                    return vec![self.begin_load(index, target, reset_position, LoadOrigin::Local)];
-                }
-                return Vec::new();
-            }
-            return vec![self.begin_load(index, target, reset_position, LoadOrigin::Local)];
-        }
-
-        if !self.media_uncertain
-            && self
-                .confirmed_media
-                .as_ref()
-                .is_some_and(|media| media.name == target)
-        {
-            if !self.authoritative_matches(index, &target) && self.proposed_index != Some(index) {
-                self.proposed_index = Some(index);
-                return vec![PlaybackEffect::SendPlaylistIndex {
-                    index,
-                    reset_position,
-                }];
-            }
+        if self.pending_load.is_some() || self.interrupted_load.is_some() {
             return Vec::new();
         }
-
-        vec![self.begin_load(index, target, reset_position, LoadOrigin::Local)]
+        vec![self.begin_load(index, target, true, LoadOrigin::Eof)]
     }
 
     fn apply_server_playlist(&mut self, items: Vec<String>) {
@@ -366,8 +352,8 @@ impl PlaybackState {
                 .take()
                 .expect("matching interrupted load disappeared");
             pending.playlist_index = index;
-            pending.origin = LoadOrigin::Server;
             pending.reset_position |= reset_position;
+            pending.origin = LoadOrigin::Server;
             self.pending_load = Some(pending);
             return Vec::new();
         }
@@ -403,10 +389,7 @@ impl PlaybackState {
                 .as_ref()
                 .is_some_and(|pending| pending.id == load_id)
             {
-                self.interrupted_load = None;
-                self.confirmed_media = Some(media.clone());
-                self.media_uncertain = false;
-                return vec![PlaybackEffect::SendFile { media }];
+                return self.commit_interrupted_media(media);
             }
             return Vec::new();
         };
@@ -416,10 +399,7 @@ impl PlaybackState {
                 .as_ref()
                 .is_some_and(|pending| pending.id == load_id)
             {
-                self.interrupted_load = None;
-                self.confirmed_media = Some(media.clone());
-                self.media_uncertain = false;
-                return vec![PlaybackEffect::SendFile { media }];
+                return self.commit_interrupted_media(media);
             }
             return Vec::new();
         }
@@ -428,37 +408,7 @@ impl PlaybackState {
             .pending_load
             .take()
             .expect("pending load disappeared during media commit");
-        self.confirmed_media = Some(media.clone());
-        self.media_uncertain = false;
-
-        let committed_playlist_index = self
-            .playlist_items
-            .iter()
-            .position(|item| item == &media.name)
-            .or_else(|| {
-                self.playlist_items
-                    .get(pending.playlist_index)
-                    .filter(|item| *item == &pending.target)
-                    .map(|_| pending.playlist_index)
-            });
-        let mut effects = vec![PlaybackEffect::SendFile { media }];
-        if let Some(index) =
-            committed_playlist_index.filter(|_| pending.origin == LoadOrigin::Local)
-        {
-            let target = self
-                .playlist_items
-                .get(index)
-                .expect("committed playlist index disappeared");
-            if self.authoritative_matches(index, target) {
-                return effects;
-            }
-            self.proposed_index = Some(index);
-            effects.push(PlaybackEffect::SendPlaylistIndex {
-                index,
-                reset_position: pending.reset_position,
-            });
-        }
-        effects
+        self.commit_loaded_media(pending, media)
     }
 
     fn commit_external_media(&mut self, media: CommittedMedia) -> Vec<PlaybackEffect> {
@@ -467,6 +417,19 @@ impl PlaybackState {
         if self.pending_load.is_some() || self.interrupted_load.is_some() {
             return Vec::new();
         }
+        self.apply_external_media(media)
+    }
+
+    fn commit_explicit_external_media(&mut self, media: CommittedMedia) -> Vec<PlaybackEffect> {
+        if let Some(pending) = self.pending_load.take() {
+            if pending.status == PendingLoadStatus::Loading {
+                self.interrupted_load = Some(pending);
+            }
+        }
+        self.apply_external_media(media)
+    }
+
+    fn apply_external_media(&mut self, media: CommittedMedia) -> Vec<PlaybackEffect> {
         if self.confirmed_media.as_ref() == Some(&media) {
             self.media_uncertain = false;
             self.proposed_index = self
@@ -492,6 +455,42 @@ impl PlaybackState {
                 index,
                 reset_position: true,
             });
+        }
+        effects
+    }
+
+    fn commit_interrupted_media(&mut self, media: CommittedMedia) -> Vec<PlaybackEffect> {
+        let pending = self
+            .interrupted_load
+            .take()
+            .expect("matching interrupted load disappeared");
+        self.commit_loaded_media(pending, media)
+    }
+
+    fn commit_loaded_media(
+        &mut self,
+        pending: PendingLoad,
+        media: CommittedMedia,
+    ) -> Vec<PlaybackEffect> {
+        self.confirmed_media = Some(media.clone());
+        self.media_uncertain = false;
+
+        let playlist_index = self
+            .playlist_items
+            .iter()
+            .position(|item| item == &media.name);
+        let mut effects = vec![PlaybackEffect::SendFile { media }];
+        if pending.origin == LoadOrigin::Eof {
+            self.proposed_index = playlist_index.filter(|index| {
+                let target = &self.playlist_items[*index];
+                !self.authoritative_matches(*index, target)
+            });
+            if let Some(index) = self.proposed_index {
+                effects.push(PlaybackEffect::SendPlaylistIndex {
+                    index,
+                    reset_position: pending.reset_position,
+                });
+            }
         }
         effects
     }
@@ -560,10 +559,14 @@ impl PlaybackState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackEvent {
-    /// GUI selection and EOF advancement both load first and announce on commit.
+    /// A local user action announces an index; only the server echo loads it.
     LocalSelect {
         index: usize,
         reset_position: bool,
+    },
+    /// EOF advancement loads the successor before announcing its committed filename.
+    EofAdvance {
+        index: usize,
     },
     ServerPlaylist {
         items: Vec<String>,
@@ -591,6 +594,10 @@ pub enum PlaybackEvent {
     /// `None` is reserved for a stable file change initiated outside Syncplay.
     PlayerMediaCommitted {
         load_id: Option<LoadId>,
+        media: CommittedMedia,
+    },
+    /// A complete MPV marker without a Syncplay generation tag is a definitive manual open.
+    PlayerMediaOpenedExternally {
         media: CommittedMedia,
     },
     LoadFailed {
@@ -651,45 +658,57 @@ mod tests {
         }
     }
 
+    fn start_server_load(state: &mut PlaybackState, index: usize, reset_position: bool) -> LoadId {
+        assert_eq!(
+            state.reduce(PlaybackEvent::LocalSelect {
+                index,
+                reset_position,
+            }),
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index,
+                reset_position,
+            }]
+        );
+        load_id(&state.reduce(PlaybackEvent::ServerIndex {
+            index: Some(index),
+            reset_position,
+        }))
+    }
+
+    fn start_eof_load(state: &mut PlaybackState, index: usize) -> LoadId {
+        load_id(&state.reduce(PlaybackEvent::EofAdvance { index }))
+    }
+
     #[test]
-    fn local_selection_loads_before_announcing_index() {
+    fn local_selection_announces_index_before_the_server_echo_loads() {
         let mut state = state_with_playlist();
 
         let effects = state.reduce(PlaybackEvent::LocalSelect {
             index: 1,
             reset_position: true,
         });
-        let id = load_id(&effects);
 
         assert_eq!(state.authoritative_index, Some(0));
+        assert_eq!(state.proposed_index, Some(1));
+        assert!(state.pending_load.is_none());
         assert_eq!(
             effects,
-            vec![PlaybackEffect::Load {
-                load_id: id,
-                target: "b.mkv".to_string(),
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index: 1,
                 reset_position: true,
             }]
         );
 
-        let effects = state.reduce(PlaybackEvent::PlayerMediaCommitted {
-            load_id: Some(id),
-            media: media("b.mkv"),
+        let effects = state.reduce(PlaybackEvent::ServerIndex {
+            index: Some(1),
+            reset_position: true,
         });
-
-        assert_eq!(
-            effects,
-            vec![
-                PlaybackEffect::SendFile {
-                    media: media("b.mkv"),
-                },
-                PlaybackEffect::SendPlaylistIndex {
-                    index: 1,
-                    reset_position: true,
-                },
-            ]
-        );
-        assert_eq!(state.confirmed_media, Some(media("b.mkv")));
-        assert!(state.pending_load.is_none());
+        assert!(matches!(
+            effects.as_slice(),
+            [PlaybackEffect::Load { target, .. }] if target == "b.mkv"
+        ));
+        assert_eq!(state.authoritative_index, Some(1));
+        assert_eq!(state.proposed_index, None);
     }
 
     #[test]
@@ -780,40 +799,44 @@ mod tests {
     }
 
     #[test]
-    fn local_commit_keeps_proposed_index_visible_until_server_echo() {
+    fn local_selection_keeps_proposed_index_visible_until_server_echo() {
         let mut state = state_with_playlist();
-        let effects = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let id = load_id(&effects);
-
-        state.reduce(PlaybackEvent::PlayerMediaCommitted {
-            load_id: Some(id),
-            media: media("b.mkv"),
-        });
+        assert_eq!(
+            state.reduce(PlaybackEvent::LocalSelect {
+                index: 1,
+                reset_position: true,
+            }),
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index: 1,
+                reset_position: true,
+            }]
+        );
 
         assert_eq!(state.authoritative_index, Some(0));
         assert_eq!(state.proposed_index, Some(1));
         assert_eq!(state.displayed_index(), Some(1));
+        assert!(state.pending_load.is_none());
 
-        state.reduce(PlaybackEvent::ServerIndex {
+        let effects = state.reduce(PlaybackEvent::ServerIndex {
             index: Some(1),
             reset_position: true,
         });
+        assert!(matches!(
+            effects.as_slice(),
+            [PlaybackEffect::Load { target, .. }] if target == "b.mkv"
+        ));
         assert_eq!(state.authoritative_index, Some(1));
         assert_eq!(state.proposed_index, None);
         assert_eq!(state.displayed_index(), Some(1));
     }
 
     #[test]
-    fn local_playlist_edit_keeps_pending_selection_separate_from_server_authority() {
+    fn local_playlist_edit_keeps_proposed_selection_separate_from_server_authority() {
         let mut state = state_with_playlist();
-        let load = state.reduce(PlaybackEvent::LocalSelect {
+        state.reduce(PlaybackEvent::LocalSelect {
             index: 1,
             reset_position: true,
         });
-        let id = load_id(&load);
 
         state.reduce(PlaybackEvent::LocalPlaylistEdit {
             items: vec![
@@ -824,15 +847,10 @@ mod tests {
             ],
             index: Some(1),
         });
-        let effects = state.reduce(PlaybackEvent::PlayerMediaCommitted {
-            load_id: Some(id),
-            media: media("b.mkv"),
-        });
 
-        assert!(effects
-            .iter()
-            .any(|effect| matches!(effect, PlaybackEffect::SendPlaylistIndex { index: 1, .. })));
         assert_eq!(state.authoritative_index, Some(0));
+        assert_eq!(state.proposed_index, Some(1));
+        assert!(state.pending_load.is_none());
     }
 
     #[test]
@@ -871,8 +889,20 @@ mod tests {
             reset_position: true,
         });
 
+        assert_eq!(
+            effects,
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index: 1,
+                reset_position: true,
+            }]
+        );
         assert!(matches!(
-            effects.as_slice(),
+            state
+                .reduce(PlaybackEvent::ServerIndex {
+                    index: Some(1),
+                    reset_position: true,
+                })
+                .as_slice(),
             [PlaybackEffect::Load { target, .. }] if target == "Episode 01.mkv"
         ));
     }
@@ -895,69 +925,85 @@ mod tests {
     }
 
     #[test]
-    fn local_commit_publishes_the_exact_observed_playlist_item() {
-        let mut state = PlaybackState::new(vec![
-            "Episode-01.mkv".to_string(),
-            "Episode 01.mkv".to_string(),
-        ]);
-        let load = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let id = load_id(&load);
+    fn eof_commit_publishes_the_exact_observed_playlist_item() {
+        let mut state = state_with_playlist();
+        let id = start_eof_load(&mut state, 1);
 
         let effects = state.reduce(PlaybackEvent::PlayerMediaCommitted {
             load_id: Some(id),
-            media: media("Episode-01.mkv"),
+            media: media("c.mkv"),
         });
 
-        assert!(matches!(
-            effects.as_slice(),
-            [
-                PlaybackEffect::SendFile { .. },
-                PlaybackEffect::SendPlaylistIndex { index: 0, .. }
+        assert_eq!(
+            effects,
+            vec![
+                PlaybackEffect::SendFile {
+                    media: media("c.mkv"),
+                },
+                PlaybackEffect::SendPlaylistIndex {
+                    index: 2,
+                    reset_position: true,
+                },
             ]
-        ));
-        assert_eq!(state.proposed_index, Some(0));
+        );
+        assert_eq!(state.proposed_index, Some(2));
     }
 
     #[test]
-    fn local_commit_keeps_the_requested_index_for_a_fuzzy_resolved_file() {
+    fn eof_commit_does_not_fall_back_to_the_requested_index_for_a_fuzzy_name() {
         let mut state = PlaybackState::new(vec!["Episode 01.mkv".to_string()]);
-        let load = state.reduce(PlaybackEvent::LocalSelect {
-            index: 0,
-            reset_position: true,
-        });
-        let id = load_id(&load);
+        let id = start_eof_load(&mut state, 0);
 
         let effects = state.reduce(PlaybackEvent::PlayerMediaCommitted {
             load_id: Some(id),
             media: media("Episode-01.mkv"),
         });
 
-        assert!(matches!(
-            effects.as_slice(),
-            [
-                PlaybackEffect::SendFile { .. },
-                PlaybackEffect::SendPlaylistIndex { index: 0, .. }
-            ]
-        ));
-        assert_eq!(state.displayed_index(), Some(0));
+        assert_eq!(
+            effects,
+            vec![PlaybackEffect::SendFile {
+                media: media("Episode-01.mkv"),
+            }]
+        );
+        assert_eq!(state.proposed_index, None);
     }
 
     #[test]
-    fn rapid_local_selections_are_latest_wins() {
+    fn rapid_local_selections_announce_each_choice_and_server_echoes_are_latest_wins() {
         let mut state = state_with_playlist();
         let first = state.reduce(PlaybackEvent::LocalSelect {
             index: 1,
             reset_position: true,
         });
-        let first_id = load_id(&first);
         let second = state.reduce(PlaybackEvent::LocalSelect {
             index: 2,
             reset_position: true,
         });
-        let second_id = load_id(&second);
+        assert_eq!(
+            first,
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index: 1,
+                reset_position: true,
+            }]
+        );
+        assert_eq!(
+            second,
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index: 2,
+                reset_position: true,
+            }]
+        );
+        assert!(state.pending_load.is_none());
+        assert_eq!(state.proposed_index, Some(2));
+
+        let first_id = load_id(&state.reduce(PlaybackEvent::ServerIndex {
+            index: Some(1),
+            reset_position: true,
+        }));
+        let second_id = load_id(&state.reduce(PlaybackEvent::ServerIndex {
+            index: Some(2),
+            reset_position: true,
+        }));
 
         assert!(second_id > first_id);
         assert!(state
@@ -974,29 +1020,29 @@ mod tests {
         });
         assert_eq!(
             effects,
-            vec![
-                PlaybackEffect::SendFile {
-                    media: media("c.mkv"),
-                },
-                PlaybackEffect::SendPlaylistIndex {
-                    index: 2,
-                    reset_position: true,
-                },
-            ]
+            vec![PlaybackEffect::SendFile {
+                media: media("c.mkv"),
+            }]
         );
     }
 
     #[test]
-    fn reselecting_confirmed_media_supersedes_an_inflight_local_load() {
+    fn server_echo_for_reselected_media_supersedes_an_inflight_load() {
         let mut state = state_with_playlist();
-        let load_b = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let load_b_id = load_id(&load_b);
+        let load_b_id = start_server_load(&mut state, 1, true);
 
-        let load_a = state.reduce(PlaybackEvent::LocalSelect {
-            index: 0,
+        assert_eq!(
+            state.reduce(PlaybackEvent::LocalSelect {
+                index: 0,
+                reset_position: true,
+            }),
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index: 0,
+                reset_position: true,
+            }]
+        );
+        let load_a = state.reduce(PlaybackEvent::ServerIndex {
+            index: Some(0),
             reset_position: true,
         });
         let load_a_id = load_id(&load_a);
@@ -1009,14 +1055,33 @@ mod tests {
     }
 
     #[test]
+    fn local_reselection_does_not_replace_an_inflight_load_before_server_echo() {
+        let mut state = state_with_playlist();
+        let load_b_id = start_server_load(&mut state, 1, true);
+
+        let effects = state.reduce(PlaybackEvent::LocalSelect {
+            index: 0,
+            reset_position: true,
+        });
+
+        assert_eq!(
+            effects,
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index: 0,
+                reset_position: true,
+            }]
+        );
+        assert_eq!(
+            state.pending_load.as_ref().map(|load| load.id),
+            Some(load_b_id)
+        );
+    }
+
+    #[test]
     fn server_reselecting_confirmed_media_supersedes_an_inflight_load() {
         let mut state = state_with_playlist();
         state.received_server_index = true;
-        let load_b = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let load_b_id = load_id(&load_b);
+        let load_b_id = start_server_load(&mut state, 1, true);
 
         let load_a = state.reduce(PlaybackEvent::ServerIndex {
             index: Some(0),
@@ -1038,24 +1103,19 @@ mod tests {
     #[test]
     fn tagged_media_commit_trusts_the_player_generation_boundary() {
         let mut state = state_with_playlist();
-        let effects = state.reduce(PlaybackEvent::LocalSelect {
-            index: 2,
-            reset_position: true,
-        });
-        let id = load_id(&effects);
+        let id = start_server_load(&mut state, 2, true);
 
         let effects = state.reduce(PlaybackEvent::PlayerMediaCommitted {
             load_id: Some(id),
             media: media("b.mkv"),
         });
 
-        assert!(matches!(
-            effects.as_slice(),
-            [
-                PlaybackEffect::SendFile { .. },
-                PlaybackEffect::SendPlaylistIndex { index: 1, .. }
-            ]
-        ));
+        assert_eq!(
+            effects,
+            vec![PlaybackEffect::SendFile {
+                media: media("b.mkv")
+            }]
+        );
         assert_eq!(state.confirmed_media, Some(media("b.mkv")));
         assert!(state.pending_load.is_none());
     }
@@ -1063,15 +1123,11 @@ mod tests {
     #[test]
     fn current_load_failure_allows_the_same_selection_to_retry() {
         let mut state = state_with_playlist();
-        let first = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let first_id = load_id(&first);
+        let first_id = start_server_load(&mut state, 1, true);
 
         state.reduce(PlaybackEvent::LoadFailed { load_id: first_id });
-        let retry = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
+        let retry = state.reduce(PlaybackEvent::ServerIndex {
+            index: Some(1),
             reset_position: true,
         });
 
@@ -1081,17 +1137,18 @@ mod tests {
     #[test]
     fn media_scan_retries_only_a_deferred_load() {
         let mut state = state_with_playlist();
-        let first = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let first_id = load_id(&first);
+        let first_id = start_eof_load(&mut state, 1);
 
         assert!(state.reduce(PlaybackEvent::RetryPending).is_empty());
         state.reduce(PlaybackEvent::LoadDeferred { load_id: first_id });
         let retry = state.reduce(PlaybackEvent::RetryPending);
 
-        assert!(load_id(&retry) > first_id);
+        let retry_id = load_id(&retry);
+        assert!(retry_id > first_id);
+        assert_eq!(
+            state.pending_load.as_ref().map(|load| load.origin),
+            Some(LoadOrigin::Eof)
+        );
     }
 
     #[test]
@@ -1110,13 +1167,9 @@ mod tests {
     }
 
     #[test]
-    fn server_index_adopts_matching_local_load_without_future_echo() {
+    fn server_index_adopts_matching_eof_load_without_future_echo() {
         let mut state = state_with_playlist();
-        let effects = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let id = load_id(&effects);
+        let id = start_eof_load(&mut state, 1);
 
         assert!(state
             .reduce(PlaybackEvent::ServerIndex {
@@ -1144,11 +1197,7 @@ mod tests {
     #[test]
     fn reconnect_accepts_only_the_exact_interrupted_load() {
         let mut state = state_with_playlist();
-        let effects = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let stale_id = load_id(&effects);
+        let stale_id = start_eof_load(&mut state, 1);
         state.reduce(PlaybackEvent::LoadStarted { load_id: stale_id });
 
         assert!(state.reduce(PlaybackEvent::Reconnect).is_empty());
@@ -1157,7 +1206,7 @@ mod tests {
             state.interrupted_load.as_ref().map(|load| load.id),
             Some(stale_id)
         );
-        assert_eq!(state.authoritative_index, Some(1));
+        assert_eq!(state.authoritative_index, Some(0));
         assert_eq!(state.confirmed_media, Some(media("a.mkv")));
         assert_eq!(state.playlist_items, vec!["a.mkv", "b.mkv", "c.mkv"]);
         assert_eq!(
@@ -1165,26 +1214,67 @@ mod tests {
                 load_id: Some(stale_id),
                 media: media("b.mkv"),
             }),
-            vec![PlaybackEffect::SendFile {
-                media: media("b.mkv"),
-            }]
+            vec![
+                PlaybackEffect::SendFile {
+                    media: media("b.mkv"),
+                },
+                PlaybackEffect::SendPlaylistIndex {
+                    index: 1,
+                    reset_position: true,
+                },
+            ]
         );
 
         let effects = state.reduce(PlaybackEvent::LocalSelect {
             index: 2,
             reset_position: true,
         });
-        assert!(load_id(&effects) > stale_id);
+        assert_eq!(
+            effects,
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index: 2,
+                reset_position: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn reconnect_preserves_a_local_selection_without_loading_until_server_authority_arrives() {
+        let mut state = state_with_playlist();
+        assert_eq!(
+            state.reduce(PlaybackEvent::LocalSelect {
+                index: 1,
+                reset_position: true,
+            }),
+            vec![PlaybackEffect::SendPlaylistIndex {
+                index: 1,
+                reset_position: true,
+            }]
+        );
+
+        assert!(state.reduce(PlaybackEvent::Reconnect).is_empty());
+        assert_eq!(state.authoritative_index, Some(1));
+        assert_eq!(state.proposed_index, None);
+        assert!(state.pending_load.is_none());
+
+        let effects = state.reduce(PlaybackEvent::ServerIndex {
+            index: Some(1),
+            reset_position: true,
+        });
+        assert!(matches!(
+            effects.as_slice(),
+            [PlaybackEffect::Load {
+                target,
+                reset_position: false,
+                ..
+            }] if target == "b.mkv"
+        ));
     }
 
     #[test]
     fn reconnect_rejects_unrelated_tagged_commit() {
         let mut state = state_with_playlist();
-        let effects = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let interrupted_id = load_id(&effects);
+        let interrupted_id = start_eof_load(&mut state, 1);
         state.reduce(PlaybackEvent::LoadStarted {
             load_id: interrupted_id,
         });
@@ -1203,11 +1293,7 @@ mod tests {
     #[test]
     fn interrupted_commit_is_reported_until_the_replacement_is_issued() {
         let mut state = state_with_playlist();
-        let first = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let interrupted_id = load_id(&first);
+        let interrupted_id = start_eof_load(&mut state, 1);
         state.reduce(PlaybackEvent::LoadStarted {
             load_id: interrupted_id,
         });
@@ -1229,9 +1315,15 @@ mod tests {
         });
         assert_eq!(
             effects,
-            vec![PlaybackEffect::SendFile {
-                media: media("b.mkv")
-            }]
+            vec![
+                PlaybackEffect::SendFile {
+                    media: media("b.mkv")
+                },
+                PlaybackEffect::SendPlaylistIndex {
+                    index: 1,
+                    reset_position: true,
+                },
+            ]
         );
         assert!(state.interrupted_load.is_none());
         assert_eq!(
@@ -1243,11 +1335,7 @@ mod tests {
     #[test]
     fn player_disconnect_rejects_interrupted_generation() {
         let mut state = state_with_playlist();
-        let first = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let id = load_id(&first);
+        let id = start_eof_load(&mut state, 1);
         state.reduce(PlaybackEvent::LoadStarted { load_id: id });
         state.reduce(PlaybackEvent::Reconnect);
         state.reduce(PlaybackEvent::PlayerDisconnected);
@@ -1264,13 +1352,8 @@ mod tests {
     #[test]
     fn reconnect_during_load_revalidates_the_next_authoritative_index() {
         let mut state = state_with_playlist();
-        let load = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        state.reduce(PlaybackEvent::LoadStarted {
-            load_id: load_id(&load),
-        });
+        let load_id = start_eof_load(&mut state, 1);
+        state.reduce(PlaybackEvent::LoadStarted { load_id });
 
         state.reduce(PlaybackEvent::Reconnect);
         let effects = state.reduce(PlaybackEvent::ServerIndex {
@@ -1318,6 +1401,51 @@ mod tests {
     }
 
     #[test]
+    fn explicit_external_open_supersedes_a_load_but_keeps_a_written_marker_ordered() {
+        let mut state = state_with_playlist();
+        let requested_id = start_eof_load(&mut state, 1);
+        state.reduce(PlaybackEvent::LoadStarted {
+            load_id: requested_id,
+        });
+
+        assert_eq!(
+            state.reduce(PlaybackEvent::PlayerMediaOpenedExternally {
+                media: media("c.mkv"),
+            }),
+            vec![
+                PlaybackEffect::SendFile {
+                    media: media("c.mkv"),
+                },
+                PlaybackEffect::SendPlaylistIndex {
+                    index: 2,
+                    reset_position: true,
+                },
+            ]
+        );
+        assert!(state.pending_load.is_none());
+        assert_eq!(
+            state.interrupted_load.as_ref().map(|pending| pending.id),
+            Some(requested_id)
+        );
+
+        assert_eq!(
+            state.reduce(PlaybackEvent::PlayerMediaCommitted {
+                load_id: Some(requested_id),
+                media: media("b.mkv"),
+            }),
+            vec![
+                PlaybackEffect::SendFile {
+                    media: media("b.mkv"),
+                },
+                PlaybackEffect::SendPlaylistIndex {
+                    index: 1,
+                    reset_position: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn matching_external_observation_clears_uncertainty_without_resending() {
         let mut state = state_with_playlist();
         state.media_uncertain = true;
@@ -1353,13 +1481,9 @@ mod tests {
     }
 
     #[test]
-    fn playlist_reorder_remaps_pending_local_index() {
+    fn playlist_reorder_remaps_pending_eof_index() {
         let mut state = state_with_playlist();
-        let effects = state.reduce(PlaybackEvent::LocalSelect {
-            index: 1,
-            reset_position: true,
-        });
-        let id = load_id(&effects);
+        let id = start_eof_load(&mut state, 1);
 
         state.reduce(PlaybackEvent::ServerPlaylist {
             items: vec![

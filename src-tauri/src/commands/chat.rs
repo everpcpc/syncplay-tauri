@@ -3,7 +3,7 @@
 use crate::app_state::AppState;
 use crate::client::chat::ChatCommand;
 use crate::commands::connection::{
-    reidentify_as_controller, reset_room_sync_state, store_control_password,
+    reidentify_as_controller, reset_room_sync_state, set_authoritative_room, store_control_password,
 };
 use crate::network::messages::ProtocolMessage;
 use crate::network::messages::{
@@ -29,8 +29,7 @@ pub async fn send_chat_message_from_player(
 }
 
 async fn send_chat_message_inner(state: &Arc<AppState>, message: &str) -> Result<(), String> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
+    if message.is_empty() {
         return Ok(());
     }
 
@@ -42,36 +41,39 @@ async fn send_chat_message_inner(state: &Arc<AppState>, message: &str) -> Result
         return Err("Chat is disabled by the server".to_string());
     }
 
-    let max_length = state
-        .server_features
-        .lock()
-        .max_chat_message_length
-        .unwrap_or(150);
-    let sanitized = trimmed.replace(['\n', '\r'], "");
-    let message = truncate_text(&sanitized, max_length);
+    let sanitized = message.replace(['\n', '\r'], "");
+    let (message, command) = if let Some(escaped) = sanitized.strip_prefix("//") {
+        (format!("/{escaped}"), None)
+    } else if sanitized.starts_with('/') && sanitized != "/" {
+        (sanitized.clone(), ChatCommand::parse(&sanitized))
+    } else {
+        (sanitized, None)
+    };
+    let message = if command.is_none() {
+        let max_length = state
+            .server_features
+            .lock()
+            .max_chat_message_length
+            .unwrap_or(150);
+        truncate_text(&message, max_length)
+    } else {
+        message
+    };
     tracing::info!("Sending chat message: {}", message);
 
     if !state.is_connected() {
         return Err("Not connected to server".to_string());
     }
 
-    if let Some(command) = ChatCommand::parse(&message) {
+    if let Some(command) = command {
         match command {
             ChatCommand::Room(room) => {
                 tracing::info!("Command: Change room to {}", room);
-                let max_len = state
-                    .server_features
-                    .lock()
-                    .max_room_name_length
-                    .unwrap_or(35);
-                let trimmed_room = truncate_text(&room, max_len);
-                let (normalized_room, control_password) =
-                    parse_controlled_room_input(&trimmed_room);
-                let room = normalized_room;
+                let (room, control_password) = parse_controlled_room_input(&room);
                 if let Some(password) = control_password {
                     store_control_password(state, &room, &password, true);
                 }
-                state.client_state.set_room(room);
+                set_authoritative_room(state, room);
                 reset_room_sync_state(state).await;
                 let set_msg = ProtocolMessage::Set {
                     Set: Box::new(SetMessage {
@@ -274,4 +276,92 @@ fn send_to_server_arc(state: &Arc<AppState>, message: ProtocolMessage) -> Result
     connection
         .send(message)
         .map_err(|e| format!("Failed to send message: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::connection::Connection;
+    use crate::network::fake_server::FakeSyncplayServer;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn outbound_chat_preserves_whitespace_and_escapes_double_slash() {
+        let state = AppState::new();
+        state.server_features.lock().chat = true;
+        let mut server = FakeSyncplayServer::start().await.unwrap();
+        let connection = Arc::new(Connection::new());
+        let (_receiver, _) = connection
+            .connect(server.host(), server.port())
+            .await
+            .unwrap();
+        connection.set_authenticated();
+        *state.connection.lock() = Some(connection);
+
+        for (input, expected) in [
+            ("  hello  ", "  hello  "),
+            ("//ready", "/ready"),
+            ("/", "/"),
+        ] {
+            send_chat_message_inner(&state, input).await.unwrap();
+            let message = timeout(Duration::from_secs(2), server.next_received())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                message,
+                ProtocolMessage::Chat {
+                    Chat: ProtocolChatMessage::Text(message)
+                } if message == expected
+            ));
+        }
+
+        server.close();
+    }
+
+    #[tokio::test]
+    async fn chat_truncates_unicode_but_room_command_sends_the_complete_name() {
+        let state = AppState::new();
+        {
+            let mut features = state.server_features.lock();
+            features.chat = true;
+            features.max_chat_message_length = Some(2);
+            features.max_room_name_length = Some(3);
+        }
+        let mut server = FakeSyncplayServer::start().await.unwrap();
+        let connection = Arc::new(Connection::new());
+        let (_receiver, _) = connection
+            .connect(server.host(), server.port())
+            .await
+            .unwrap();
+        connection.set_authenticated();
+        *state.connection.lock() = Some(connection);
+
+        send_chat_message_inner(&state, "测试😀").await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), server.next_received())
+                .await
+                .unwrap()
+                .unwrap(),
+            ProtocolMessage::Chat {
+                Chat: ProtocolChatMessage::Text(message)
+            } if message == "测试"
+        ));
+
+        let room = "这是一个远远超过服务端展示上限的完整房间名";
+        send_chat_message_inner(&state, &format!("/room {room}"))
+            .await
+            .unwrap();
+        let message = timeout(Duration::from_secs(2), server.next_received())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            message,
+            ProtocolMessage::Set { Set }
+                if Set.room.as_ref().map(|room| room.name.as_str()) == Some(room)
+        ));
+
+        server.close();
+    }
 }

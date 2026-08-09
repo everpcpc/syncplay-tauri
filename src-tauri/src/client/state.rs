@@ -87,7 +87,24 @@ impl ClientState {
     }
 
     pub fn set_room(&self, room: String) {
-        *self.room.write() = room;
+        let changed = {
+            let mut current_room = self.room.write();
+            if *current_room == room {
+                false
+            } else {
+                *current_room = room.clone();
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+
+        let username = self.username.read().clone();
+        if let Some(user) = self.users.write().get_mut(&username) {
+            user.room = room;
+            user.is_controller = false;
+        }
     }
 
     // File methods
@@ -212,5 +229,33 @@ impl Default for ClientState {
             is_ready: RwLock::new(None),
             server_version: RwLock::new(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_room_clears_current_users_controller_status() {
+        let state = ClientState::new();
+        state.set_username("alice".to_string());
+        state.set_room("old".to_string());
+        state.add_user(User {
+            username: "alice".to_string(),
+            room: "old".to_string(),
+            file: None,
+            file_size: None,
+            file_duration: None,
+            is_ready: None,
+            is_controller: true,
+            features: None,
+        });
+
+        state.set_room("new".to_string());
+
+        let current = state.get_user("alice").unwrap();
+        assert_eq!(current.room, "new");
+        assert!(!current.is_controller);
     }
 }

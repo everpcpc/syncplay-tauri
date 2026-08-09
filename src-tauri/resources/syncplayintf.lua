@@ -367,6 +367,195 @@ mp.register_script_message('get_paused_and_position', function()
     state_paused_and_position()
 end)
 
+-- Syncplay generation-aware loading. The per-file marker is the authoritative
+-- token on old mpv versions, where start-file/end-file have no playlist ID.
+local syncplay_loads_by_entry = {}
+local syncplay_active_loads_by_entry = {}
+local syncplay_redirects_by_entry = {}
+local syncplay_pending_start_entry = nil
+local syncplay_active_load = nil
+local syncplay_latest_armed = nil
+
+local function syncplay_emit_load_event(phase, token, reason, entry_id, detail, propagated)
+    mp.commandv(
+        "script-message",
+        "syncplay-load-event",
+        phase,
+        token or "",
+        reason or "",
+        entry_id and tostring(entry_id) or "",
+        detail or "",
+        propagated == nil and "" or tostring(propagated)
+    )
+end
+
+local function syncplay_clear_redirects(token)
+    for entry_key, redirected_token in pairs(syncplay_redirects_by_entry) do
+        if redirected_token == token then
+            syncplay_redirects_by_entry[entry_key] = nil
+        end
+    end
+end
+
+local function syncplay_marker(load_id)
+    return "<SyncplayUpdateFile>\n"
+        .. "ANS_syncplay_load_id=" .. load_id .. "\n"
+        .. "ANS_filename=${filename}\n"
+        .. "ANS_length=${=duration:${=length:0}}\n"
+        .. "ANS_path=${path}\n"
+        .. "</SyncplayUpdateFile>"
+end
+
+local function syncplay_marker_load_id()
+    local marker = mp.get_property("file-local-options/term-playing-msg")
+    if not marker then
+        return nil
+    end
+    return string.match(marker, "ANS_syncplay_load_id=(%d+)")
+end
+
+mp.register_script_message('syncplay-load-ping', function(nonce)
+    syncplay_emit_load_event("ready", nonce)
+end)
+
+mp.register_script_message('syncplay-load-file', function(load_id, path, syntax)
+    if not load_id or not string.match(load_id, "^%d+$") or not path then
+        syncplay_emit_load_event("rejected", load_id, "invalid generation load request")
+        return
+    end
+
+    syncplay_latest_armed = load_id
+    local options = { ["term-playing-msg"] = syncplay_marker(load_id) }
+    local major, minor = string.match(mp.get_property("mpv-version", "0.23"), "^(%d+)%.(%d+)")
+    major = tonumber(major) or 0
+    minor = tonumber(minor) or 23
+    local use_modern = syntax == "modern"
+        or (syntax == "auto"
+            and (major > 0 or minor >= 38))
+
+    local function run_load(modern)
+        local command
+        if modern then
+            command = { "loadfile", path, "replace", -1, options }
+        else
+            command = { "loadfile", path, "replace", options }
+        end
+        return pcall(mp.command_native, command)
+    end
+
+    local call_ok, result, load_error = run_load(use_modern)
+    if syntax == "auto" and (not call_ok or not result) then
+        call_ok, result, load_error = run_load(not use_modern)
+    end
+    if not call_ok or not result then
+        if syncplay_latest_armed == load_id then
+            syncplay_latest_armed = nil
+        end
+        syncplay_emit_load_event(
+            "rejected",
+            load_id,
+            (call_ok and load_error) or tostring(result) or "loadfile failed"
+        )
+        return
+    end
+
+    local entry_id = type(result) == "table" and result.playlist_entry_id or nil
+    if entry_id then
+        syncplay_loads_by_entry[tostring(entry_id)] = load_id
+    end
+    syncplay_emit_load_event("accepted", load_id, nil, entry_id)
+end)
+
+mp.register_event("start-file", function(event)
+    syncplay_pending_start_entry = event and event.playlist_entry_id or nil
+end)
+
+mp.add_hook("on_load", 50, function()
+    local entry_id = syncplay_pending_start_entry
+    local entry_key = entry_id and tostring(entry_id) or nil
+    local token = syncplay_marker_load_id()
+    local redirected_token = entry_key and syncplay_redirects_by_entry[entry_key] or nil
+
+    if not token and entry_key then
+        token = syncplay_loads_by_entry[entry_key]
+            or redirected_token
+    end
+    if entry_key then
+        syncplay_loads_by_entry[entry_key] = nil
+    end
+    if redirected_token then
+        -- A redirect token belongs to the first child mpv actually opens. The
+        -- remaining inserted entries are alternatives, not continuations of
+        -- the same Syncplay load. A nested redirect can establish a fresh set.
+        syncplay_clear_redirects(redirected_token)
+    end
+    if token == syncplay_latest_armed then
+        syncplay_latest_armed = nil
+    end
+    if token and not syncplay_marker_load_id() then
+        mp.set_property("file-local-options/term-playing-msg", syncplay_marker(token))
+    end
+
+    if entry_key then
+        syncplay_active_loads_by_entry[entry_key] = token
+        syncplay_active_load = nil
+    else
+        syncplay_active_load = { token = token }
+    end
+    syncplay_pending_start_entry = nil
+    syncplay_emit_load_event(
+        "start",
+        token,
+        nil,
+        entry_id,
+        mp.get_property("path") or ""
+    )
+end)
+
+mp.register_event("end-file", function(event)
+    local entry_id = event and event.playlist_entry_id or nil
+    local entry_key = entry_id and tostring(entry_id) or nil
+    local token
+    if entry_key then
+        token = syncplay_active_loads_by_entry[entry_key]
+            or syncplay_loads_by_entry[entry_key]
+            or syncplay_redirects_by_entry[entry_key]
+    else
+        token = syncplay_active_load and syncplay_active_load.token or nil
+    end
+    local reason = event and event.reason or "unknown"
+    local propagated = false
+
+    if reason == "redirect" and token
+        and (not syncplay_latest_armed or syncplay_latest_armed == token) then
+        local first_id = event and event.playlist_insert_id or nil
+        local count = event and event.playlist_insert_num_entries or nil
+        if first_id and count then
+            for inserted_id = first_id, first_id + count - 1 do
+                syncplay_redirects_by_entry[tostring(inserted_id)] = token
+            end
+            propagated = count > 0
+        end
+    end
+
+    syncplay_emit_load_event(
+        "end",
+        token,
+        reason,
+        entry_id,
+        event and (event.file_error or event.error) or nil,
+        propagated
+    )
+
+    if entry_key then
+        syncplay_active_loads_by_entry[entry_key] = nil
+        syncplay_loads_by_entry[entry_key] = nil
+        syncplay_redirects_by_entry[entry_key] = nil
+    else
+        syncplay_active_load = nil
+    end
+end)
+
 -- Default options
 local utils = require 'mp.utils'
 local options = require 'mp.options'

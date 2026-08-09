@@ -9,10 +9,12 @@ use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
 use super::backend::PlayerBackend;
+use super::mpc_api::{MpcMediaSettle, MpcMediaSettleAction};
 use super::properties::PlayerState;
 
 const DEFAULT_MPC_PORT: u16 = 13579;
 const MPC_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+const MPC_CMD_PLAYPAUSE: u32 = 0xA0000003;
 const MPC_CMD_CLOSEAPP: u32 = 0xA0004006;
 
 pub struct MpcWebBackend {
@@ -34,6 +36,7 @@ impl MpcWebBackend {
             kind, player_path, args, initial_file
         );
         let mut cmd = Command::new(player_path);
+        cmd.kill_on_drop(true);
         cmd.args(args);
         if let Some(path) = initial_file {
             cmd.arg(path);
@@ -80,10 +83,21 @@ impl MpcWebBackend {
             url.push_str("&p1=");
             url.push_str(&urlencoding::encode(value));
         }
-        let response = self.client.get(url).send().await?;
+        let response = self.client.get(url).send().await.inspect_err(|_error| {
+            self.connected.store(false, Ordering::SeqCst);
+        })?;
         if !response.status().is_success() {
-            warn!("MPC command failed with status {}", response.status());
+            self.connected.store(false, Ordering::SeqCst);
+            anyhow::bail!("MPC command failed with status {}", response.status());
         }
+        Ok(())
+    }
+
+    async fn refresh_state(&self) -> anyhow::Result<()> {
+        let text = self.get_variables().await?;
+        debug!("mpc variables: {}", text);
+        let new_state = self.parse_variables(&text);
+        *self.state.lock() = new_state;
         Ok(())
     }
 
@@ -132,12 +146,8 @@ impl PlayerBackend for MpcWebBackend {
     }
 
     async fn poll_state(&self) -> anyhow::Result<()> {
-        match self.get_variables().await {
-            Ok(text) => {
-                debug!("mpc variables: {}", text);
-                let new_state = self.parse_variables(&text);
-                *self.state.lock() = new_state;
-            }
+        match self.refresh_state().await {
+            Ok(()) => {}
             Err(e) => {
                 self.connected.store(false, Ordering::SeqCst);
                 warn!("Failed to read MPC variables: {}", e);
@@ -154,6 +164,39 @@ impl PlayerBackend for MpcWebBackend {
     async fn set_paused(&self, paused: bool) -> anyhow::Result<()> {
         let command = if paused { 0xA0000005 } else { 0xA0000004 };
         self.send_command(command, None).await
+    }
+
+    async fn settle_media_change(&self, paused: bool, position: f64) -> anyhow::Result<()> {
+        let mut settle = MpcMediaSettle::new(paused, position);
+        loop {
+            if settle.needs_pause_observation() {
+                self.refresh_state().await.inspect_err(|_error| {
+                    self.connected.store(false, Ordering::SeqCst);
+                })?;
+            }
+            let observed_paused = self.state.lock().paused;
+            let Some(action) = settle.next(observed_paused) else {
+                return Ok(());
+            };
+            match action {
+                MpcMediaSettleAction::SetPaused { paused, delay } => {
+                    self.set_paused(paused).await?;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                MpcMediaSettleAction::TogglePaused { delay } => {
+                    self.send_command(MPC_CMD_PLAYPAUSE, None).await?;
+                    tokio::time::sleep(delay).await;
+                }
+                MpcMediaSettleAction::SetPosition(position) => {
+                    self.set_position(position).await?;
+                }
+                MpcMediaSettleAction::Failed => {
+                    anyhow::bail!("MPC pause state did not settle after retries");
+                }
+            }
+        }
     }
 
     async fn set_speed(&self, speed: f64) -> anyhow::Result<()> {
