@@ -100,10 +100,12 @@ export function AppTooltipPortal() {
     };
 
     const handlePointerOver = (event: PointerEvent) => {
-      if (pointerPressedRef.current || event.buttons !== 0) {
+      if (event.buttons !== 0) {
+        pointerPressedRef.current = true;
         hideTooltip();
         return;
       }
+      pointerPressedRef.current = false;
       const target = findTooltipTarget(event.target);
       if (target && target !== activeTargetRef.current) {
         showTooltip(target);
