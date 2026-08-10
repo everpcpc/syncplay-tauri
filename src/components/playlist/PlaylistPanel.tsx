@@ -595,7 +595,7 @@ export function PlaylistPanel() {
               <span className="text-sm font-semibold">Playlist</span>
               <span className="text-xs app-text-muted app-tnum">({playlist.items.length})</span>
             </div>
-            <div className="flex items-center gap-2 flex-1 justify-center">
+            <div className="flex items-center gap-2 flex-1">
               <button
                 onClick={handleAddFile}
                 disabled={!connection.connected}

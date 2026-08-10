@@ -178,7 +178,7 @@ function AppHeader({
                 type="button"
                 onClick={onCheckForUpdates}
                 disabled={isCheckingForUpdates || isInstallingUpdate}
-                className="btn-neutral inline-flex items-center justify-center px-2 py-1 rounded-lg text-xs shrink-0"
+                className="inline-flex items-center justify-center px-2 py-1 rounded-lg text-xs app-panel-muted shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
                 data-tauri-drag-region="false"
                 aria-busy={isCheckingForUpdates}
                 aria-label={
