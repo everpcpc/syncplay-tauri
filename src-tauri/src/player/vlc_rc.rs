@@ -129,7 +129,13 @@ fn handle_line(
     debug!("vlc >> {}", line);
     let trimmed = line.trim();
     if let Some(value) = trimmed.strip_prefix("time:") {
-        state.lock().position = value.trim().parse::<f64>().ok();
+        let position = value.trim().parse::<f64>().ok();
+        let mut state = state.lock();
+        if position.is_some() {
+            state.observe_position(position);
+        } else {
+            state.position = None;
+        }
         return;
     }
     if let Some(value) = trimmed.strip_prefix("length:") {
@@ -138,16 +144,16 @@ fn handle_line(
     }
     if let Some(value) = trimmed.strip_prefix("state ") {
         match value.trim() {
-            "playing" => state.lock().paused = Some(false),
-            "paused" | "stopped" => state.lock().paused = Some(true),
+            "playing" => state.lock().observe_paused(Some(false)),
+            "paused" | "stopped" => state.lock().observe_paused(Some(true)),
             _ => {}
         }
         return;
     }
     if let Some(value) = trimmed.strip_prefix("state:") {
         match value.trim() {
-            "playing" => state.lock().paused = Some(false),
-            "paused" | "stopped" => state.lock().paused = Some(true),
+            "playing" => state.lock().observe_paused(Some(false)),
+            "paused" | "stopped" => state.lock().observe_paused(Some(true)),
             _ => {}
         }
         return;

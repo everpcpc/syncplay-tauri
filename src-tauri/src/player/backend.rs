@@ -148,6 +148,7 @@ struct FakePlayerInner {
     poll_delay: Option<std::time::Duration>,
     settle_delay: Option<std::time::Duration>,
     settle_error: Option<String>,
+    confirm_commands: bool,
 }
 
 #[cfg(test)]
@@ -170,24 +171,15 @@ impl FakePlayerBackend {
                 poll_delay: None,
                 settle_delay: None,
                 settle_error: None,
+                confirm_commands: false,
             })),
         }
     }
 
     pub fn with_state(kind: PlayerKind, state: PlayerState) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(FakePlayerInner {
-                kind,
-                state,
-                commands: Vec::new(),
-                shutdown_count: 0,
-                connected: true,
-                load_delay: None,
-                poll_delay: None,
-                settle_delay: None,
-                settle_error: None,
-            })),
-        }
+        let player = Self::new(kind);
+        player.set_fake_state(state);
+        player
     }
 
     pub fn commands(&self) -> Vec<FakePlayerCommand> {
@@ -199,7 +191,17 @@ impl FakePlayerBackend {
     }
 
     pub fn set_fake_state(&self, state: PlayerState) {
-        self.inner.lock().state = state;
+        let mut inner = self.inner.lock();
+        let mut state = state;
+        let position = state.position;
+        let paused = state.paused;
+        state.observed_position = inner.state.observed_position;
+        state.observed_paused = inner.state.observed_paused;
+        state.position_observation_generation = inner.state.position_observation_generation;
+        state.paused_observation_generation = inner.state.paused_observation_generation;
+        state.observe_position(position);
+        state.observe_paused(paused);
+        inner.state = state;
     }
 
     pub fn set_connected(&self, connected: bool) {
@@ -220,6 +222,10 @@ impl FakePlayerBackend {
 
     pub fn set_settle_error(&self, error: impl Into<String>) {
         self.inner.lock().settle_error = Some(error.into());
+    }
+
+    pub fn set_confirm_commands(&self, confirm_commands: bool) {
+        self.inner.lock().confirm_commands = confirm_commands;
     }
 }
 
@@ -277,7 +283,11 @@ impl PlayerBackend for FakePlayerBackend {
 
     async fn set_position(&self, position: f64) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
-        inner.state.position = Some(position);
+        if inner.confirm_commands {
+            inner.state.observe_position(Some(position));
+        } else {
+            inner.state.position = Some(position);
+        }
         inner
             .commands
             .push(FakePlayerCommand::SetPosition(position));
@@ -286,7 +296,11 @@ impl PlayerBackend for FakePlayerBackend {
 
     async fn set_paused(&self, paused: bool) -> anyhow::Result<()> {
         let mut inner = self.inner.lock();
-        inner.state.paused = Some(paused);
+        if inner.confirm_commands {
+            inner.state.observe_paused(Some(paused));
+        } else {
+            inner.state.paused = Some(paused);
+        }
         inner.commands.push(FakePlayerCommand::SetPaused(paused));
         Ok(())
     }
@@ -417,5 +431,26 @@ mod tests {
                 FakePlayerCommand::Shutdown,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn fake_player_separates_commands_from_observations() {
+        let player = FakePlayerBackend::new(PlayerKind::Mpv);
+        player.set_fake_state(PlayerState {
+            position: Some(10.0),
+            paused: Some(false),
+            ..PlayerState::default()
+        });
+
+        player.set_position(42.0).await.unwrap();
+        player.set_paused(true).await.unwrap();
+
+        let state = player.get_state();
+        assert_eq!(state.position, Some(42.0));
+        assert_eq!(state.observed_position, Some(10.0));
+        assert_eq!(state.position_observation_generation, 1);
+        assert_eq!(state.paused, Some(true));
+        assert_eq!(state.observed_paused, Some(false));
+        assert_eq!(state.paused_observation_generation, 1);
     }
 }

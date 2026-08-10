@@ -978,13 +978,35 @@ impl MpvIpc {
         self.send_command(cmd)
     }
 
+    #[cfg(test)]
     pub fn update_pause_and_position(&self, paused: Option<bool>, position: Option<f64>) {
+        self.update_pause_and_position_with_observation(
+            paused,
+            position,
+            paused.is_some(),
+            position.is_some(),
+        );
+    }
+
+    pub fn update_pause_and_position_with_observation(
+        &self,
+        paused: Option<bool>,
+        position: Option<f64>,
+        paused_observed: bool,
+        position_observed: bool,
+    ) {
         let mut state = self.state.lock();
-        if let Some(paused) = paused {
-            state.paused = Some(paused);
+        if paused_observed {
+            state.observe_paused(paused);
+        } else if paused.is_some() {
+            state.paused = paused;
         }
-        if let Some(position) = position {
-            state.position = Some(position);
+        if position_observed {
+            state.observe_position(position);
+        } else if position.is_some() {
+            state.position = position;
+        }
+        if position.is_some() {
             *self.last_position_update.lock() = Some(Instant::now());
         }
     }
@@ -1949,6 +1971,7 @@ mod tests {
     fn store_pause_state_refreshes_position_clock_when_unpausing() {
         let ipc = MpvIpc::new("unused");
         ipc.update_pause_and_position(Some(true), Some(10.0));
+        let observed_generation = ipc.get_state().paused_observation_generation;
         let before_unpause = ipc.last_position_update().expect("position update missing");
 
         std::thread::sleep(Duration::from_millis(1));
@@ -1956,7 +1979,10 @@ mod tests {
 
         let after_unpause = ipc.last_position_update().expect("position update missing");
         assert!(after_unpause > before_unpause);
-        assert_eq!(ipc.get_state().paused, Some(false));
+        let state = ipc.get_state();
+        assert_eq!(state.paused, Some(false));
+        assert_eq!(state.observed_paused, Some(true));
+        assert_eq!(state.paused_observation_generation, observed_generation);
     }
 
     #[test]
@@ -1987,6 +2013,7 @@ mod tests {
     fn store_position_state_refreshes_position_clock_after_seek() {
         let ipc = MpvIpc::new("unused");
         ipc.update_pause_and_position(Some(false), Some(10.0));
+        let observed_generation = ipc.get_state().position_observation_generation;
         let before_seek = ipc.last_position_update().expect("position update missing");
 
         std::thread::sleep(Duration::from_millis(1));
@@ -1994,7 +2021,10 @@ mod tests {
 
         let after_seek = ipc.last_position_update().expect("position update missing");
         assert!(after_seek > before_seek);
-        assert_eq!(ipc.get_state().position, Some(25.0));
+        let state = ipc.get_state();
+        assert_eq!(state.position, Some(25.0));
+        assert_eq!(state.observed_position, Some(10.0));
+        assert_eq!(state.position_observation_generation, observed_generation);
     }
 
     #[test]
