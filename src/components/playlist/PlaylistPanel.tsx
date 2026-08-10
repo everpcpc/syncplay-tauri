@@ -19,17 +19,33 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { SyncplayConfig } from "../../types/config";
-import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type DragEvent } from "react";
 import { createPortal } from "react-dom";
 import { MediaDirectoriesDialog } from "./MediaDirectoriesDialog";
 import { TrustedDomainsDialog } from "./TrustedDomainsDialog";
 
 const LAST_ADD_FILE_DIRECTORY_KEY = "syncplay.lastAddFileDirectory";
+const PLAYLIST_REORDER_ANIMATION_MS = 180;
 
 interface PlaylistItemStatus {
   filename: string;
   path: string | null;
   available: boolean;
+}
+
+interface PlaylistReorderAnimation {
+  expectedItems: string[];
+  startRects: Map<number, DOMRect>;
+}
+
+function reorderItems<T>(items: readonly T[], fromIndex: number, toIndex: number): T[] | null {
+  if (fromIndex < 0 || fromIndex >= items.length) return null;
+  if (toIndex < 0 || toIndex > items.length || fromIndex === toIndex) return null;
+  const nextItems = [...items];
+  const [moved] = nextItems.splice(fromIndex, 1);
+  const insertIndex = Math.min(fromIndex < toIndex ? toIndex - 1 : toIndex, nextItems.length);
+  nextItems.splice(insertIndex, 0, moved);
+  return nextItems.every((item, index) => item === items[index]) ? null : nextItems;
 }
 
 export function PlaylistPanel() {
@@ -60,7 +76,9 @@ export function PlaylistPanel() {
     active: boolean;
   } | null>(null);
   const dragGhostRafRef = useRef<number | null>(null);
+  const reorderAnimationRef = useRef<PlaylistReorderAnimation | null>(null);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
+  const [dragTargetIndex, setDragTargetIndex] = useState<number | null>(null);
   const [dragGhost, setDragGhost] = useState<{
     text: string;
     width: number;
@@ -144,20 +162,15 @@ export function PlaylistPanel() {
     if (!dragGhost || typeof document === "undefined") return null;
     return createPortal(
       <div
-        className="pointer-events-none fixed"
+        className="playlist-drag-ghost pointer-events-none fixed"
         style={{
           left: dragGhost.x,
           top: dragGhost.y,
           width: dragGhost.width,
           height: dragGhost.height,
-          zIndex: 9999,
-          opacity: 0.92,
-          transform: "scale(1.02)",
-          transformOrigin: "top left",
-          transition: "transform 120ms ease, opacity 120ms ease",
         }}
       >
-        <div className="h-full w-full rounded-md app-panel-muted text-sm px-2 py-2 shadow-lg opacity-95">
+        <div className="h-full w-full rounded-md app-panel-glass text-sm px-2 py-2">
           {dragGhost.text}
         </div>
       </div>,
@@ -357,25 +370,21 @@ export function PlaylistPanel() {
   };
 
   const handleReorderItems = useCallback(
-    async (fromIndex: number, toIndex: number) => {
-      if (!connection.connected) return;
-      const count = playlist.items.length;
-      if (fromIndex < 0 || fromIndex >= count) return;
-      if (toIndex < 0 || toIndex > count) return;
-      if (fromIndex === toIndex) return;
-
-      const nextItems = [...playlist.items];
-      const [moved] = nextItems.splice(fromIndex, 1);
-      let insertIndex = toIndex;
-      if (fromIndex < toIndex) {
-        insertIndex = Math.max(0, toIndex - 1);
+    async (fromIndex: number, toIndex: number, animation: PlaylistReorderAnimation | null) => {
+      const clearAnimation = () => {
+        if (reorderAnimationRef.current === animation) {
+          reorderAnimationRef.current = null;
+        }
+      };
+      if (!connection.connected) {
+        clearAnimation();
+        return;
       }
-      insertIndex = Math.min(insertIndex, nextItems.length);
-      nextItems.splice(insertIndex, 0, moved);
-      const isSameOrder =
-        nextItems.length === playlist.items.length &&
-        nextItems.every((item, idx) => item === playlist.items[idx]);
-      if (isSameOrder) return;
+      const nextItems = reorderItems(playlist.items, fromIndex, toIndex);
+      if (!nextItems) {
+        clearAnimation();
+        return;
+      }
 
       try {
         await invoke("update_playlist", {
@@ -383,6 +392,7 @@ export function PlaylistPanel() {
           items: nextItems,
         });
       } catch (error) {
+        clearAnimation();
         addNotification({
           type: "error",
           message: "Failed to reorder playlist",
@@ -408,6 +418,62 @@ export function PlaylistPanel() {
     }
     return items.length;
   }, []);
+
+  const capturePlaylistItemRects = useCallback(
+    (fromIndex: number, toIndex: number): PlaylistReorderAnimation | null => {
+      const expectedItems = reorderItems(playlist.items, fromIndex, toIndex);
+      const reorderedIndexes = reorderItems(
+        playlist.items.map((_, index) => index),
+        fromIndex,
+        toIndex
+      );
+      const container = playlistContainerRef.current;
+      if (!expectedItems || !reorderedIndexes || !container) return null;
+      const currentRects = new Map<number, DOMRect>();
+      container.querySelectorAll<HTMLElement>("[data-playlist-item]").forEach((item) => {
+        const index = Number(item.dataset.index);
+        if (!Number.isNaN(index)) currentRects.set(index, item.getBoundingClientRect());
+      });
+      const startRects = new Map<number, DOMRect>();
+      reorderedIndexes.forEach((previousIndex, nextIndex) => {
+        const rect = currentRects.get(previousIndex);
+        if (rect) startRects.set(nextIndex, rect);
+      });
+      if (startRects.size === 0) return null;
+      const animation = { expectedItems, startRects };
+      reorderAnimationRef.current = animation;
+      return animation;
+    },
+    [playlist.items]
+  );
+
+  useLayoutEffect(() => {
+    const animation = reorderAnimationRef.current;
+    if (!animation) return;
+    const matchesExpectedOrder =
+      animation.expectedItems.length === playlist.items.length &&
+      animation.expectedItems.every((item, index) => item === playlist.items[index]);
+    if (!matchesExpectedOrder) return;
+    reorderAnimationRef.current = null;
+    const container = playlistContainerRef.current;
+    if (!container || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    container.querySelectorAll<HTMLElement>("[data-playlist-item]").forEach((item) => {
+      const index = Number(item.dataset.index);
+      const startRect = Number.isNaN(index) ? null : animation.startRects.get(index);
+      if (!startRect) return;
+      const endRect = item.getBoundingClientRect();
+      const deltaX = startRect.left - endRect.left;
+      const deltaY = startRect.top - endRect.top;
+      if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) return;
+      item.animate(
+        [{ transform: `translate(${deltaX}px, ${deltaY}px)` }, { transform: "translate(0, 0)" }],
+        {
+          duration: PLAYLIST_REORDER_ANIMATION_MS,
+          easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+        }
+      );
+    });
+  }, [playlist.items]);
 
   const scheduleDragGhostUpdate = useCallback((x: number, y: number) => {
     if (dragGhostRafRef.current !== null) return;
@@ -443,8 +509,9 @@ export function PlaylistPanel() {
         setDraggingIndex(dragState.index);
       }
       const dropIndex = getDropIndex(event.clientY);
-      if (dropIndex !== null) {
+      if (dropIndex !== null && dragOverIndexRef.current !== dropIndex) {
         dragOverIndexRef.current = dropIndex;
+        setDragTargetIndex(dropIndex);
       }
       const nextX = event.clientX - dragState.offsetX;
       const nextY = event.clientY - dragState.offsetY;
@@ -459,6 +526,7 @@ export function PlaylistPanel() {
     const dragState = dragStartRef.current;
     dragStartRef.current = null;
     setDraggingIndex(null);
+    setDragTargetIndex(null);
     setDragGhost(null);
     if (dragGhostRafRef.current !== null) {
       window.cancelAnimationFrame(dragGhostRafRef.current);
@@ -471,10 +539,11 @@ export function PlaylistPanel() {
     }
     const fromIndex = dragState.index;
     const toIndex = dragOverIndexRef.current ?? fromIndex;
+    const animation = capturePlaylistItemRects(fromIndex, toIndex);
     dragIndexRef.current = null;
     dragOverIndexRef.current = null;
-    void handleReorderItems(fromIndex, toIndex);
-  }, [handlePointerMove, handleReorderItems]);
+    void handleReorderItems(fromIndex, toIndex, animation);
+  }, [capturePlaylistItemRects, handlePointerMove, handleReorderItems]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -526,6 +595,13 @@ export function PlaylistPanel() {
   const scanLabel = mediaIndexRefreshing ? "Scanning media directory" : "Scan media directory";
   const scanTooltip = `${scanLabel} (Last scan: ${formatLastScan(mediaIndexVersion)})`;
 
+  const dropIndicatorIndex =
+    draggingIndex !== null &&
+    dragTargetIndex !== null &&
+    dragTargetIndex !== draggingIndex &&
+    dragTargetIndex !== draggingIndex + 1
+      ? dragTargetIndex
+      : null;
   const handleRemoveItem = async (index: number) => {
     try {
       await invoke("update_playlist", {
@@ -661,7 +737,11 @@ export function PlaylistPanel() {
             </p>
           </div>
         ) : (
-          <div className="space-y-2">
+          <div
+            className={`playlist-list space-y-2 ${
+              dropIndicatorIndex === playlist.items.length ? "playlist-list-drop-at-end" : ""
+            }`}
+          >
             {playlist.items.map((item, index) =>
               (() => {
                 const itemStatus = availability[index];
@@ -679,9 +759,15 @@ export function PlaylistPanel() {
                         void handlePlayItem(index);
                       }
                     }}
-                    className={`p-2.5 rounded-lg text-sm select-none transition-transform transition-opacity duration-150 ${
+                    className={`playlist-item p-2.5 rounded-lg text-sm select-none transition-transform transition-opacity duration-150 ${
                       isCurrent ? "app-item-playing" : "app-panel-muted group"
-                    } ${draggingIndex === index ? "opacity-40 scale-[0.98]" : ""}`}
+                    } ${
+                      connection.connected && playlist.items.length > 1
+                        ? "playlist-item-sortable"
+                        : ""
+                    } ${draggingIndex === index ? "playlist-item-dragging" : ""} ${
+                      dropIndicatorIndex === index ? "playlist-item-drop-before" : ""
+                    }`}
                     data-playlist-item
                     data-index={index}
                     onPointerDown={(event) => {
