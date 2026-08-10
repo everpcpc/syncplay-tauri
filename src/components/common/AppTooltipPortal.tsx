@@ -43,6 +43,7 @@ export function AppTooltipPortal() {
   );
   const tooltipRef = useRef<HTMLDivElement | null>(null);
   const activeTargetRef = useRef<HTMLElement | null>(null);
+  const pointerPressedRef = useRef(false);
   const showFrameRef = useRef<number | null>(null);
 
   const hideTooltip = useCallback(() => {
@@ -89,7 +90,22 @@ export function AppTooltipPortal() {
   );
 
   useEffect(() => {
+    const handlePointerDown = () => {
+      pointerPressedRef.current = true;
+      hideTooltip();
+    };
+
+    const handlePointerRelease = () => {
+      pointerPressedRef.current = false;
+    };
+
     const handlePointerOver = (event: PointerEvent) => {
+      if (event.buttons !== 0) {
+        pointerPressedRef.current = true;
+        hideTooltip();
+        return;
+      }
+      pointerPressedRef.current = false;
       const target = findTooltipTarget(event.target);
       if (target && target !== activeTargetRef.current) {
         showTooltip(target);
@@ -107,6 +123,7 @@ export function AppTooltipPortal() {
     };
 
     const handleFocusIn = (event: FocusEvent) => {
+      if (pointerPressedRef.current) return;
       const target = findTooltipTarget(event.target);
       if (target) showTooltip(target);
     };
@@ -143,6 +160,7 @@ export function AppTooltipPortal() {
       }
     };
 
+    document.addEventListener("pointerdown", handlePointerDown, true);
     document.addEventListener("pointerover", handlePointerOver);
     document.addEventListener("pointerout", handlePointerOut);
     document.addEventListener("focusin", handleFocusIn);
@@ -151,8 +169,12 @@ export function AppTooltipPortal() {
     document.addEventListener(APP_DIALOG_PORTAL_CHANGE_EVENT, handleDialogPortalChange);
     window.addEventListener("resize", handleViewportChange);
     window.addEventListener("scroll", handleViewportChange, true);
+    window.addEventListener("pointerup", handlePointerRelease, true);
+    window.addEventListener("pointercancel", handlePointerRelease, true);
+    window.addEventListener("blur", handlePointerRelease);
 
     return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, true);
       document.removeEventListener("pointerover", handlePointerOver);
       document.removeEventListener("pointerout", handlePointerOut);
       document.removeEventListener("focusin", handleFocusIn);
@@ -161,6 +183,9 @@ export function AppTooltipPortal() {
       document.removeEventListener(APP_DIALOG_PORTAL_CHANGE_EVENT, handleDialogPortalChange);
       window.removeEventListener("resize", handleViewportChange);
       window.removeEventListener("scroll", handleViewportChange, true);
+      window.removeEventListener("pointerup", handlePointerRelease, true);
+      window.removeEventListener("pointercancel", handlePointerRelease, true);
+      window.removeEventListener("blur", handlePointerRelease);
       if (showFrameRef.current !== null) {
         window.cancelAnimationFrame(showFrameRef.current);
       }

@@ -649,6 +649,70 @@
   color: var(--app-text);
 }
 
+.playlist-list,
+.playlist-item {
+  position: relative;
+}
+
+.playlist-item-sortable {
+  cursor: grab;
+}
+
+.playlist-item-sortable:active {
+  cursor: grabbing;
+}
+
+.playlist-item-dragging {
+  background: var(--app-accent-soft);
+  border-color: var(--app-accent);
+  border-style: dashed;
+  box-shadow: inset 0 0 0 1px var(--app-accent-soft);
+}
+
+.playlist-item-dragging > * {
+  visibility: hidden;
+}
+
+.playlist-item-drop-before::before,
+.playlist-list-drop-at-end::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  z-index: 2;
+  border-top: 2px dashed var(--app-accent);
+  pointer-events: none;
+}
+
+.playlist-item-drop-before::before {
+  top: -5px;
+}
+
+.playlist-list-drop-at-end::after {
+  bottom: -5px;
+}
+
+.playlist-drag-ghost {
+  z-index: 9999;
+  opacity: 0.94;
+  transform: scale(1.02);
+  transform-origin: top left;
+  transition:
+    transform 120ms ease,
+    opacity 120ms ease;
+}
+
+.playlist-drag-ghost > div {
+  box-shadow: var(--app-shadow);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .playlist-item,
+  .playlist-drag-ghost {
+    transition: none;
+  }
+}
+
 .app-overlay {
   background-color: var(--app-overlay);
 }
