@@ -611,6 +611,8 @@ async fn handle_syncplayintf_line(
     }
     if line.contains("<paused=") && line.contains(", pos=") {
         if let Some((mut paused, mut position)) = parse_pause_position(line) {
+            let paused_observed = paused.is_some();
+            let position_observed = position.is_some();
             if paused.is_none() || position.is_none() {
                 if let Some(app_state) = state.upgrade() {
                     let global = app_state.effective_global_state();
@@ -618,7 +620,12 @@ async fn handle_syncplayintf_line(
                     position = position.or(Some(global.position));
                 }
             }
-            ipc.update_pause_and_position(paused, position);
+            ipc.update_pause_and_position_with_observation(
+                paused,
+                position,
+                paused_observed,
+                position_observed,
+            );
         }
         return;
     }
@@ -1903,6 +1910,10 @@ mod tests {
         let state = ipc.get_state();
         assert_eq!(state.paused, Some(true));
         assert_eq!(state.position, Some(23.5));
+        assert_eq!(state.observed_paused, None);
+        assert_eq!(state.observed_position, None);
+        assert_eq!(state.paused_observation_generation, 0);
+        assert_eq!(state.position_observation_generation, 0);
     }
 
     #[tokio::test]

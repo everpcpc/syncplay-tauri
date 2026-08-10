@@ -432,7 +432,7 @@ fn handle_line(
             }
             ResponseKey::Position => {
                 if let Some(position) = value.and_then(|value| value.parse::<f64>().ok()) {
-                    state.lock().position = Some(position);
+                    state.lock().observe_position(Some(position));
                 }
             }
             ResponseKey::Pause => {
@@ -442,7 +442,7 @@ fn handle_line(
                     _ => None,
                 });
                 if paused.is_some() {
-                    state.lock().paused = paused;
+                    state.lock().observe_paused(paused);
                 }
             }
             ResponseKey::Speed => {
@@ -611,11 +611,12 @@ impl PlayerBackend for MplayerBackend {
     async fn set_paused(&self, paused: bool) -> anyhow::Result<()> {
         let current = self.state.lock().paused.unwrap_or(false);
         if paused != current {
+            self.send_command("pause").await?;
             self.state.lock().paused = Some(paused);
-            self.send_command("pause").await
         } else {
-            Ok(())
+            return Ok(());
         }
+        Ok(())
     }
 
     async fn set_speed(&self, speed: f64) -> anyhow::Result<()> {

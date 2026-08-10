@@ -364,7 +364,7 @@ async fn handle_line(
                 paused = true;
                 let _ = connection.send_line("set-playstate: paused").await;
             }
-            state.lock().paused = Some(paused);
+            state.lock().observe_paused(Some(paused));
         }
         "position" => {
             if argument != "no-input" {
@@ -376,7 +376,7 @@ async fn handle_line(
                     *last_position_update.lock() = Some(Instant::now());
                 }
             } else {
-                state.lock().position = None;
+                state.lock().observe_position(None);
             }
         }
         "duration-change" => {
@@ -436,7 +436,7 @@ async fn handle_line(
                     size: None,
                 },
             );
-            guard.position = None;
+            guard.observe_position(None);
             drop(guard);
             *last_duration.lock() = None;
             media_refresh.lock().invalidate_active();
@@ -594,7 +594,7 @@ fn store_vlc_position(
             history.previous = previous_position;
         }
     }
-    state.lock().position = Some(position);
+    state.lock().observe_position(Some(position));
 }
 
 fn parse_line(line: &str) -> (String, String) {

@@ -1106,6 +1106,28 @@ fn should_ignore_seek_after_rewind(state: &Arc<AppState>, position: f64) -> bool
         && position > IGNORE_SEEK_AFTER_REWIND_POSITION_THRESHOLD
 }
 
+fn with_current_player_local_state<R>(
+    state: &Arc<AppState>,
+    player: &Arc<dyn PlayerBackend>,
+    operation: impl FnOnce(&mut crate::client::local_state::LocalPlaybackState) -> R,
+) -> Option<R> {
+    let player_slot = state.player.lock();
+    if !player_slot
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, player))
+    {
+        return None;
+    }
+    let mut local_state = state.local_playback_state.lock();
+    Some(operation(&mut local_state))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteCorrectionStart {
+    AlreadyActive,
+    Started(u64),
+}
+
 async fn try_set_position(
     state: &Arc<AppState>,
     player: &Arc<dyn PlayerBackend>,
@@ -1116,11 +1138,95 @@ async fn try_set_position(
         tracing::debug!("Ignored seek to {} after rewind ({})", position, context);
         return false;
     }
+    let Some(start) = with_current_player_local_state(state, player, |local_state| {
+        let snapshot = player.get_state();
+        if local_state.remote_position_is_active_for(position) {
+            RemoteCorrectionStart::AlreadyActive
+        } else {
+            RemoteCorrectionStart::Started(
+                local_state
+                    .begin_remote_position(position, snapshot.position_observation_generation),
+            )
+        }
+    }) else {
+        return false;
+    };
+    let RemoteCorrectionStart::Started(correction) = start else {
+        return true;
+    };
     if let Err(e) = player.set_position(position).await {
+        with_current_player_local_state(state, player, |local_state| {
+            local_state.cancel_remote_position(correction);
+        });
         tracing::warn!("Failed to set position ({}): {}", context, e);
         return false;
     }
-    true
+    let global = state.effective_global_state();
+    with_current_player_local_state(state, player, |local_state| {
+        let snapshot = player.get_state();
+        local_state.complete_remote_position(correction);
+        if let (Some(position), Some(paused)) = (snapshot.position, snapshot.paused) {
+            local_state.update_from_player(
+                position,
+                paused,
+                snapshot.observed_position,
+                snapshot.observed_paused,
+                snapshot.position_observation_generation,
+                snapshot.paused_observation_generation,
+                global.position,
+                global.paused,
+            );
+        }
+    })
+    .is_some()
+}
+
+async fn try_set_paused(
+    state: &Arc<AppState>,
+    player: &Arc<dyn PlayerBackend>,
+    paused: bool,
+    context: &str,
+) -> bool {
+    let Some(start) = with_current_player_local_state(state, player, |local_state| {
+        let snapshot = player.get_state();
+        if local_state.remote_pause_is_handled(paused, snapshot.observed_paused) {
+            RemoteCorrectionStart::AlreadyActive
+        } else {
+            RemoteCorrectionStart::Started(
+                local_state.begin_remote_pause(paused, snapshot.paused_observation_generation),
+            )
+        }
+    }) else {
+        return false;
+    };
+    let RemoteCorrectionStart::Started(correction) = start else {
+        return true;
+    };
+    if let Err(e) = player.set_paused(paused).await {
+        with_current_player_local_state(state, player, |local_state| {
+            local_state.cancel_remote_pause(correction);
+        });
+        tracing::warn!("Failed to set paused ({}): {}", context, e);
+        return false;
+    }
+    let global = state.effective_global_state();
+    with_current_player_local_state(state, player, |local_state| {
+        let snapshot = player.get_state();
+        local_state.complete_remote_pause(correction);
+        if let (Some(position), Some(paused)) = (snapshot.position, snapshot.paused) {
+            local_state.update_from_player(
+                position,
+                paused,
+                snapshot.observed_position,
+                snapshot.observed_paused,
+                snapshot.position_observation_generation,
+                snapshot.paused_observation_generation,
+                global.position,
+                global.paused,
+            );
+        }
+    })
+    .is_some()
 }
 
 async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, message_age: f64) {
@@ -1174,23 +1280,26 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         .clone()
         .unwrap_or_else(|| "Unknown".to_string());
     let do_seek = playstate.do_seek.unwrap_or(false);
-    let pause_changed =
-        playstate.paused != previous_global.paused || playstate.paused != local_paused;
+    let global_pause_changed = playstate.paused != previous_global.paused;
+    let pause_correction_pending = state
+        .local_playback_state
+        .lock()
+        .remote_pause_is_active_for(playstate.paused);
+    let pause_needs_sync =
+        global_pause_changed || (playstate.paused != local_paused && !pause_correction_pending);
     let diff = local_position - adjusted_global_position;
     let mut made_change_on_player = false;
+    let mut position_applied = false;
+    let mut pause_applied = false;
 
     if !had_last_global && state.client_state.get_file().is_some() {
         if try_set_position(state, &player, adjusted_global_position, "init").await {
-            state
-                .local_playback_state
-                .lock()
-                .mark_remote_seek(adjusted_global_position);
             made_change_on_player = true;
+            position_applied = true;
         }
-        if let Err(e) = player.set_paused(playstate.paused).await {
-            tracing::warn!("Failed to set paused on init: {}", e);
-        } else {
+        if try_set_paused(state, &player, playstate.paused, "init").await {
             made_change_on_player = true;
+            pause_applied = true;
         }
     }
 
@@ -1203,11 +1312,9 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
                 .unwrap_or(local_position)
         } else {
             *state.last_seek_from_position.lock() = None;
-            if try_set_position(state, &player, adjusted_global_position, "seek").await {
-                state
-                    .local_playback_state
-                    .lock()
-                    .mark_remote_seek(adjusted_global_position);
+            if position_applied
+                || try_set_position(state, &player, adjusted_global_position, "seek").await
+            {
                 made_change_on_player = true;
             } else {
                 return;
@@ -1224,16 +1331,19 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         maybe_show_osd(state, &config, &message, config.user.show_same_room_osd);
     }
 
+    let position_correction_pending = state
+        .local_playback_state
+        .lock()
+        .has_active_remote_position()
+        || position_applied;
+
     if diff > config.user.seek_threshold_rewind
         && !do_seek
+        && !position_correction_pending
         && config.user.rewind_on_desync
         && actor_name != current_username
     {
         if try_set_position(state, &player, adjusted_global_position, "rewind").await {
-            state
-                .local_playback_state
-                .lock()
-                .mark_remote_seek(adjusted_global_position);
             made_change_on_player = true;
         }
         let message = format!("Rewinded due to time difference with {}", actor_name);
@@ -1244,7 +1354,7 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
     if config.user.fastforward_on_desync && should_allow_fastforward(state, &config) {
         let mut next_behind_marker = None;
         let mut fastforward_target = None;
-        if diff < -FASTFORWARD_BEHIND_THRESHOLD && !do_seek {
+        if diff < -FASTFORWARD_BEHIND_THRESHOLD && !do_seek && !position_correction_pending {
             let now = std::time::Instant::now();
             let start = state.sync_engine.lock().behind_first_detected();
             match start {
@@ -1275,7 +1385,6 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         if let Some(position) = fastforward_target {
             if actor_name != current_username {
                 if try_set_position(state, &player, position, "fastforward").await {
-                    state.local_playback_state.lock().mark_remote_seek(position);
                     made_change_on_player = true;
                 }
                 let message = format!("Fast-forwarded due to time difference with {}", actor_name);
@@ -1295,7 +1404,8 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         && config.user.slow_on_desync
     {
         let slowdown_active = state.sync_engine.lock().is_slowdown_active();
-        if diff > config.user.slowdown_threshold && !slowdown_active {
+        if diff > config.user.slowdown_threshold && !slowdown_active && !position_correction_pending
+        {
             if actor_name != current_username {
                 if let Err(e) = player.set_speed(config.user.slowdown_rate).await {
                     tracing::warn!("Failed to set slowdown: {}", e);
@@ -1320,38 +1430,36 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
         }
     }
 
-    if pause_changed {
+    if pause_needs_sync {
         if playstate.paused {
             if actor_name != current_username
+                && !do_seek
+                && !position_correction_pending
                 && try_set_position(state, &player, adjusted_global_position, "pause-sync").await
             {
-                state
-                    .local_playback_state
-                    .lock()
-                    .mark_remote_seek(adjusted_global_position);
                 made_change_on_player = true;
             }
-            if let Err(e) = player.set_paused(true).await {
-                tracing::warn!("Failed to set paused: {}", e);
-            } else {
+            if pause_applied || try_set_paused(state, &player, true, "sync").await {
                 made_change_on_player = true;
             }
-            let message = format!(
-                "{} paused at {}",
-                actor_name,
-                format_time(adjusted_global_position)
-            );
-            emit_system_message(state, &message);
-            maybe_show_osd(state, &config, &message, config.user.show_same_room_osd);
+            if global_pause_changed {
+                let message = format!(
+                    "{} paused at {}",
+                    actor_name,
+                    format_time(adjusted_global_position)
+                );
+                emit_system_message(state, &message);
+                maybe_show_osd(state, &config, &message, config.user.show_same_room_osd);
+            }
         } else {
-            if let Err(e) = player.set_paused(false).await {
-                tracing::warn!("Failed to set paused: {}", e);
-            } else {
+            if pause_applied || try_set_paused(state, &player, false, "sync").await {
                 made_change_on_player = true;
             }
-            let message = format!("{} unpaused", actor_name);
-            emit_system_message(state, &message);
-            maybe_show_osd(state, &config, &message, config.user.show_same_room_osd);
+            if global_pause_changed {
+                let message = format!("{} unpaused", actor_name);
+                emit_system_message(state, &message);
+                maybe_show_osd(state, &config, &message, config.user.show_same_room_osd);
+            }
         }
     }
 
@@ -1360,15 +1468,23 @@ async fn handle_state_update(state: &Arc<AppState>, playstate: PlayState, messag
             tracing::warn!("Failed to refresh player state after update: {}", e);
         }
         let refreshed_state = player.get_state();
-        if let (Some(position), Some(paused)) = (refreshed_state.position, refreshed_state.paused) {
-            let global = state.effective_global_state();
-            state.local_playback_state.lock().update_from_player(
-                position,
-                paused,
-                global.position,
-                global.paused,
-            );
-        }
+        let global = state.effective_global_state();
+        with_current_player_local_state(state, &player, |local_state| {
+            if let (Some(position), Some(paused)) =
+                (refreshed_state.position, refreshed_state.paused)
+            {
+                local_state.update_from_player(
+                    position,
+                    paused,
+                    refreshed_state.observed_position,
+                    refreshed_state.observed_paused,
+                    refreshed_state.position_observation_generation,
+                    refreshed_state.paused_observation_generation,
+                    global.position,
+                    global.paused,
+                );
+            }
+        });
     }
 
     // Report the viewer's own offset from the room-global position so the UI
@@ -1403,7 +1519,8 @@ fn build_local_playstate(state: &Arc<AppState>) -> Option<PlayState> {
     }
     let global = state.effective_global_state();
     let local_state = state.local_playback_state.lock();
-    let (local_position, local_paused) = local_state.current()?;
+    let (local_position, local_paused) =
+        local_state.protocol_state(global.position, global.paused)?;
     let config = state.config.lock().clone();
     let position = if config.user.dont_slow_down_with_me {
         global.position
@@ -1948,7 +2065,7 @@ fn controller_auth_request(room: &str, password: &str) -> ProtocolMessage {
 pub(crate) async fn reset_transient_connection_state(state: &Arc<AppState>) {
     state.client_state.clear_users();
     state.client_state.clear_server_version();
-    *state.local_playback_state.lock() = crate::client::local_state::LocalPlaybackState::new();
+    state.local_playback_state.lock().clear_remote_corrections();
     playback_runtime::reconnect(state).await;
     *state.server_features.lock() = ServerFeatures::default();
     *state.ignoring_on_the_fly.lock() = crate::app_state::IgnoringOnTheFlyState::default();
@@ -3426,6 +3543,324 @@ mod lifecycle_tests {
     use crate::player::properties::PlayerState;
     use std::sync::Arc;
     use tokio::time::{sleep, timeout, Duration};
+
+    #[tokio::test]
+    async fn remote_seek_uses_one_player_command_without_a_follower_seek() {
+        let state = AppState::new();
+        state.client_state.set_username("alice".to_string());
+        state
+            .client_state
+            .set_global_state(120.0, false, Some("bob".to_string()));
+        *state.last_global_update.lock() = Some(std::time::Instant::now());
+
+        let player = Arc::new(FakePlayerBackend::new(PlayerKind::Mpv));
+        player.set_fake_state(PlayerState {
+            position: Some(120.0),
+            paused: Some(false),
+            ..PlayerState::default()
+        });
+        let snapshot = player.get_state();
+        state.local_playback_state.lock().update_from_player(
+            120.0,
+            false,
+            snapshot.observed_position,
+            snapshot.observed_paused,
+            snapshot.position_observation_generation,
+            snapshot.paused_observation_generation,
+            120.0,
+            false,
+        );
+        *state.player.lock() = Some(player.clone());
+
+        handle_state_update(
+            &state,
+            PlayState {
+                position: 80.0,
+                paused: false,
+                do_seek: Some(true),
+                set_by: Some("bob".to_string()),
+            },
+            0.0,
+        )
+        .await;
+
+        assert_eq!(
+            player
+                .commands()
+                .iter()
+                .filter(|command| matches!(command, FakePlayerCommand::SetPosition(80.0)))
+                .count(),
+            1
+        );
+        let response = build_local_playstate(&state).expect("missing follower playstate");
+        assert!((response.position - 80.0).abs() < 0.1);
+        assert_eq!(response.do_seek, None);
+
+        for position in [120.0, 100.0, 80.0] {
+            player.set_fake_state(PlayerState {
+                position: Some(position),
+                paused: Some(false),
+                ..PlayerState::default()
+            });
+            let snapshot = player.get_state();
+            let changes = state.local_playback_state.lock().update_from_player(
+                position,
+                false,
+                snapshot.observed_position,
+                snapshot.observed_paused,
+                snapshot.position_observation_generation,
+                snapshot.paused_observation_generation,
+                80.0,
+                false,
+            );
+            assert_eq!(changes, (false, false));
+        }
+
+        player.set_fake_state(PlayerState {
+            position: Some(60.0),
+            paused: Some(false),
+            ..PlayerState::default()
+        });
+        let snapshot = player.get_state();
+        assert_eq!(
+            state.local_playback_state.lock().update_from_player(
+                60.0,
+                false,
+                snapshot.observed_position,
+                snapshot.observed_paused,
+                snapshot.position_observation_generation,
+                snapshot.paused_observation_generation,
+                80.0,
+                false,
+            ),
+            (false, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn first_seek_state_does_not_duplicate_init_corrections() {
+        let state = AppState::new();
+        state.client_state.set_username("alice".to_string());
+        state.client_state.set_file(Some("movie.mkv".to_string()));
+
+        let player = Arc::new(FakePlayerBackend::new(PlayerKind::Mpv));
+        player.set_confirm_commands(true);
+        player.set_fake_state(PlayerState {
+            position: Some(120.0),
+            paused: Some(true),
+            ..PlayerState::default()
+        });
+        let snapshot = player.get_state();
+        *state.player.lock() = Some(player.clone());
+        state.local_playback_state.lock().update_from_player(
+            120.0,
+            true,
+            snapshot.observed_position,
+            snapshot.observed_paused,
+            snapshot.position_observation_generation,
+            snapshot.paused_observation_generation,
+            120.0,
+            true,
+        );
+
+        handle_state_update(
+            &state,
+            PlayState {
+                position: 80.0,
+                paused: false,
+                do_seek: Some(true),
+                set_by: Some("bob".to_string()),
+            },
+            0.0,
+        )
+        .await;
+
+        let commands = player.commands();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, FakePlayerCommand::SetPosition(80.0)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, FakePlayerCommand::SetPaused(false)))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_raw_position_does_not_skip_a_backward_seek() {
+        let state = AppState::new();
+        let player = Arc::new(FakePlayerBackend::new(PlayerKind::Mpv));
+        player.set_fake_state(PlayerState {
+            position: Some(80.0),
+            paused: Some(false),
+            ..PlayerState::default()
+        });
+        player.set_position(83.0).await.unwrap();
+        let backend: Arc<dyn PlayerBackend> = player.clone();
+        *state.player.lock() = Some(backend.clone());
+
+        assert!(try_set_position(&state, &backend, 80.0, "test").await);
+        assert_eq!(
+            player
+                .commands()
+                .iter()
+                .filter(|command| matches!(command, FakePlayerCommand::SetPosition(80.0)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_player_snapshot_cannot_cross_a_player_replacement() {
+        let state = AppState::new();
+        let old_player = Arc::new(FakePlayerBackend::new(PlayerKind::Mpv));
+        for position in 1..=5 {
+            old_player.set_fake_state(PlayerState {
+                position: Some(position as f64),
+                paused: Some(false),
+                ..PlayerState::default()
+            });
+        }
+        let old_backend: Arc<dyn PlayerBackend> = old_player.clone();
+        *state.player.lock() = Some(old_backend.clone());
+
+        let new_player = Arc::new(FakePlayerBackend::new(PlayerKind::Mpv));
+        new_player.set_fake_state(PlayerState {
+            position: Some(1.0),
+            paused: Some(true),
+            ..PlayerState::default()
+        });
+        let new_backend: Arc<dyn PlayerBackend> = new_player.clone();
+        {
+            let mut player_slot = state.player.lock();
+            state.local_playback_state.lock().reset_player_observation();
+            *player_slot = Some(new_backend.clone());
+        }
+
+        let stale_snapshot = old_player.get_state();
+        assert!(
+            with_current_player_local_state(&state, &old_backend, |local_state| {
+                local_state.update_from_player(
+                    5.0,
+                    false,
+                    stale_snapshot.observed_position,
+                    stale_snapshot.observed_paused,
+                    stale_snapshot.position_observation_generation,
+                    stale_snapshot.paused_observation_generation,
+                    5.0,
+                    false,
+                );
+            })
+            .is_none()
+        );
+
+        let new_snapshot = new_player.get_state();
+        assert_eq!(
+            with_current_player_local_state(&state, &new_backend, |local_state| {
+                local_state.update_from_player(
+                    1.0,
+                    true,
+                    new_snapshot.observed_position,
+                    new_snapshot.observed_paused,
+                    new_snapshot.position_observation_generation,
+                    new_snapshot.paused_observation_generation,
+                    1.0,
+                    true,
+                )
+            }),
+            Some((false, false))
+        );
+        assert_eq!(
+            state.local_playback_state.lock().current(),
+            Some((1.0, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_remote_unpause_stays_an_ack_instead_of_a_local_pause() {
+        let state = AppState::new();
+        state.client_state.set_username("alice".to_string());
+        state
+            .client_state
+            .set_global_state(120.0, true, Some("bob".to_string()));
+        *state.last_global_update.lock() = Some(std::time::Instant::now());
+
+        let player = Arc::new(FakePlayerBackend::new(PlayerKind::Mpv));
+        player.set_fake_state(PlayerState {
+            position: Some(120.0),
+            paused: Some(true),
+            ..PlayerState::default()
+        });
+        let snapshot = player.get_state();
+        state.local_playback_state.lock().update_from_player(
+            120.0,
+            true,
+            snapshot.observed_position,
+            snapshot.observed_paused,
+            snapshot.position_observation_generation,
+            snapshot.paused_observation_generation,
+            120.0,
+            true,
+        );
+        *state.player.lock() = Some(player.clone());
+
+        let unpause = PlayState {
+            position: 120.0,
+            paused: false,
+            do_seek: None,
+            set_by: Some("bob".to_string()),
+        };
+        handle_state_update(&state, unpause.clone(), 0.0).await;
+
+        player.set_fake_state(PlayerState {
+            position: Some(120.0),
+            paused: Some(true),
+            ..PlayerState::default()
+        });
+        let snapshot = player.get_state();
+        assert_eq!(
+            state.local_playback_state.lock().update_from_player(
+                120.0,
+                true,
+                snapshot.observed_position,
+                snapshot.observed_paused,
+                snapshot.position_observation_generation,
+                snapshot.paused_observation_generation,
+                120.0,
+                false,
+            ),
+            (false, false)
+        );
+
+        handle_state_update(&state, unpause, 0.0).await;
+
+        assert_eq!(
+            player
+                .commands()
+                .iter()
+                .filter(|command| matches!(command, FakePlayerCommand::SetPaused(false)))
+                .count(),
+            1
+        );
+        let response = build_local_playstate(&state).expect("missing follower playstate");
+        assert!(!response.paused);
+        assert_eq!(response.do_seek, None);
+        assert_eq!(
+            state
+                .chat
+                .get_messages()
+                .iter()
+                .filter(|message| message.message == "bob unpaused")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn list_projection_keeps_empty_persistent_room_without_fake_user() {

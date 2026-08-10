@@ -1071,7 +1071,7 @@ fn spawn_event_loop(args: EventLoopArgs) -> std::thread::JoinHandle<()> {
                 }
                 MpcEvent::PlayState(play_state) => {
                     let paused = play_state != 0;
-                    state.lock().paused = Some(paused);
+                    state.lock().observe_paused(Some(paused));
                 }
                 MpcEvent::NowPlaying(value) => {
                     let parts = split_mpc_fields(&value);
@@ -1086,13 +1086,13 @@ fn spawn_event_loop(args: EventLoopArgs) -> std::thread::JoinHandle<()> {
                     }
                 }
                 MpcEvent::Position(pos) => {
-                    state.lock().position = Some(pos);
+                    state.lock().observe_position(Some(pos));
                     if let Some(tx) = position_waiter.lock().take() {
                         let _ = tx.send(());
                     }
                 }
                 MpcEvent::Seek(pos) => {
-                    state.lock().position = Some(pos);
+                    state.lock().observe_position(Some(pos));
                 }
                 MpcEvent::Version(value) => {
                     *version.lock() = Some(value.clone());
@@ -1144,7 +1144,7 @@ fn apply_mpc_load_state(
     let ready = mpc_load_state_ready(state_code);
     file_ready.store(ready, Ordering::SeqCst);
     if !ready {
-        state.lock().paused = None;
+        state.lock().observe_paused(None);
     }
 }
 

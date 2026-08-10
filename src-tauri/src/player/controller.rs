@@ -243,7 +243,11 @@ async fn ensure_player_connected_for_media_at_epoch(
                 tracing::warn!("Failed to send feature update to player: {error}");
             }
         }
-        *state.player.lock() = Some(fake);
+        {
+            let mut player_slot = state.player.lock();
+            state.local_playback_state.lock().reset_player_observation();
+            *player_slot = Some(fake);
+        }
         *state.last_player_spawn.lock() = Some(Instant::now());
         *state.last_player_kind.lock() = Some(kind);
         tracing::info!(
@@ -457,6 +461,7 @@ async fn ensure_player_connected_for_media_at_epoch(
     let installed = {
         let mut player = state.player.lock();
         if state.player_startup_epoch.load(Ordering::Acquire) == startup_epoch {
+            state.local_playback_state.lock().reset_player_observation();
             *player = Some(backend.clone());
             true
         } else {
@@ -593,7 +598,12 @@ pub(crate) async fn stop_player_instance(
 
 async fn stop_player_locked(state: &Arc<AppState>) -> Result<(), String> {
     playback_runtime::player_disconnected(state).await;
-    let player = state.player.lock().take();
+    let player = {
+        let mut player_slot = state.player.lock();
+        let player = player_slot.take();
+        state.local_playback_state.lock().reset_player_observation();
+        player
+    };
     let child = state.player_process.lock().take();
     let player_kind = player.as_ref().map(|player| player.kind());
     let had_child = child.is_some();
@@ -751,29 +761,47 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
                 (player_state.position, player_state.paused)
             {
                 let global = state.effective_global_state();
-                let (mut local_pause_change, local_seeked) = {
-                    let mut local_state = state.local_playback_state.lock();
-                    let (pause_change, seeked) = local_state.update_from_player(
-                        position,
-                        paused_value,
-                        global.position,
-                        global.paused,
-                    );
-                    (pause_change, seeked)
+                let local_changes = {
+                    let player_slot = state.player.lock();
+                    if player_slot
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &player))
+                    {
+                        Some(state.local_playback_state.lock().update_from_player(
+                            position,
+                            paused_value,
+                            player_state.observed_position,
+                            player_state.observed_paused,
+                            player_state.position_observation_generation,
+                            player_state.paused_observation_generation,
+                            global.position,
+                            global.paused,
+                        ))
+                    } else {
+                        None
+                    }
                 };
+                let Some((mut local_pause_change, local_seeked)) = local_changes else {
+                    observed_player = None;
+                    media_candidate = None;
+                    committed_observation = None;
+                    continue;
+                };
+                let observed_position = player_state.observed_position.unwrap_or(position);
+                let observed_paused = player_state.observed_paused.unwrap_or(paused_value);
                 if local_seeked {
                     *state.last_seek_from_position.lock() = Some(global.position);
                 }
-                let mut paused = paused_value;
+                let mut paused = observed_paused;
                 let mut skip_ready_toggle = false;
                 if local_pause_change && paused {
                     let current_length = state.client_state.get_file_duration().unwrap_or(0.0);
                     let near_end = current_length > PLAYLIST_LOAD_NEXT_FILE_MINIMUM_LENGTH
-                        && (position - current_length).abs()
+                        && (observed_position - current_length).abs()
                             < PLAYLIST_LOAD_NEXT_FILE_TIME_FROM_END_THRESHOLD;
                     if near_end {
                         skip_ready_toggle = true;
-                        let _ = advance_playlist_check(&state, position).await;
+                        let _ = advance_playlist_check(&state, observed_position).await;
                     }
                 }
                 if local_pause_change
@@ -801,7 +829,7 @@ pub fn spawn_player_state_loop(state: Arc<AppState>) {
                         }
                     } else {
                         PlayState {
-                            position,
+                            position: observed_position,
                             paused,
                             do_seek: if local_seeked { Some(true) } else { None },
                             set_by: None,

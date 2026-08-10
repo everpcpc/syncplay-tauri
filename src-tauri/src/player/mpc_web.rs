@@ -22,6 +22,13 @@ pub struct MpcWebBackend {
     client: Client,
     state: Arc<Mutex<PlayerState>>,
     connected: Arc<AtomicBool>,
+    refresh_lock: tokio::sync::Mutex<()>,
+}
+
+struct ParsedVariables {
+    state: PlayerState,
+    position_observed: bool,
+    paused_observed: bool,
 }
 
 impl MpcWebBackend {
@@ -51,6 +58,7 @@ impl MpcWebBackend {
             client: Client::builder().timeout(MPC_HTTP_TIMEOUT).build()?,
             state: Arc::new(Mutex::new(PlayerState::default())),
             connected: Arc::new(AtomicBool::new(true)),
+            refresh_lock: tokio::sync::Mutex::new(()),
         };
         Ok((backend, child))
     }
@@ -94,21 +102,47 @@ impl MpcWebBackend {
     }
 
     async fn refresh_state(&self) -> anyhow::Result<()> {
+        let _refresh_guard = self.refresh_lock.lock().await;
         let text = self.get_variables().await?;
         debug!("mpc variables: {}", text);
-        let new_state = self.parse_variables(&text);
-        *self.state.lock() = new_state;
+        let parsed = Self::parse_variables(&text);
+        let mut new_state = parsed.state;
+        let mut state = self.state.lock();
+        new_state.observed_position = state.observed_position;
+        new_state.observed_paused = state.observed_paused;
+        new_state.position_observation_generation = state.position_observation_generation;
+        new_state.paused_observation_generation = state.paused_observation_generation;
+        if parsed.position_observed {
+            let position = new_state.position;
+            new_state.observe_position(position);
+        } else {
+            new_state.position = state.position;
+        }
+        if parsed.paused_observed {
+            let paused = new_state.paused;
+            new_state.observe_paused(paused);
+        } else {
+            new_state.paused = state.paused;
+        }
+        *state = new_state;
         Ok(())
     }
 
-    fn parse_variables(&self, text: &str) -> PlayerState {
+    fn parse_variables(text: &str) -> ParsedVariables {
         let mut state = PlayerState::default();
+        let mut position_observed = false;
+        let mut paused_observed = false;
         for line in text.lines() {
             let mut parts = line.splitn(2, '=');
             let key = parts.next().unwrap_or("").trim();
             let value = parts.next().unwrap_or("").trim();
             match key {
-                "position" => state.position = value.parse::<f64>().ok(),
+                "position" => {
+                    if let Ok(position) = value.parse::<f64>() {
+                        state.position = Some(position);
+                        position_observed = true;
+                    }
+                }
                 "duration" => state.duration = value.parse::<f64>().ok(),
                 "filepath" => {
                     state.path = Some(value.to_string());
@@ -117,17 +151,25 @@ impl MpcWebBackend {
                         .map(|name| name.to_string_lossy().to_string());
                 }
                 "paused" => {
-                    state.paused = match value {
+                    let paused = match value {
                         "1" | "true" | "yes" => Some(true),
                         "0" | "false" | "no" => Some(false),
                         _ => None,
+                    };
+                    if paused.is_some() {
+                        state.paused = paused;
+                        paused_observed = true;
                     }
                 }
                 "speed" => state.speed = value.parse::<f64>().ok(),
                 _ => {}
             }
         }
-        state
+        ParsedVariables {
+            state,
+            position_observed,
+            paused_observed,
+        }
     }
 }
 
@@ -232,5 +274,30 @@ impl PlayerBackend for MpcWebBackend {
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_invalid_playback_fields_are_not_observations() {
+        let parsed = MpcWebBackend::parse_variables(
+            "duration=120\nposition=invalid\npaused=unknown\nfilepath=movie.mkv",
+        );
+
+        assert!(!parsed.position_observed);
+        assert!(!parsed.paused_observed);
+    }
+
+    #[test]
+    fn valid_playback_fields_are_observations() {
+        let parsed = MpcWebBackend::parse_variables("position=12.5\npaused=0");
+
+        assert!(parsed.position_observed);
+        assert!(parsed.paused_observed);
+        assert_eq!(parsed.state.position, Some(12.5));
+        assert_eq!(parsed.state.paused, Some(false));
     }
 }
