@@ -27,6 +27,42 @@ import { TrustedDomainsDialog } from "./TrustedDomainsDialog";
 const LAST_ADD_FILE_DIRECTORY_KEY = "syncplay.lastAddFileDirectory";
 const PLAYLIST_REORDER_ANIMATION_MS = 180;
 
+const ADD_FILE_DIALOG_FILTERS = [
+  {
+    name: "Video",
+    extensions: [
+      "mp4",
+      "mkv",
+      "avi",
+      "mov",
+      "wmv",
+      "flv",
+      "webm",
+      "m4v",
+      "mpg",
+      "mpeg",
+      "ts",
+      "m2ts",
+      "mts",
+      "vob",
+      "rm",
+      "rmvb",
+      "3gp",
+      "ogv",
+      "divx",
+      "asf",
+    ],
+  },
+  {
+    name: "Audio",
+    extensions: ["mp3", "flac", "aac", "ogg", "oga", "opus", "wav", "wma", "m4a", "aiff", "ape"],
+  },
+  {
+    name: "All files",
+    extensions: ["*"],
+  },
+];
+
 interface PlaylistItemStatus {
   filename: string;
   path: string | null;
@@ -286,6 +322,7 @@ export function PlaylistPanel() {
         multiple: false,
         directory: false,
         defaultPath: getLastAddFileDirectory(mediaDirectories),
+        filters: ADD_FILE_DIALOG_FILTERS,
       });
     } catch (error) {
       addNotification({
